@@ -12,7 +12,6 @@ main/data/aux/
 *.aux.xml
 *.tmp
 __pycache__/
-*.pyc
 .ipynb_checkpoints/
 
 # ── VS Code settings ──
