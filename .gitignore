@@ -1,0 +1,23 @@
+# ── Conda environment ──
+miniconda3/
+
+# ── Intermediate and large files ──
+main/processing/
+main/data/raw/
+main/data/output/
+main/data/aux/
+
+# ── Logs, temp files, caches ──
+*.log
+*.aux.xml
+*.tmp
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# ── VS Code settings ──
+.vscode/
+
+# ── Optional: Jupyter backups ──
+*.ipynb~
+
