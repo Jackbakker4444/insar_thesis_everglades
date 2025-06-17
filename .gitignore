@@ -6,6 +6,7 @@ main/processing/
 main/data/raw/
 main/data/output/
 main/data/aux/
+isce2_conda
 
 # ── Logs, temp files, caches ──
 *.log
@@ -19,4 +20,6 @@ __pycache__/
 
 # ── Optional: Jupyter backups ──
 *.ipynb~
+
+**/.git/
 
