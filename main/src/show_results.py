@@ -7,8 +7,8 @@ from pathlib import Path
 from subprocess import check_call
 
 
-from InSAR.main.src.show_fringes import create_fringe_tif
-from atm_correction  import do_iono_correct
+from help_show_fringes import create_fringe_tif
+from help_atm_correction  import do_iono_correction
 
 # _______________________________________ paths and variable settings ___________________________________
 BASE      = Path(__file__).resolve().parents[1]             # ~/InSAR/main

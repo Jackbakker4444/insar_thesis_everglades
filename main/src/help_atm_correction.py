@@ -136,18 +136,18 @@ def do_tropo_correction(wdir: Path, ref: int, sec: int, gacos_dir: Path, tropo_d
         print('Writing output HDR file...')
         enviHDRFile = open(filename + '.hdr', 'w')
         enviHDR = '''ENVI
-                description = {{GACOS: {FILENAME} }}
-                samples = {WIDTH}
-                lines = {FILE_LENGTH}
-                bands = 1
-                header offset = 0
-                file type = ENVI Standard
-                data type = 4
-                interleave = bsq
-                sensor type = Unknown
-                byte order = 0
-                map info = {{Geographic Lat/Lon, 1, 1, {X_FIRST}, {Y_FIRST}, {X_STEP}, {Y_STEP}, WGS-84, units=Degrees}}
-                coordinate system string = {{GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.017453292519943295]]}}'''.format(**headers)
+description = {{GACOS: {FILENAME} }}
+samples = {WIDTH}
+lines = {FILE_LENGTH}
+bands = 1
+header offset = 0
+file type = ENVI Standard
+data type = 4
+interleave = bsq
+sensor type = Unknown
+byte order = 0
+map info = {{Geographic Lat/Lon, 1, 1, {X_FIRST}, {Y_FIRST}, {X_STEP}, {Y_STEP}, WGS-84, units=Degrees}}
+coordinate system string = {{GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.017453292519943295]]}}'''.format(**headers)
         enviHDRFile.write(enviHDR)
         enviHDRFile.close()
         print('Output HDR file =', filename)
