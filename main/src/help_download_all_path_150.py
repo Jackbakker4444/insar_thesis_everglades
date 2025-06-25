@@ -53,7 +53,6 @@ from io import StringIO
 # Global variables intended for cross-thread modification
 abort = False
 
-
 ###
 # A routine that handles trapped signals
 def signal_handler(sig, frame):
@@ -64,8 +63,11 @@ def signal_handler(sig, frame):
 
 ################################## Custom add to download in right folder ###################################
 from pathlib import Path
-BASE_DIR = Path(__file__).resolve().parent.parent            # folder that holds this .py
-DOWNLOAD_DIR = BASE_DIR / "data" / "raw" / "tmp_downloads"
+ABS_BASE        = Path(__file__).resolve().parents[5]
+DATA_BASE       = ABS_BASE / "mnt" / "DATA2" / "bakke326l"
+RAW_DIR         = DATA_BASE / "raw"
+DOWNLOAD_DIR    = RAW_DIR / "tmp_downloads"
+
 print("downloads will appear here:", DOWNLOAD_DIR)
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)       # create it if it isn't there
 #############################################################################################################

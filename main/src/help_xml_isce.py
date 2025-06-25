@@ -6,33 +6,41 @@ from dataclasses import dataclass
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-# ───────────────────────────── paths ─────────────────────────────────────────
-BASE     = Path(__file__).resolve().parents[1]
-RAW_DIR  = BASE / "data" / "raw"
-DEM_WGS84 = BASE / "data" / "aux" / "dem" / "srtm_30m.dem.wgs84"
-
 # ──────────────────── CEOS helper dataclass ─────────────────────────────────
 @dataclass(frozen=True)
 class CeosSet:
-    leader: Path
-    image : Path          # only HH image is passed
+    leader: list[Path]
+    image : list[Path]          # only HH image is passed
 
 # ─────────────────────── helper functions ───────────────────────────────────
-def ceos_files(path: str, date: str) -> CeosSet:
-    folder   = RAW_DIR / f"path{path}" / date
-    led_file = next(folder.glob("LED-*"))
-    img_file = next(folder.glob("IMG-HH-*"))
-    return CeosSet(led_file, img_file)
+def ceos_files(path: str, date: str, raw_dir: Path) -> CeosSet:
+    folder = raw_dir / f"path{path}" / date
+    leaders = sorted(folder.rglob("LED-*"))  # recurse into subdirs
+    images  = sorted(folder.rglob("IMG-HH-*"))
+    
+    if not leaders or not images:
+        raise FileNotFoundError(f"No CEOS files found in {folder}")
+    if len(leaders) != len(images):
+        raise RuntimeError(f"Unequal LED/IMG count in {folder}\nLEDs: {len(leaders)}, IMGs: {len(images)}")
+    
+    return CeosSet(leaders, images)
 
-def detect_beam_mode(summary_txt: Path) -> str:
+def detect_beam_mode(date_folder: Path) -> str:
     """
     Function detecting the beam mode: FBD or FBS. 
     """
-    try:
-        txt = summary_txt.read_text()
-    except FileNotFoundError:
+    meta_txt = next(date_folder.glob("*.txt"), None)
+    if meta_txt is None:
+        print(" NO meta text file found") 
+        
+    txt = meta_txt.read_text(errors="ignore")
+    if "FBD" in txt:
+        return "FBD"
+    if "FBS" in txt:
         return "FBS"
-    return "FBD" if "IMG-HV" in txt else "FBS"
+    else:
+        print(f" ⚠️ NO beam mode found in txt file: {meta_txt}")
+            
 
 # ───────────────────── XML building helpers ────────────────────────────────
 def sensor_component(tag: str, files: CeosSet, out_dir: Path, mode: str) -> ET.Element:
@@ -42,8 +50,17 @@ def sensor_component(tag: str, files: CeosSet, out_dir: Path, mode: str) -> ET.E
     to single-pol before further processing.
     """
     comp = ET.Element("component", name=tag)
-    ET.SubElement(comp, "property", name="IMAGEFILE").text   = str(files.image)
-    ET.SubElement(comp, "property", name="LEADERFILE").text  = str(files.leader)
+    
+    img_list = [str(p) for p in files.image]
+    led_list = [str(p) for p in files.leader]
+    
+    if len(img_list) == 1:
+        ET.SubElement(comp, "property", name="IMAGEFILE").text  = img_list[0]
+        ET.SubElement(comp, "property", name="LEADERFILE").text = led_list[0]
+    else:
+        ET.SubElement(comp, "property", name="IMAGEFILE").text  = str(img_list)
+        ET.SubElement(comp, "property", name="LEADERFILE").text = str(led_list)
+        
     ET.SubElement(comp, "property", name="OUTPUT").text      = str(out_dir)
     
     if mode == "FBD":
@@ -58,25 +75,31 @@ def write_stripmap_xml(
     path     : str,
     ref_date : str,
     sec_date : str,
+    raw_dir  : Path,
+    work_dir : Path,
+    dem_wgs84: Path
 ) -> None:
     """Create stripmapApp.xml for one interferometric pair."""
-    work_dir = xml_file.parent
     ref_out, sec_out = work_dir / ref_date, work_dir / sec_date
     ref_out.mkdir(parents=True, exist_ok=True)
     sec_out.mkdir(parents=True, exist_ok=True)
+    
+    ref_date_dir = raw_dir / f"path{path}" / ref_date
+    sec_date_dir = raw_dir / f"path{path}" / sec_date
 
     # input CEOS sets & beam modes
-    ref_files = ceos_files(path, ref_date)
-    sec_files = ceos_files(path, sec_date)
-    ref_mode  = detect_beam_mode(ref_files.image.parent / "summary.txt")
-    sec_mode  = detect_beam_mode(sec_files.image.parent / "summary.txt")
+    ref_files = ceos_files(path, ref_date, raw_dir)
+    sec_files = ceos_files(path, sec_date, raw_dir)
+    
+    ref_mode  = detect_beam_mode(ref_date_dir)
+    sec_mode  = detect_beam_mode(sec_date_dir)
 
     # assemble XML
     root = ET.Element("stripmapApp")
     app  = ET.SubElement(root, "component", name="stripmapApp")
-    ET.SubElement(app, "property", name="SENSORNAME").text  = "ALOS_SLC"
-    ET.SubElement(app, "property", name="DEMFILENAME").text = str(DEM_WGS84)
-    ET.SubElement(app, "property", name="regionOfInterest").text = str([25.00, 26.70, -81.80, -80.15])      # be sure to give EPSG 4326 (WGS 84) coordinates
+    ET.SubElement(app, "property", name="SENSORNAME").text  = "ALOS"
+    ET.SubElement(app, "property", name="DEMFILENAME").text = str(dem_wgs84)
+    ET.SubElement(app, "property", name="regionOfInterest").text = str([25.0, 26.7, -81.6, -80.3])     # be sure to give EPSG 4326 (WGS 84) coordinates
     ET.SubElement(app, "property", name="unwrapper name").text = "snaphu"
     
     

@@ -40,6 +40,7 @@ import sys
 from pathlib import Path
 
 from osgeo import gdal
+from applications.gdal2isce_xml import gdal2isce_xml
 
 gdal.UseExceptions()
 
@@ -100,7 +101,6 @@ def build_dem_xml(out_bin: Path, overwrite: bool) -> None:
         print(f"✔  {xml_file.name} exists - skipping gdal2isce_xml")
         return
     
-    from applications.gdal2isce_xml import gdal2isce_xml
     print("⚙️  Generating ISCE XML …")
     gdal2isce_xml(str(out_bin))
 

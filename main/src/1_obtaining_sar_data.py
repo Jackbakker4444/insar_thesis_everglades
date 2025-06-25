@@ -23,28 +23,32 @@ import csv
 import subprocess
 import zipfile
 from pathlib import Path
-import shutil
-
 
 def run() -> None:
     """Kick off the download and tidy the results in one go."""
     print("🚀 script started, download of data an unzipping will be done")
     # ------------------------------------------------------------------ paths
+    # Script paths
     script_dir = Path(__file__).resolve().parent           # where *this* script lives (…/src/)
-    project_root = script_dir.parent                       # step up to …/main/
-    tmp_dir = project_root / "data" / "raw" / "tmp_downloads"
-
     download_script = script_dir / "help_download_two_path_150.py"  # adjust if name changes
+    
+    # Data paths
+    ABS_BASE        = Path(__file__).resolve().parents[5]
+    DATA_BASE       = ABS_BASE / "mnt" / "DATA2" / "bakke326l"
+    RAW_DIR         = DATA_BASE / "raw"
+    TMP_DIR    = RAW_DIR / "tmp_downloads"
 
     if not download_script.exists():
         raise FileNotFoundError(f"Cannot locate {download_script}")
 
     # ------------------------------------------------------ 1⃣ run downloader
     print("\n ⬇️  Starting ASF bulk download…\n")
+    
+    # Call entire python script 
     subprocess.check_call(["python", str(download_script)])
 
     # ------------------------------------------------------ 2⃣ load metadata
-    csv_files = sorted(tmp_dir.glob("*.csv"))
+    csv_files = sorted(TMP_DIR.glob("*.csv"))
     if not csv_files:
         print("⚠️  No CSV metadata file found in tmp_downloads; nothing to organise.")
         return
@@ -55,7 +59,7 @@ def run() -> None:
         rows_by_granule = {row["Granule Name"]: row for row in csv.DictReader(f)}
 
     # ------------------------------------------------------ 3⃣ process zips
-    for zip_path in tmp_dir.glob("*.zip"):
+    for zip_path in TMP_DIR.glob("*.zip"):
         granule = zip_path.stem.split("-", 1)[0]  # e.g. ALPSRP268560510
         info = rows_by_granule.get(granule)
         if info is None:
@@ -66,10 +70,10 @@ def run() -> None:
         path_num = info["Path Number"].zfill(3)  # keep leading zeros
         acq_date = info["Acquisition Date"][:10].replace("-", "")  # YYYYMMDD
 
-        target_dir = project_root / "data" / "raw" / f"path{path_num}" / acq_date
+        target_dir = RAW_DIR / f"path{path_num}" / acq_date
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"📦  Unzipping {zip_path.name} ➜ {target_dir.relative_to(project_root)}")
+        print(f"📦  Unzipping {zip_path.name} ➜ {target_dir}")
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(target_dir)
 

@@ -8,8 +8,9 @@ import numpy as np
 from pathlib import Path
 
 # _______________________________________ paths and variable settings ___________________________________
-BASE      = Path(__file__).resolve().parents[1]             # ~/InSAR/main
-PROC_DIR  = BASE / "processing"
+ABS_BASE        = Path(__file__).resolve().parents[5]
+DATA_BASE       = ABS_BASE / "mnt" / "DATA2" / "bakke326l"
+PROC_DIR        = DATA_BASE / "processing"
 
 path = 464
 ref = 20081104
