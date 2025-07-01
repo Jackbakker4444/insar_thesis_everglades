@@ -30,8 +30,10 @@ RAW_DIR         = DATA_BASE / "raw"
 
 BASE            = Path(__file__).resolve().parents[1]                       # ~/InSAR/main
 DEM_TIF         = BASE / "data" / "aux" / "dem" / "srtm_30m.tif"
+DTM_TIF         = BASE / "data" / "aux" / "dem" / "3dep_10m.tif"
 TROPO_DIR       = BASE / "data" / "aux" / "tropo"
 DEM_WGS84       = BASE / "data" / "aux" / "dem" / "srtm_30m.dem.wgs84"
+DTM_WGS84       = BASE / "data" / "aux" / "dem" / "3dep_10m.dem.wgs84"
 HOME_PROC       = BASE / "processing"                                       # light-weight inspect dir base
 
 # ──────────────────────────── core functions ────────────────────────────────
@@ -142,7 +144,7 @@ def run_pair(path: int, ref: str, sec: str, workdir: Path, step: str, steps:bool
     
     
     #------------------ Make files  inspectable -------------------------   
-    inspect_dir = HOME_PROC / pair_id / "inspect"
+    inspect_dir = HOME_PROC / 'paths' / pair_id
     inspect_dir.mkdir(parents=True, exist_ok=True)
     print("🔎 Inspect dir:", inspect_dir)
     

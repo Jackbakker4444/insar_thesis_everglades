@@ -30,13 +30,13 @@ def run() -> None:
     # ------------------------------------------------------------------ paths
     # Script paths
     script_dir = Path(__file__).resolve().parent           # where *this* script lives (…/src/)
-    download_script = script_dir / "help_download_two_path_150.py"  # adjust if name changes
+    download_script = script_dir / "help_download_all_path_150.py"  # adjust if name changes
     
     # Data paths
     ABS_BASE        = Path(__file__).resolve().parents[5]
     DATA_BASE       = ABS_BASE / "mnt" / "DATA2" / "bakke326l"
     RAW_DIR         = DATA_BASE / "raw"
-    TMP_DIR    = RAW_DIR / "tmp_downloads"
+    TMP_DIR         = RAW_DIR / "tmp_downloads"
 
     if not download_script.exists():
         raise FileNotFoundError(f"Cannot locate {download_script}")

@@ -141,8 +141,8 @@ def write_dem_report(out_bin: Path, keep_egm: bool) -> None:
 # -----------------------------------------------------------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Convert GeoTIFF DSM/DEM to ISCE2 format")
-    ap.add_argument("--input", required=True, type=Path, help="Input GeoTIFF DSM/DEM")
+    ap = argparse.ArgumentParser(description="Convert GeoTIFF DTM/DEM to ISCE2 format")
+    ap.add_argument("--input", required=True, type=Path, help="Input GeoTIFF DTM/DEM")
     ap.add_argument("--output", required=True, type=Path, help="Output basename (*.dem.wgs84)")
     ap.add_argument("--tmp-dir", default="./tmp_reproj", type=Path, help="Temp directory for reprojection")
     ap.add_argument("--keep-egm", action="store_true", help="Keep geoid heights (skip ellipsoid conversion)")
