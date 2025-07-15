@@ -33,9 +33,9 @@ ABS_BASE        = Path(__file__).resolve().parents[5]
 DATA_BASE       = ABS_BASE / "mnt" / "DATA2" / "bakke326l"
 PROC_DIR        = DATA_BASE / "processing"
 
-path = 464
-ref = 20081104
-sec = 20081220
+path = 150
+ref = 20101108
+sec = 20101224
 
 pair_id = f"path{path}_{ref}_{sec}"
 wdir    = PROC_DIR / pair_id
@@ -240,28 +240,41 @@ def IFG_correction(unw, aps, outname):
     drv = None
 
 igram_dir = wdir / "interferogram"
-IFG_correction(str(igram_dir / "filt_topophase.unw.geo.vrt"), f"{ref}_{sec}.aps.geo", str(igram_dir / "filt_topophase_aps.unw.geo"))
+IFG_correction(str(igram_dir / "filt_topophase.unw.geo"), f"{ref}_{sec}.aps.geo", str(igram_dir / "filt_topophase_aps.unw.geo"))
 
 # Plot functions
 
 def plotdata2(file1, file2, band=1, title=("file1", "file2"), colormap='jet', datamin=None, datamax=None):
     ds1 = gdal.Open(file1, gdal.GA_ReadOnly)
     data1 = ds1.GetRasterBand(band).ReadAsArray()
+    data1_mask = np.ma.masked_where(data1 == 0, data1)
     ds1 = None
 
     ds2 = gdal.Open(file2, gdal.GA_ReadOnly)
     data2 = ds2.GetRasterBand(band).ReadAsArray()
+    data2_mask = np.ma.masked_where(data2 == 0, data2)
     ds2 = None
+    
+    # Build a copy of the requested colormap with a transparent "bad" colour
+    cmap_obj = plt.get_cmap(colormap).copy()
+    cmap_obj.set_bad(alpha=0)  # masked values → transparent
+
+    # Autoscale separately unless datamin/datamax are provided
+    def _scale(data):
+        return (data.min(), data.max()) if datamin is None else (datamin, datamax)
+    
+    vmin_data1, vmax_data1 = _scale(data1_mask)
+    vmin_data2, vmax_data2 = _scale(data2_mask)
 
     fig = plt.figure(figsize=(14, 6))
 
     ax = fig.add_subplot(1, 2, 1)
-    ax.imshow(data1, cmap=colormap, vmin=datamin, vmax=datamax)
+    ax.imshow(data1_mask, cmap=cmap_obj, vmin=vmin_data1, vmax=vmax_data1)
     ax.set_title(title[0])
     ax.set_axis_off()
 
     ax = fig.add_subplot(1, 2, 2)
-    ax.imshow(data2, cmap=colormap, vmin=datamin, vmax=datamax)
+    ax.imshow(data2_mask, cmap=cmap_obj, vmin=vmin_data2, vmax=vmax_data2)
     ax.set_title(title[1])
     ax.set_axis_off()
 

@@ -77,7 +77,10 @@ def write_stripmap_xml(
     sec_date : str,
     raw_dir  : Path,
     work_dir : Path,
-    dem_wgs84: Path
+    dem_wgs84: Path,
+    range_looks:      int,
+    az_looks:         int,
+    filter_strength: float
 ) -> None:
     """Create stripmapApp.xml for one interferometric pair."""
     ref_out, sec_out = work_dir / ref_date, work_dir / sec_date
@@ -112,8 +115,8 @@ def write_stripmap_xml(
     # Controls ENL (noise) ↔ spatial resolution trade-off before filtering / unwrapping.
     # Start: range = 4, az = 9 for L-band stripmap → ~30 m ground pix. Raise both if coherence is still < 0.2 in flats (e.g. 6×13).
     # Lower if details (urban, coastlines) are getting smeared and mean γ > 0.5.
-    ET.SubElement(app, "property", name="Range Looks").text = str(2)
-    ET.SubElement(app, "property", name="Azimuth looks").text = str(5)
+    ET.SubElement(app, "property", name="Range Looks").text = str(range_looks)
+    ET.SubElement(app, "property", name="Azimuth looks").text = str(az_looks)
     
     # Required for rubber-sheeting & iono tropospheric split.
     ET.SubElement(app, "property", name="do DenseOffsets").text = str(True)                             # Needed for dense offsets and split spectrum
@@ -135,7 +138,7 @@ def write_stripmap_xml(
     ET.SubElement(app, "property", name="do rubbersheetingRange").text = str(True)
     
     # Suppresses phase noise prior to unwrapping; too strong ⇒ loss of details.
-    ET.SubElement(app, "property", name="filter strength").text = str(0.6)                                       # 0.5 is default
+    ET.SubElement(app, "property", name="filter strength").text = str(filter_strength)                                       # 0.5 is default
     
     ## Dense-offset grid
     # Size of the FFT cross-correlation match window in azimuth × range (SLC pixels). Larger window → higher SNR, lower spatial detail.
