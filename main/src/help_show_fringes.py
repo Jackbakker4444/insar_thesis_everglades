@@ -38,13 +38,13 @@ from pathlib import Path
 # outband = output = None
 
 
-def create_fringe_tif(work_dir : Path, out_dir : Path) -> None:
+def create_fringe_tif(work_dir : Path, out_dir : Path, ref : int, sec : int, range_looks : int, azi_looks :int, alpha : float) -> None:
     """
     Read filt_topophase.flat.geo (complex), convert to wrapped phase,
     and save a single–band GTiff called FRINGES.tif.
     """
     src_path = work_dir / "interferogram" / "filt_topophase.flat.geo"
-    dst_path  = out_dir   / "FRINGES.tif"
+    dst_path  = out_dir   / f"FRINGES_{ref}_{sec}_ra{range_looks}_az{azi_looks}_{alpha}.tif"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ds = gdal.Open(str(src_path), gdal.GA_ReadOnly)

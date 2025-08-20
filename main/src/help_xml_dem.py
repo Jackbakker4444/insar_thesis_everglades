@@ -15,7 +15,7 @@ Requires:
 Usage
 -----
 ```bash
-python dsm_to_isce.py  \
+python help_xml_dem.py  \
        --input   /path/to/my_lidar_utm.tif \
        --output  /path/to/dem/my_area.dem.wgs84
 ```

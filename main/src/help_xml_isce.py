@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import xml.etree.ElementTree as ET
+import math
 
 # ──────────────────── CEOS helper dataclass ─────────────────────────────────
 @dataclass(frozen=True)
@@ -61,10 +62,10 @@ def sensor_component(tag: str, files: CeosSet, out_dir: Path, mode: str) -> ET.E
         ET.SubElement(comp, "property", name="IMAGEFILE").text  = str(img_list)
         ET.SubElement(comp, "property", name="LEADERFILE").text = str(led_list)
         
-    ET.SubElement(comp, "property", name="OUTPUT").text      = str(out_dir)
-    
     if mode == "FBD":
-        ET.SubElement(comp, "property", name="RESAMPLE_FLAG").text = "dual2single" ## Only possible for 1.0 level data
+        ET.SubElement(comp, "property", name="RESAMPLE_FLAG").text = "dual2single" ## Only possible for 1.0 level data    
+            
+    ET.SubElement(comp, "property", name="OUTPUT").text      = str(out_dir)
     
     return comp
 
@@ -102,7 +103,7 @@ def write_stripmap_xml(
     app  = ET.SubElement(root, "component", name="stripmapApp")
     ET.SubElement(app, "property", name="SENSORNAME").text  = "ALOS"
     ET.SubElement(app, "property", name="DEMFILENAME").text = str(dem_wgs84)
-    ET.SubElement(app, "property", name="regionOfInterest").text = str([25.0, 26.7, -81.6, -80.3])     # be sure to give EPSG 4326 (WGS 84) coordinates
+    ET.SubElement(app, "property", name="regionOfInterest").text = str([25.1, 26.7, -81.4, -80.2])     # be sure to give EPSG 4326 (WGS 84) coordinates
     ET.SubElement(app, "property", name="unwrapper name").text = "snaphu"
     
     
@@ -142,8 +143,8 @@ def write_stripmap_xml(
     
     ## Dense-offset grid
     # Size of the FFT cross-correlation match window in azimuth × range (SLC pixels). Larger window → higher SNR, lower spatial detail.
-    ET.SubElement(app, "property", name="dense window width").text = str(128)                                    # 64 is default
-    ET.SubElement(app, "property", name="dense window height").text = str(128) 
+    ET.SubElement(app, "property", name="dense window width").text = str(64)                                    # 64 is default
+    ET.SubElement(app, "property", name="dense window height").text = str(64) 
     
     # Search “pull-in” around the window centre, i.e. the largest offset (in pixels) the matcher will look for.
     ET.SubElement(app, "property", name="dense search width").text = str(40)
@@ -155,8 +156,6 @@ def write_stripmap_xml(
     
     
     ## ------------------------------------ End of tuning -----------------------------------------------------------------------------
-
-
     # reference / secondary
     app.append(sensor_component("Reference", ref_files, ref_out, ref_mode))
     app.append(sensor_component("Secondary", sec_files, sec_out, sec_mode))
