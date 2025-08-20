@@ -10,7 +10,7 @@ from osgeo import gdal, gdalconst
 
 
 
-def do_iono_correction(work_dir: Path, out_dir: Path = None) -> Path:
+def do_iono_correction(work_dir: Path, out_dir: Path, input_unw: Path, output_suffix: str = "_iono" ) -> Path:
     """
     Perform ionospheric phase correction on a full-band unwrapped interferogram.
 
@@ -22,15 +22,18 @@ def do_iono_correction(work_dir: Path, out_dir: Path = None) -> Path:
     Parameters
     ----------
     work_dir : Path
-        The main processing directory containing ISCE2 output folders.
-    out_dir : Path, optional
-        Directory where the corrected interferograms will be saved.
-        If None, defaults to `work_dir/interferogram`.
+        Pair directory (…/pathXXX_REF_SEC_SRTM or …_3DEP).
+    out_dir : Path
+        Output directory (usually work_dir / "interferogram").
+    input_unw : Path
+        Unwrapped input to correct (e.g., filt_topophase.unw.geo or
+        filt_topophase_tropo.unw.geo).
+    output_suffix : str
+        Suffix in output filename: "_iono" (IONO-only) or "_tropo_iono" (TROPO+IONO).
 
     Returns
     -------
-    Path
-        Path to the ionosphere-corrected interferogram GeoTIFF.
+    Path to ionosphere-corrected unwrapped interferogram (.geo).
 
     References
     ----------
@@ -38,46 +41,52 @@ def do_iono_correction(work_dir: Path, out_dir: Path = None) -> Path:
       https://github.com/isce-framework/isce2-docs/blob/master/Notebooks/UNAVCO_2020/Atmosphere/Ionosphere/stripmapApp_ionosphere.ipynb
       Inspectable script with comments can be found at InSAR/main/src/show_ionospheric_correction.
     """
-    igram_path = work_dir / "interferogram" / "filt_topophase_tropo.unw.geo"
-    iono_path  = work_dir / "ionosphere"    / "dispersive.bil.unwCor.filt.geo"
-    mask_path  = work_dir / "ionosphere"    / "mask.bil.geo"
-
-    if out_dir is None:
-        out_dir = work_dir / "interferogram"
+    iono_dir  = work_dir / "ionosphere"
+    igram_dir = work_dir / "interferogram"
+    out_dir = out_dir or igram_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    dst_corr_path  = out_dir / "filt_topophase_tropo_iono.unw.geo"
-    dst_wrap_path  = out_dir / "filt_topophase_tropo_iono_wrapped.unw.geo"
+    # Inputs produced by your iono workflow
+    iono_phase = iono_dir / "dispersive.bil.unwCor.filt.geo"
+    iono_mask  = iono_dir / "mask.bil.geo"
 
-    # Load full-band unwrapped interferogram (band 2)
-    with rasterio.open(igram_path) as src_igram:
+    if not input_unw.exists():
+        raise FileNotFoundError(f"input_unw not found: {input_unw}")
+    if not iono_phase.exists():
+        raise FileNotFoundError(f"iono phase not found: {iono_phase}")
+    if not iono_mask.exists():
+        raise FileNotFoundError(f"iono mask not found:  {iono_mask}")
+
+    # Read input unwrapped (phase band is commonly band 2; fallback to band 1 if single-band)
+    with rasterio.open(input_unw) as src_igram:
         profile = src_igram.profile
-        profile.update(dtype=float32, count=1, nodata=np.nan, compress="deflate")
-        igram_band = src_igram.read(2)
+        profile.update(dtype=float32, count=1, nodata=np.nan, compress="deflate", predictor=3, zlevel=6)
+        if src_igram.count == 1:
+            phase_in = src_igram.read(1)
+        else:
+            phase_in = src_igram.read(2)  # band 2 = phase (ISCE unw)
 
-    # Load dispersive phase (band 1)
-    with rasterio.open(iono_path) as src_iono:
+    with rasterio.open(iono_phase) as src_iono:
         iono_band = src_iono.read(1)
 
-    # Load mask
-    with rasterio.open(mask_path) as src_mask:
+    with rasterio.open(iono_mask) as src_mask:
         mask_band = src_mask.read(1)
 
-    # Apply correction and wrapping
-    igram_iono_corrected = (igram_band - iono_band) * mask_band
-    igram_iono_corrected_wrap = igram_iono_corrected - np.round(igram_iono_corrected / (2.0 * np.pi)) * 2 * np.pi
+    # Apply correction and rewrap
+    corrected = (phase_in - iono_band) * mask_band
+    wrapped   = corrected - np.round(corrected / (2.0 * np.pi)) * 2.0 * np.pi
 
-    # Save corrected interferogram
+    # Outputs (names matched to apply_atmos_corrections.py)
+    dst_corr_path = out_dir / f"filt_topophase{output_suffix}.unw.geo"
+    dst_wrap_path = out_dir / f"filt_topophase{output_suffix}_wrapped.unw.geo"
+
     with rasterio.open(dst_corr_path, "w", **profile) as dst:
-        dst.write(igram_iono_corrected.astype(float32), 1)
-
-    # Save wrapped corrected interferogram
+        dst.write(corrected.astype(float32), 1)
     with rasterio.open(dst_wrap_path, "w", **profile) as dst:
-        dst.write(igram_iono_corrected_wrap.astype(float32), 1)
+        dst.write(wrapped.astype(float32), 1)
 
-    print("✓ interferogram corrected for ionosphere:", dst_corr_path)
-    print("✓ wrapped version also saved as:", dst_wrap_path)
-
+    print("✓ ionosphere corrected:", dst_corr_path)
+    print("✓ wrapped version:",     dst_wrap_path)
     return dst_corr_path
 
 
@@ -126,77 +135,77 @@ def do_tropo_correction(wdir: Path, ref: int, sec: int, gacos_dir: Path, tropo_d
                 parts = line.strip().split()
                 if len(parts) == 2:
                     headers[parts[0]] = parts[1]
-                elif len(parts) > 2:
-                    continue
         headers['FILENAME'] = infile
-        headers['Y_STEP'] = str(np.abs(float(headers['Y_STEP'])))
+        headers['Y_STEP'] = str(abs(float(headers['Y_STEP'])))
         return headers
 
     def writehdr(filename, headers):
-        print('Writing output HDR file...')
-        enviHDRFile = open(filename + '.hdr', 'w')
-        enviHDR = '''ENVI
-description = {{GACOS: {FILENAME} }}
-samples = {WIDTH}
-lines = {FILE_LENGTH}
-bands = 1
-header offset = 0
-file type = ENVI Standard
-data type = 4
-interleave = bsq
-sensor type = Unknown
-byte order = 0
-map info = {{Geographic Lat/Lon, 1, 1, {X_FIRST}, {Y_FIRST}, {X_STEP}, {Y_STEP}, WGS-84, units=Degrees}}
-coordinate system string = {{GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.017453292519943295]]}}'''.format(**headers)
-        enviHDRFile.write(enviHDR)
-        enviHDRFile.close()
-        print('Output HDR file =', filename)
+        with open(filename + '.hdr', 'w') as fo:
+            fo.write(
+                'ENVI\n'
+                f'description = {{GACOS: {headers["FILENAME"]} }}\n'
+                f'samples = {headers["WIDTH"]}\n'
+                f'lines = {headers["FILE_LENGTH"]}\n'
+                'bands = 1\n'
+                'header offset = 0\n'
+                'file type = ENVI Standard\n'
+                'data type = 4\n'
+                'interleave = bsq\n'
+                'sensor type = Unknown\n'
+                'byte order = 0\n'
+                f'map info = {{Geographic Lat/Lon, 1, 1, {headers["X_FIRST"]}, {headers["Y_FIRST"]}, {headers["X_STEP"]}, {headers["Y_STEP"]}, WGS-84, units=Degrees}}\n'
+                'coordinate system string = {GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],'
+                'PRIMEM["Greenwich",0.0],UNIT["Degree",0.017453292519943295]]}\n'
+            )
 
     def GACOS_rsc2hdr(inputfile):
-        print('Generating hdr file for: ' + inputfile + '...')
-        filename, file_extension = os.path.splitext(inputfile)
-        if file_extension in ['.hdr', '.rsc']:
-            raise Exception("Give path to the ENVI file not the .hdr or .rsc file")
+        if os.path.splitext(inputfile)[1] in ('.hdr', '.rsc'):
+            raise ValueError("Pass the ENVI binary (no .hdr/.rsc extension).")
         headers = loadrsc(inputfile)
         writehdr(inputfile, headers)
-        print('hdr for ' + inputfile + ' generated\n')
 
-    def file_transform(unwfile, apsfile, apsfile_out):
-        apsfile = os.path.abspath(apsfile)
+    def file_transform(match_raster, apsfile, apsfile_out):
+        """Reproject apsfile to match match_raster grid/CRS."""
+        apsfile     = os.path.abspath(apsfile)
         apsfile_out = os.path.abspath(apsfile_out)
+
         src = gdal.Open(apsfile, gdalconst.GA_ReadOnly)
         src_proj = src.GetProjection()
         src_geotrans = src.GetGeoTransform()
-        match_ds = gdal.Open(unwfile + '.vrt', gdalconst.GA_ReadOnly)
+
+        match_ds = gdal.Open(match_raster, gdalconst.GA_ReadOnly)
         match_proj = match_ds.GetProjection()
         match_geotrans = match_ds.GetGeoTransform()
         wide = match_ds.RasterXSize
         high = match_ds.RasterYSize
+
         dst = gdal.GetDriverByName('ENVI').Create(apsfile_out, wide, high, 1, gdalconst.GDT_Float32)
         dst.SetGeoTransform(match_geotrans)
         dst.SetProjection(match_proj)
         gdal.ReprojectImage(src, dst, src_proj, match_proj, gdalconst.GRA_Bilinear)
-        print("Reprojected:", apsfile_out)
-        dst = None
-        src = None
+
+        dst = None; src = None; match_ds = None
 
     def zenith2slant(losfile, aps_zenith, aps_slant):
-        aps_zenith = os.path.abspath(aps_zenith)
-        aps_slant = os.path.abspath(aps_slant)
-        losfile = os.path.abspath(losfile)
+        """Project zenith delay to slant phase delay using incidence angle."""
+        WAVELENGTH = 0.2362  # meters (ALOS L-band)
         ds = gdal.Open(aps_zenith, gdal.GA_ReadOnly)
         zenith = ds.GetRasterBand(1).ReadAsArray()
-        proj = ds.GetProjection()
+        proj   = ds.GetProjection()
         geotrans = ds.GetGeoTransform()
         ds = None
+
         ds = gdal.Open(losfile, gdal.GA_ReadOnly)
         inc = ds.GetRasterBand(1).ReadAsArray()
         ds = None
-        inc = inc * np.pi / 180
-        scaling = -4 * np.pi / (23.62 / 100)
+
+        inc = inc * np.pi / 180.0
+        # Convert zenith delay (m) to phase (radians) in slant:
+        # phase = -(4π / λ) * (zenith / cos(inc))
+        scaling = -4.0 * np.pi / WAVELENGTH
         slant = scaling * zenith / np.cos(inc)
-        slant[zenith == 0] = 0
-        slant[inc == 0] = 0
+        slant[(zenith == 0) | (inc == 0)] = 0
+
         drv = gdal.GetDriverByName('ENVI').Create(aps_slant, slant.shape[1], slant.shape[0], 1, gdal.GDT_Float32)
         drv.SetGeoTransform(geotrans)
         drv.SetProjection(proj)
@@ -204,9 +213,6 @@ coordinate system string = {{GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["
         drv = None
 
     def differential_delay(ref_aps, sec_aps, outname):
-        ref_aps = os.path.abspath(ref_aps)
-        sec_aps = os.path.abspath(sec_aps)
-        outname = os.path.abspath(outname)
         ds = gdal.Open(ref_aps, gdal.GA_ReadOnly)
         ref = ds.GetRasterBand(1).ReadAsArray()
         proj = ds.GetProjection()
@@ -215,6 +221,7 @@ coordinate system string = {{GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["
         ds = gdal.Open(sec_aps, gdal.GA_ReadOnly)
         sec = ds.GetRasterBand(1).ReadAsArray()
         ds = None
+
         diffAPS = ref - sec
         drv = gdal.GetDriverByName('ENVI').Create(outname, diffAPS.shape[1], diffAPS.shape[0], 1, gdal.GDT_Float32)
         drv.SetGeoTransform(geotrans)
@@ -222,27 +229,31 @@ coordinate system string = {{GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["
         drv.GetRasterBand(1).WriteArray(diffAPS)
         drv = None
 
-    def IFG_correction(unw, aps, outname):
-        unw = os.path.abspath(unw)
-        aps = os.path.abspath(aps)
-        outname = os.path.abspath(outname)
-        ds = gdal.Open(unw, gdal.GA_ReadOnly)
-        unwdata_phase = ds.GetRasterBand(2).ReadAsArray()
-        unwdata_amplitude = ds.GetRasterBand(1).ReadAsArray()
-        proj = ds.GetProjection()
+    def IFG_correction(unw_path, aps_path, outname):
+        """
+        Subtract differential APS (phase) from unwrapped IFG (band 2) and
+        write 2-band ENVI (band1=amplitude, band2=phase).
+        """
+        ds = gdal.Open(unw_path, gdal.GA_ReadOnly)
+        # ISCE unw: band1 amplitude, band2 phase
+        amp  = ds.GetRasterBand(1).ReadAsArray()
+        phase = ds.GetRasterBand(2).ReadAsArray()
+        proj  = ds.GetProjection()
         geotrans = ds.GetGeoTransform()
         ds = None
-        ds = gdal.Open(aps, gdal.GA_ReadOnly)
-        apsdata = ds.GetRasterBand(1).ReadAsArray()
+
+        ds = gdal.Open(aps_path, gdal.GA_ReadOnly)
+        aps = ds.GetRasterBand(1).ReadAsArray()
         ds = None
-        unwdata_phase = unwdata_phase - apsdata
-        unwdata_phase[unwdata_phase == 0] = 0
-        unwdata_phase[apsdata == 0] = 0
-        drv = gdal.GetDriverByName('ENVI').Create(outname, unwdata_phase.shape[1], unwdata_phase.shape[0], 2, gdal.GDT_Float32)
+
+        phase = phase - aps
+        phase[(phase == 0) | (aps == 0)] = 0
+
+        drv = gdal.GetDriverByName('ENVI').Create(outname, phase.shape[1], phase.shape[0], 2, gdal.GDT_Float32)
         drv.SetGeoTransform(geotrans)
         drv.SetProjection(proj)
-        drv.GetRasterBand(1).WriteArray(unwdata_amplitude)
-        drv.GetRasterBand(2).WriteArray(unwdata_phase)
+        drv.GetRasterBand(1).WriteArray(amp)
+        drv.GetRasterBand(2).WriteArray(phase)
         drv = None
 
     GACOS_rsc2hdr(str(gacos_dir / f"{ref}.ztd"))
