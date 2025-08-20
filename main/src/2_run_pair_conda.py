@@ -1,153 +1,236 @@
 #!/usr/bin/env python3
 """
-run_pair_conda.py – batch-process multiple ALOS pairs with ISCE2
-and sweep multilook / filter parameters.
+run_path150_allpairs.py
+=======================
 
-If called **without CLI arguments** the script will:
-  • read the first 4 rows of /home/bakke326l/InSAR/main/data/pairs.csv
-  • run them for every combo in COMBOS (see below)
+Purpose
+-------
+Run **all ALOS pairs for path 150** listed in
+/home/bakke326l/InSAR/main/data/pairs.csv with fixed settings
+(range=10, az=16, alpha=0.6). For **each pair** the script runs **twice**:
+once using the **SRTM DEM** and once using the **3DEP DTM**, then moves on
+to the next pair.
 
-You can still run a *single* pair manually:
+Where results go
+----------------
+/mnt/DATA2/bakke326l/processing/interferograms/
+    path150_<REF>_<SEC>_SRTM/   # ISCE workdir + products + inspect quicklooks
+    path150_<REF>_<SEC>_3DEP/
 
-    python src/run_pair_conda.py 150 20071216 20080131 --range 4 --az 1 --alpha 0.8
+Quicklook PNG copies are also written to:
+~/InSAR/main/processing/inspect/
+
+Inputs & assumptions
+--------------------
+- CSV: /home/bakke326l/InSAR/main/data/pairs.csv
+  columns: path,reference,secondary   (header is skipped)
+  Only rows with path == 150 are processed.
+- DEMs:
+  - SRTM:  /home/bakke326l/InSAR/main/data/aux/dem/srtm_30m.tif
+  - 3DEP:  /home/bakke326l/InSAR/main/data/aux/dem/3dep_10m.tif
+  (The script auto-builds the *.dem.wgs84 and *.wgs84.xml if missing.)
+- ISCE2 is installed and ISCE_HOME is set.
+- gdal_translate is available on PATH.
+
+How to run
+----------
+# 1) Batch mode (default): run ALL path-150 pairs from the CSV
+python 2_run_pair_conda.py
+
+# 2) Batch but limit number of rows (useful for smoke tests)
+python 2_run_pair_conda.py --n 10
+
+# 3) Single pair (also runs both SRTM and 3DEP)
+python 2_run_pair_conda.py 20071216 20080131
+
+# 4) (Optional) override fixed processing settings
+python 2_run_pair_conda.py --range 10 --az 16 --alpha 0.6
+
+Performance tip (optional):
+  export OMP_NUM_THREADS=$(nproc)
+  export MKL_NUM_THREADS=$OMP_NUM_THREADS
+
+Changing the path
+-----------------
+This script is hard-wired to path 150. To run a different path from the CSV,
+edit the filter in batch_from_csv() (the line `if path != 150: continue`)
+or adapt the script to accept a --path flag.
+
+Naming
+------
+All output folders/files drop parameter names and append the DEM label:
+    path150_<REF>_<SEC>_SRTM/
+    path150_<REF>_<SEC>_3DEP/
 """
 
 from __future__ import annotations
 import argparse, csv, os, shutil, subprocess, sys
 from pathlib import Path
 from subprocess import check_call
+import numpy as np, rasterio
+import matplotlib.pyplot as plt
+from matplotlib import colormaps
 
+# your helpers
 from help_xml_isce import write_stripmap_xml
 from help_xml_dem  import write_dem_report
 from help_show_fringes import create_fringe_tif
-from help_atm_correction import do_iono_correction, do_tropo_correction
 
-# ───────────────────────── constants ──────────────────────────
-ABS_BASE   = Path(__file__).resolve().parents[5]
-DATA_BASE  = ABS_BASE / "mnt" / "DATA2" / "bakke326l"
-PROC_DIR   = DATA_BASE / "processing" / "tuning"          # <— new
-RAW_DIR    = DATA_BASE / "raw"
+# ───────────────────────── paths ─────────────────────────
+BASE        = Path("/home/bakke326l/InSAR/main")
+PAIRS_CSV   = BASE / "data" / "pairs.csv"
 
-BASE       = Path(__file__).resolve().parents[1]           # ~/InSAR/main
-DEM_TIF    = BASE / "data" / "aux" / "dem" / "srtm_30m.tif"
-TROPO_DIR  = BASE / "data" / "aux" / "tropo"
-DEM_WGS84  = BASE / "data" / "aux" / "dem" / "srtm_30m.dem.wgs84"
+DATA_BASE   = Path("/mnt/DATA2/bakke326l")
+PROC_DIR    = DATA_BASE / "processing" / "interferograms"
+RAW_DIR     = DATA_BASE / "raw"
 
-# sweep these six combos
-COMBOS: list[tuple[int, int, float]] = [
-    (4, 1, 0.8),
-    (4, 4, 0.7),
-    (8, 3, 0.8),
-    (10, 2, 0.5),
-    (2, 1, 0.8),
-    (4, 4, 0.9),
-]
+# DEM sources
+SRTM_TIF    = BASE / "data" / "aux" / "dem" / "srtm_30m.tif"
+THREEDEP_TIF= BASE / "data" / "aux" / "dem" / "3dep_10m.tif"
 
-# ─────────────────────── helper: one pair, one combo ───────────────────────
-def run_pair(
+HOME_PROC   = BASE / "processing"
+
+# Fixed processing knobs (no sweep)
+DEF_RANGE = 10
+DEF_AZ    = 16
+DEF_ALPHA = 0.6
+
+# ─────────────────────── utilities ───────────────────────
+def _quicklook_png(src: Path, dst: Path, band: int = 1) -> None:
+    """Save tiff as PNG."""
+    turbo = colormaps.get_cmap("turbo")
+    with rasterio.open(src) as ds:
+        arr = ds.read(band, masked=True)
+    if arr.mask.all():
+        plt.imsave(dst, np.zeros((*arr.shape, 3), dtype=np.uint8))
+        return
+    vmin, vmax = np.percentile(arr.compressed(), [1, 99])
+    norm = np.clip((arr - vmin) / (vmax - vmin), 0, 1)
+    rgba = (turbo(norm.filled(0)) * 255).astype(np.uint8)
+    rgb  = rgba[..., :3]
+    plt.imsave(dst, rgb)
+
+
+def _ensure_dem(tif_path: Path) -> Path:
+    """
+    Make sure <tif>.dem.wgs84 (+ .wgs84.xml) exists for ISCE.
+    Returns the path to the .dem.wgs84 binary.
+    """
+    dem_bin = tif_path.with_suffix(".dem.wgs84")
+    dem_xml = dem_bin.with_suffix(".wgs84.xml")
+    if not dem_xml.exists():
+        print(f"⚙️  Building DEM in WGS84 for {tif_path.name} …")
+        check_call([
+            sys.executable,
+            str(Path(__file__).parent / "help_xml_dem.py"),
+            "--input",  str(tif_path),
+            "--output", str(dem_bin),
+            "--overwrite",
+        ])
+        write_dem_report(out_bin=dem_bin, keep_egm=False)
+    return dem_bin
+
+
+def _pair_dir_name(path: int, ref: str, sec: str, dem_label: str) -> str:
+    """Directory/file stem without parameter names, with DEM tag."""
+    return f"path{path}_{ref}_{sec}_{dem_label}"
+
+
+def run_pair_with_dem(
     path: int,
     ref: str,
     sec: str,
-    range_looks: int,
-    az_looks: int,
-    alpha: float,
+    dem_label: str,     # "SRTM" or "3DEP"
+    dem_tif: Path,      # source TIF to convert for ISCE
+    range_looks: int = DEF_RANGE,
+    az_looks: int = DEF_AZ,
+    alpha: float = DEF_ALPHA,
 ) -> None:
     """
-    Prepare XML → run stripmapApp → export quick-look tiffs.
-    All outputs live in
-        mnt/DATA2/bakke326l/processing/tuning/
-        path{path}_{ref}_{sec}_{range}x_{az}x_{alpha}/
+    Run ONE pair for ONE DEM/DTM. Naming: pathXXX_REF_SEC_<DEM>.
     """
-    pair_id = f"path{path}_{ref}_{sec}_ra{range_looks}_az{az_looks}_filter{alpha}"
-    wdir    = PROC_DIR / pair_id
+    dem_wgs84 = _ensure_dem(dem_tif)
+    pair_id   = _pair_dir_name(path, ref, sec, dem_label)
+
+    wdir        = PROC_DIR / pair_id
     inspect_dir = wdir / "inspect"
 
-    # (re)create work dirs
+    # Create work dirs
     if wdir.exists():
         print(f"🗑  Removing previous directory {wdir}")
         shutil.rmtree(wdir)
     inspect_dir.mkdir(parents=True, exist_ok=True)
 
-    # make sure DEM (wgs84) exists --------------------------------------------------
-    dem_bin = DEM_TIF.with_suffix(".dem.wgs84")
-    dem_xml = dem_bin.with_suffix(".wgs84.xml")
-    if not dem_xml.exists():
-        print("⚙️  Making DEM wgs84 …")
-        check_call([
-            sys.executable,
-            str(Path(__file__).parent / "dem_xml.py"),
-            "--input",  str(DEM_TIF),
-            "--output", str(dem_bin),
-            "--overwrite",
-        ])
-        write_dem_report(out_bin=dem_bin, keep_egm=False)
-
-    # write per-pair XML -------------------------------------------------------------
+    # Write stripmap XML
     xml_file = wdir / "stripmapApp.xml"
     write_stripmap_xml(
-        xml_file     = xml_file,
-        path         = str(path),
-        ref_date     = ref,
-        sec_date     = sec,
-        raw_dir      = RAW_DIR,
-        work_dir     = wdir,
-        dem_wgs84    = DEM_WGS84,
-        range_looks  = range_looks,
-        az_looks     = az_looks,
-        filter_strength = alpha,
+        xml_file         = xml_file,
+        path             = str(path),
+        ref_date         = ref,
+        sec_date         = sec,
+        raw_dir          = RAW_DIR,
+        work_dir         = wdir,
+        dem_wgs84        = dem_wgs84,          
+        range_looks      = range_looks,
+        az_looks         = az_looks,
+        filter_strength  = alpha,
     )
     print(f"📝  XML written: {xml_file}")
 
-    # locate ISCE runner ------------------------------------------------------------
+    # Run ISCE
     isce_home   = Path(os.environ["ISCE_HOME"])
     stripmap_py = isce_home / "applications" / "stripmapApp.py"
     if not stripmap_py.exists():
         sys.exit(f"❌  stripmapApp.py not found in {isce_home}")
-
-    # run the full stack
-    cmd = [sys.executable, str(stripmap_py), str(xml_file)]
+    cmd = [sys.executable, str(stripmap_py), str(xml_file), "--steps"]
     print("🚀", " ".join(cmd))
     subprocess.check_call(cmd, cwd=wdir)
 
-    # atmos corrections -------------------------------------------------------------
+    # Export quicklooks
     igram_dir = wdir / "interferogram"
-    tropo_dir = wdir / "troposphere"; tropo_dir.mkdir(exist_ok=True)
-    
-    print(f"😶‍🌫️  Tropospheric correction will now be done for {ref} & {sec}")
-    do_tropo_correction(wdir=wdir, ref=ref, sec=sec,
-                        gacos_dir=TROPO_DIR, tropo_dir=tropo_dir)
-    tropo_corrected = igram_dir / "filt_topophase_tropo.unw.geo"
-    print(f"☀️  Tropospheric correction complete, corrected file: {tropo_corrected}")
-    
-    print(f"🌌  Ionospheric correction will now be done for {ref} & {sec}")
-    do_iono_correction(work_dir=wdir, out_dir=igram_dir)
-    iono_tropo_corrected = igram_dir / "filt_topophase_tropo_iono.unw.geo"
-    print(f"🌍  Ionospheric correction complete, corrected file: {iono_tropo_corrected}")
+    translate = lambda src, dst: subprocess.check_call(["gdal_translate", "-of", "GTiff", str(src), str(dst)])
 
-    # export quick-look GeoTIFFs ----------------------------------------------------
-    translate = lambda src, dst: subprocess.check_call(
-        ["gdal_translate", "-of", "GTiff", str(src), str(dst)]
-    )
-    for src in [
-        igram_dir/"phsig.cor.geo.vrt",
-        igram_dir/"topophase.cor.geo.vrt",
-        igram_dir/"filt_topophase.unw.geo.vrt",
-        igram_dir/"filt_topophase_tropo.unw.geo",
-        igram_dir/"filt_topophase_tropo_iono.unw.geo",
-        igram_dir/"filt_topophase_tropo_iono_wrapped.unw.geo",
-        tropo_dir / f"{ref}_{sec}.aps.geo",
-    ]:
-        tif = inspect_dir / (src.name + ".tif")
+    products = [
+        igram_dir / "phsig.cor.geo.vrt",
+        igram_dir / "topophase.cor.geo.vrt",
+        igram_dir / "filt_topophase.unw.geo.vrt",
+    ]
+    for src in products:
+        if not src.exists():
+            print(f"⚠️  Missing product (skipping): {src.name}")
+            continue
+        # filenames 
+        tif = inspect_dir / f"{src.stem}_{ref}_{sec}_{dem_label}.tif"
         translate(src, tif)
 
-    create_fringe_tif(work_dir=wdir, out_dir=inspect_dir)
-    
-    # End of interferogram build ----------------------------------------------------
-    print(f"📑 results can be found at: {wdir}")
-    print(f"✅ pair: {pair_id} ran successfully!")
+        png = HOME_PROC / "inspect" / f"{src.stem}_{ref}_{sec}_{dem_label}.png"
+        png.parent.mkdir(parents=True, exist_ok=True)
+        _quicklook_png(src, png)
 
-# ─────────────────────────── batch driver ────────────────────────────────
-def batch_from_csv(n_pairs: int = 4) -> None:
+    # Fringes -> rename to DEM-tagged name (helper creates name with params)
+    create_fringe_tif(work_dir=wdir, out_dir=inspect_dir,
+                      ref=ref, sec=sec, range_looks=range_looks,
+                      azi_looks=az_looks, alpha=alpha)
+    old_fringe = inspect_dir / f"FRINGES_{ref}_{sec}_ra{range_looks}_az{az_looks}_{alpha}.tif"
+    new_fringe = inspect_dir / f"FRINGES_{ref}_{sec}_{dem_label}.tif"
+    if old_fringe.exists():
+        shutil.move(old_fringe, new_fringe)
+        _quicklook_png(new_fringe, HOME_PROC / "inspect" / f"FRINGES_{ref}_{sec}_{dem_label}.png")
+
+    print(f"📑 results: {wdir}")
+    print(f"✅ done: {pair_id}")
+
+
+# ─────────────────────────── batch (shape preserved) ───────────────────────────
+def batch_from_csv(n_pairs: int = 999999) -> None:
+    """
+    Keep the simple shape of your original:
+      - open CSV
+      - skip header
+      - enumerate rows with an n_pairs ceiling
+      - parse (path, ref, sec)
+    Here we only run **path 150**, and for **each pair** we run **SRTM then 3DEP**.
+    """
     csv_path = Path("/home/bakke326l/InSAR/main/data/pairs.csv")
     with csv_path.open() as f:
         rdr = csv.reader(f)
@@ -156,27 +239,34 @@ def batch_from_csv(n_pairs: int = 4) -> None:
             if i >= n_pairs:
                 break
             path, ref, sec = int(row[0]), row[1], row[2]
-            for r, a, alp in COMBOS:
-                run_pair(path, ref, sec, r, a, alp)
+            if path != 150:
+                continue
+            # run DEM then DTM before moving to next pair
+            run_pair_with_dem(path, ref, sec, "3DEP", THREEDEP_TIF)
+            run_pair_with_dem(path, ref, sec, "SRTM", SRTM_TIF)
+            
 
-# ─────────────────────────── CLI fallback ────────────────────────────────
+
+# ─────────────────────────── CLI ───────────────────────────
 if __name__ == "__main__":
     p = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Run one ALOS pair (manual) or nothing to batch the first 4 pairs."
+        description="Run ALL pairs for path 150 (both SRTM and 3DEP) or a single pair."
     )
-    p.add_argument("path", nargs="?", type=int, help="ALOS path/track number")
-    p.add_argument("reference", nargs="?", help="Reference date  YYYYMMDD")
-    p.add_argument("secondary", nargs="?", help="Secondary date YYYYMMDD")
-    p.add_argument("--range",  type=int,   default=4,   help="Range looks")
-    p.add_argument("--az",     type=int,   default=1,   help="Azimuth looks")
-    p.add_argument("--alpha",  type=float, default=0.8, help="Goldstein alpha")
-
+    p.add_argument("reference", nargs="?", help="Reference date YYYYMMDD (single-pair mode)")
+    p.add_argument("secondary", nargs="?", help="Secondary date YYYYMMDD (single-pair mode)")
+    p.add_argument("--range",  type=int,   default=DEF_RANGE, help="Range looks (fixed)")
+    p.add_argument("--az",     type=int,   default=DEF_AZ,    help="Azimuth looks (fixed)")
+    p.add_argument("--alpha",  type=float, default=DEF_ALPHA, help="Goldstein alpha (fixed)")
+    p.add_argument("--n",      type=int,   default=999999,    help="Limit number of CSV rows (batch mode)")
     args = p.parse_args()
 
-    if args.path is None:
-        # no positional args → full batch mode
-        batch_from_csv(4)
+    if args.reference and args.secondary:
+        # single pair (also run both DEMs)
+        run_pair_with_dem(150, args.reference, args.secondary, "3DEP", THREEDEP_TIF,
+                    range_looks=args.range, az_looks=args.az, alpha=args.alpha)
+        run_pair_with_dem(150, args.reference, args.secondary, "SRTM", SRTM_TIF,
+                          range_looks=args.range, az_looks=args.az, alpha=args.alpha)
     else:
-        run_pair(args.path, args.reference, args.secondary,
-                 args.range, args.az, args.alpha)
+        # batch, path 150 only, both DEMs per pair
+        batch_from_csv(args.n)
