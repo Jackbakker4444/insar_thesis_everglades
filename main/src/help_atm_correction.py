@@ -60,30 +60,36 @@ def do_iono_correction(work_dir: Path, out_dir: Path, input_unw: Path, output_su
     # Read input unwrapped (phase band is commonly band 2; fallback to band 1 if single-band)
     with rasterio.open(input_unw) as src_igram:
         profile = src_igram.profile
-        profile.update(dtype=float32, count=1, nodata=np.nan, compress="deflate", predictor=3, zlevel=6)
+        profile.update(dtype="float32", count=1, nodata=np.nan, compress="deflate", predictor=3, zlevel=6)
         if src_igram.count == 1:
             phase_in = src_igram.read(1)
         else:
             phase_in = src_igram.read(2)  # band 2 = phase (ISCE unw)
 
     with rasterio.open(iono_phase) as src_iono:
-        iono_band = src_iono.read(1)
+        iono_band = src_iono.read(1).astype("float32")
 
     with rasterio.open(iono_mask) as src_mask:
-        mask_band = src_mask.read(1)
+        mask_raw = src_mask.read(1)
+        
+    mask01 = (mask_raw > 0).astype("float32")
 
     # Apply correction and rewrap
-    corrected = (phase_in - iono_band) * mask_band
-    wrapped   = corrected - np.round(corrected / (2.0 * np.pi)) * 2.0 * np.pi
+    corrected = phase_in - iono_band
+    corrected = np.where(mask01 > 0, corrected, np.float32(np.nan))
+    
+    wrapped   = np.where(np.isfinite(corrected), 
+                         corrected - np.round(corrected / (2.0 * np.pi)) * 2.0 * np.pi,
+                         np.float32(np.nan)).astype("float32")
 
     # Outputs (names matched to apply_atmos_corrections.py)
     dst_corr_path = out_dir / f"filt_topophase{output_suffix}.unw.geo"
     dst_wrap_path = out_dir / f"filt_topophase{output_suffix}_wrapped.unw.geo"
 
     with rasterio.open(dst_corr_path, "w", **profile) as dst:
-        dst.write(corrected.astype(float32), 1)
+        dst.write(corrected.astype("float32"), 1)
     with rasterio.open(dst_wrap_path, "w", **profile) as dst:
-        dst.write(wrapped.astype(float32), 1)
+        dst.write(wrapped.astype("float32"), 1)
 
     print("✓ ionosphere corrected:", dst_corr_path)
     print("✓ wrapped version:",     dst_wrap_path)
