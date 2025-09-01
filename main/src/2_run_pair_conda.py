@@ -59,6 +59,9 @@ import numpy as np, rasterio
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
 
+# Make GDAL more memory-friendly for large translates
+os.environ.setdefault("GDAL_CACHEMAX", "512")  # MB
+
 # your helpers
 from help_xml_isce import write_stripmap_xml
 from help_xml_dem  import write_dem_report
@@ -105,19 +108,31 @@ def _log_status(path: int, ref: str, sec: str, dem: str,
         f.write(row)
 
 # ─────────────────────── utilities ───────────────────────
-def _quicklook_png(src: Path, dst: Path, band: int = 1) -> None:
-    """Save tiff as PNG."""
+def _quicklook_png(src: Path, dst: Path, band: int = 1, max_wh: int = 4096) -> None:
+    """
+    Fast, low-RAM PNG quicklook from any raster (VRT/TIF).
+    Downsamples on read so we never load a full huge array.
+    """
     turbo = colormaps.get_cmap("turbo")
+    from rasterio.enums import Resampling
     with rasterio.open(src) as ds:
-        arr = ds.read(band, masked=True)
+        scale = max(1, int(np.ceil(max(ds.width, ds.height) / max_wh)))
+        out_h, out_w = max(1, ds.height // scale), max(1, ds.width // scale)
+        arr = ds.read(
+            band,
+            out_shape=(1, out_h, out_w),
+            resampling=Resampling.bilinear,
+            masked=True,
+        ).squeeze()
     if hasattr(arr, "mask") and np.asarray(arr.mask).all():
-        plt.imsave(dst, np.zeros((*arr.shape, 3), dtype=np.uint8))
+        plt.imsave(dst, np.zeros((out_h, out_w, 3), dtype=np.uint8))
         return
     vmin, vmax = np.percentile(arr.compressed(), [1, 99])
-    norm = np.clip((arr - vmin) / (vmax - vmin), 0, 1)
-    rgba = (turbo(norm.filled(0)) * 255).astype(np.uint8)
-    rgb  = rgba[..., :3]
-    plt.imsave(dst, rgb)
+    if not np.isfinite([vmin, vmax]).all() or vmin == vmax:
+        vmin, vmax = float(np.nanmin(arr)), float(np.nanmax(arr))
+    norm = np.clip((arr - vmin) / (vmax - vmin + 1e-12), 0, 1)
+    rgba = (turbo(np.ma.filled(norm, 0)) * 255).astype(np.uint8)
+    plt.imsave(dst, rgba[..., :3])
 
 def _ensure_dem(tif_path: Path) -> Path:
     """
@@ -150,7 +165,14 @@ def _core_ifg_exists(wdir: Path) -> bool:
 def _safe_translate(src: Path, dst: Path) -> bool:
     """gdal_translate wrapper that won't crash the batch."""
     try:
-        subprocess.check_call(["gdal_translate", "-of", "GTiff", str(src), str(dst)])
+        subprocess.check_call([
+            "gdal_translate",
+            "-of", "GTiff",
+            "-co", "TILED=YES",
+            "-co", "COMPRESS=DEFLATE",
+            "-co", "BIGTIFF=IF_SAFER",
+            str(src), str(dst)
+        ])
         return True
     except CalledProcessError as e:
         print(f"⚠️  gdal_translate failed: {src.name} → {e}")
@@ -171,27 +193,37 @@ def _make_quicklooks(wdir: Path, ref: str, sec: str, dem_label: str) -> tuple[in
     inspect_dir.mkdir(exist_ok=True, parents=True)
     igram_dir = wdir / "interferogram"
 
-    products = [
-        igram_dir / "phsig.cor.geo.vrt",
-        igram_dir / "topophase.cor.geo.vrt",
-        igram_dir / "filt_topophase.unw.geo.vrt",
+    # For phsig.cor: skip TIF copy (PNG directly from VRT to avoid heavy I/O)
+    product_specs = [
+        (igram_dir / "phsig.cor.geo.vrt",          False),  # no TIF; PNG from VRT
+        (igram_dir / "topophase.cor.geo.vrt",      True),   # make TIF + PN
+        (igram_dir / "filt_topophase.unw.geo.vrt", True),   # make TIF + PNG
     ]
-    for src in products:
+    for src, make_tif in product_specs:
         if not src.exists():
             print(f"⚠️  Missing product (skipping): {src}")
             missing += 1
             continue
-        tif = inspect_dir / f"{src.stem}_{ref}_{sec}_{dem_label}.tif"
-        if _safe_translate(src, tif):
-            ok += 1
-            png = HOME_PROC / "inspect" / f"{src.stem}_{ref}_{sec}_{dem_label}.png"
-            png.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                _quicklook_png(tif, png)  # plot from translated GeoTIFF
-            except Exception as e:
-                print(f"⚠️  quicklook failed for {tif.name}: {e}")
+        png = inspect_dir / f"{src.stem}_{ref}_{sec}_{dem_label}.png"
+        png.parent.mkdir(parents=True, exist_ok=True)
+        if make_tif:
+            tif = inspect_dir / f"{src.stem}_{ref}_{sec}_{dem_label}.tif"
+            if _safe_translate(src, tif):
+                ok += 1
+                try:
+                    _quicklook_png(tif, png)
+                except Exception as e:
+                    print(f"⚠️  quicklook failed for {tif.name}: {e}")
+            else:
+                missing += 1
         else:
-            missing += 1
+            # phsig.cor: create PNG directly from VRT to reduce memory/IO
+            try:
+                _quicklook_png(src, png)
+                ok += 1
+            except Exception as e:
+                print(f"⚠️  quicklook (direct VRT) failed for {src.name}: {e}")
+                missing += 1
 
     # Fringes (helper names with params → we rename if found)
     try:
@@ -203,7 +235,7 @@ def _make_quicklooks(wdir: Path, ref: str, sec: str, dem_label: str) -> tuple[in
         if old.exists():
             try:
                 shutil.move(old, new)
-                _quicklook_png(new, HOME_PROC / "inspect" / f"FRINGES_{ref}_{sec}_{dem_label}.png")
+                _quicklook_png(new, inspect_dir / f"FRINGES_{ref}_{sec}_{dem_label}.png")
                 ok += 1
             except Exception as e:
                 print(f"⚠️  fringe rename/quicklook failed: {e}")
@@ -341,7 +373,7 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     if args.reference and args.secondary:
-        # single pair (also run both DEMs)
+        # single pair (also run both SRTM and 3DEP)
         for dem_label, dem_tif in (("3DEP", THREEDEP_TIF), ("SRTM", SRTM_TIF)):
             run_pair_with_dem(args.path, args.reference, args.secondary, dem_label, dem_tif,
                               range_looks=args.range, az_looks=args.az, alpha=args.alpha,
