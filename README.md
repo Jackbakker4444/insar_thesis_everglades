@@ -469,7 +469,7 @@ inspect/vertical_displacement_cm_<REF>_<SEC>_{RAW|IONO|TROPO|TROPO_IONO}.geo.tif
 * This pipeline depends on **ISCE2**, **GDAL**, **snaphu**, and the **GACOS** product.
 * EDEN water‐level data acknowledged for gauge validation.
 * Portions of iono/tropo workflows mirror ISCE2 tutorial patterns.
+* ChatGPT-5 was used for optimizing code, building docstrings and making this README.md file
 
 ---
 
-**Happy interferogramming!** If you want this README rendered with your actual custom paths, just say the word and share any deviations from the defaults above.

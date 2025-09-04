@@ -1,62 +1,72 @@
 #!/usr/bin/env python3
 """
-6_visualization.py — Build publication-ready figures from metrics & exported TIFFs
+6_visualization.py
+==================
 
-Purpose
--------
-Create figures that summarize accuracy vs. gauge density and time-series behavior
-using the outputs from `5_accuracy_assessment.py`. The script draws uncertainty
-bands from the 5-95th percentiles (central 90%), **clips bands to the y-limits**
-(with small ↑/↓ annotations for the clipped amount), and renders larger, tighter
-map panels under each per-pair plot.
+Builds publication-ready figures *from* the metrics & TIFFs produced by
+`5_accuracy_assessment.py`.
 
-Needed data (inputs & assumptions)
-----------------------------------
-Per AREA (default root: /mnt/DATA2/bakke326l/processing/areas):
-  <AREA>/results/accuracy_metrics.csv
-      • Rebuilt by 5_accuracy_assessment.py; columns include:
-        area, pair_ref, pair_sec, dem, corr, method, replicate, n_cal, area_km2, rmse_cm, ...
-      • If "density" is absent it will be computed as area_km2 / n_cal.
-  <AREA>/results/idw60_<PAIR>.tif
-  <AREA>/results/cal_ti_60pct_<DEMsel>_<PAIR>.tif
-      • GeoTIFFs written by 5_accuracy_assessment.py (replicate #1 plan).
-      • Arrays are float (cm) with nodata set or NaN.
+What this script creates
+------------------------
+A) Per-PAIR, per-AREA "accuracy vs density" (TROPO_IONO core set):
+   • LS • SRTM — solid + translucent (5–95%) band
+   • LS • 3DEP — solid + translucent band
+   • IDW       — dashed + **hatched** band
+   + Under the plot: calibrated TI(60%) & IDW(60%) maps.
+   -> <area>/results/acc_den_pair_<PAIR>.png
 
-Dependencies
-------------
-- Python packages: numpy, pandas, rasterio, matplotlib
-- No external command-line tools required.
+B) Per-AREA, all pairs "accuracy vs density" (TROPO_IONO core set):
+   • Same 3 lines; optionally show median (solid) &/or mean (dotted)
+   -> <area>/results/acc_den_area_<AREA>.png
 
-Outputs & directories
----------------------
-Per AREA:
-  <AREA>/results/acc_den_pair_<PAIR>.png      # per-pair accuracy vs density (+ 2 map panels)
-  <AREA>/results/acc_den_area_<AREA>.png      # all-pairs combined accuracy vs density
-  <AREA>/results/acc_period_<AREA>_SRTM_<D>.png
-  <AREA>/results/acc_period_<AREA>_3DEP_<D>.png
-  <AREA>/results/acc_period_<AREA>_COMBINED_<D>.png
-Global (ALL AREAS):
-  <areas_root>/results/acc_den_ALL_AREAS.png
-  <areas_root>/results/acc_period_ALL_AREAS_<D>.png
+C) ALL-AREAS combined "accuracy vs density":
+   -> <root>/results/acc_den_ALL_AREAS.png
+
+D) Time-series boxplots (IDW • TROPO_IONO at target density):
+   • Per-DEM and combined paired SRTM+3DEP spanning pair dates
+   -> <area>/results/acc_period_*.png and <root>/results/acc_period_ALL_AREAS_*.png
+
+NEW (requested)
+---------------
+E) Per-AREA **SRTM corrections** accuracy vs density:
+   • LS • SRTM • IONO
+   • LS • SRTM • TROPO_IONO
+   • IDW • TROPO_IONO
+   -> <area>/results/acc_den_area_SRTM_CORRS_<AREA>.png
+
+F) Per-PAIR **SRTM corrections** accuracy vs density + **3-map row**:
+   • LS • SRTM • IONO
+   • LS • SRTM • TROPO_IONO
+   • IDW • TROPO_IONO
+   • Maps (smaller, three across):
+       - cal_ti_60pct_SRTM_IONO_<PAIR>.tif
+       - cal_ti_60pct_SRTM_TROPO_IONO_<PAIR>.tif
+       - idw90_<PAIR>.tif (fallback: idw60_<PAIR>.tif)
+   -> <area>/results/acc_den_pair_SRTM_CORRS_<PAIR>.png
+
+Inputs expected
+---------------
+• Per-area metrics CSV (rebuilt by 5_* each run):
+    <areas_root>/<AREA>/results/accuracy_metrics.csv
+• Per-pair maps from 5_*:
+    idw60_<PAIR>.tif         (and optionally idw90_<PAIR>.tif)
+    cal_ti_60pct_<DEM>_<PAIR>.tif
+    cal_ti_60pct_SRTM_IONO_<PAIR>.tif
+    cal_ti_60pct_SRTM_TROPO_IONO_<PAIR>.tif
+
+Uncertainty bands
+-----------------
+• Uses 5–95% (central 90%). Bands are **clipped to y-limits**; overflow amounts
+  are annotated on the plot margin (↑ / ↓).
 
 How to run
 ----------
-# All areas (default root)
 python 6_visualization.py
-
-# Single area
 python 6_visualization.py --area ENP
-
-# Choose target density for period plots; control summary curves and IDW axis DEM
-python 6_visualization.py --target-density 500 --no-show-mean --idw-dem-density SRTM
-
-Notes
------
-- Density (km² per gauge) is plotted on a log x-axis; a top x-axis mirrors ticks
-  as number of calibration gauges using each curve's reference area.
-- “IDW” lines/bands are hatched to visually separate from least-squares curves.
-- Band clipping prevents extreme outliers from vertically stretching plots; the
-  clipped magnitude is annotated at the plot margins.
+python 6_visualization.py --target-density 500
+python 6_visualization.py --no-show-mean
+python 6_visualization.py --no-show-median
+python 6_visualization.py --idw-dem-density SRTM   # SRTM|3DEP|AUTO for IDW x-axis
 """
 
 from __future__ import annotations
@@ -79,7 +89,8 @@ from matplotlib.patches import Patch
 AREAS_ROOT_DEFAULT = Path("/mnt/DATA2/bakke326l/processing/areas")
 DEMS = ["SRTM", "3DEP"]
 CORR_TROPO_IONO = "TROPO_IONO"
-# IMPORTANT: columns are uppercased on load, so constants must be uppercase:
+CORR_IONO = "IONO"
+# IMPORTANT: we uppercase columns on load; constants must be uppercase:
 METHOD_LS = "LEAST_SQUARES"
 METHOD_IDW = "IDW_DHVIS"
 CMAP_INV = "viridis_r"  # inverted: dark blue = larger
@@ -98,57 +109,17 @@ for _n in ("rasterio", "rasterio._io", "rasterio.env", "rasterio._base", "matplo
 
 # -------------------------- Small helpers ------------------------------------
 def _pair_dates_from_tag(pair_tag: str) -> Tuple[str, str]:
-    """
-    Convert 'YYYYMMDD_YYYYMMDD' → ('YYYY-MM-DD','YYYY-MM-DD').
-
-    Parameters
-    ----------
-    pair_tag : str
-
-    Returns
-    -------
-    tuple[str, str]
-    """
+    """'YYYYMMDD_YYYYMMDD' → ('YYYY-MM-DD','YYYY-MM-DD')."""
     a, b = pair_tag.split("_")
     return f"{a[:4]}-{a[4:6]}-{a[6:]}", f"{b[:4]}-{b[4:6]}-{b[6:]}"
 
 def _ensure_upper(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Uppercase the 'dem', 'corr', and 'method' columns if present (normalize for joins/filters).
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-
-    Returns
-    -------
-    pandas.DataFrame
-        Same frame with selected columns uppercased.
-    """
     for c in ("dem", "corr", "method"):
         if c in df.columns:
             df[c] = df[c].astype(str).str.upper()
     return df
 
 def _read_area_metrics(area_dir: Path) -> Optional[pd.DataFrame]:
-    """
-    Load <AREA>/results/accuracy_metrics.csv and normalize fields.
-
-    Behavior
-    --------
-    - Uppercases DEM/CORR/METHOD.
-    - Adds 'density' = area_km2 / n_cal if absent.
-    - Normalizes pair_ref/pair_sec to ISO strings and adds 'pair_tag' = 'YYYYMMDD_YYYYMMDD'.
-
-    Parameters
-    ----------
-    area_dir : Path
-
-    Returns
-    -------
-    pandas.DataFrame | None
-        None if the CSV is missing.
-    """
     f = area_dir / "results" / "accuracy_metrics.csv"
     if not f.exists():
         return None
@@ -167,21 +138,7 @@ def _read_area_metrics(area_dir: Path) -> Optional[pd.DataFrame]:
     return df
 
 def _choose_idw_dem(df: pd.DataFrame, pref: str) -> Optional[str]:
-    """
-    Decide which DEM's rows to use for the IDW curve's x-axis density.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Subset of metrics for METHOD == IDW_DHVIS.
-    pref : str
-        'SRTM' | '3DEP' | 'AUTO' (AUTO falls back to available DEMs).
-
-    Returns
-    -------
-    str | None
-        Chosen DEM name, or None if not found.
-    """
+    """Pick which DEM to use for the IDW density axis (SRTM preferred)."""
     if df is None or df.empty:
         return None
     present = sorted(df["dem"].unique().tolist())
@@ -194,21 +151,11 @@ def _choose_idw_dem(df: pd.DataFrame, pref: str) -> Optional[str]:
 
 def _agg_curve(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Aggregate rows (across replicates/pairs as provided) into a curve by n_cal.
-
-    Returns columns
-    ---------------
-    n_cal, med_rmse, mean_rmse, p_low, p_high, med_density
-    where p_low/p_high are the central band percentiles (P_LOW/P_HIGH).
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-
-    Returns
-    -------
-    pandas.DataFrame
+    Aggregate rows (across replicates/pairs as given) into a curve indexed by n_cal:
+      returns columns: n_cal, med_rmse, mean_rmse, p_low, p_high, med_density
     """
+    if df.empty:
+        return pd.DataFrame(columns=["n_cal","med_rmse","mean_rmse","p_low","p_high","med_density"])
     g = (df.groupby("n_cal", as_index=False)
            .agg(med_rmse=("rmse_cm", "median"),
                 mean_rmse=("rmse_cm", "mean"),
@@ -220,26 +167,12 @@ def _agg_curve(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------- Band clipping & annotation (prevents y-stretch from extremes) -----
 def _init_clip_notes(ax):
-    """
-    Initialize per-axis counters used to stack band-clipping annotations (↑/↓).
-    Attach private attributes on the Axes instance.
-    """
+    """Initialize per-axis counters for stacking clip annotations."""
     ax._clip_note_top = 0
     ax._clip_note_bot = 0
 
 def _annotate_clip(ax, side: str, label: str, cm_excess: float, color: str):
-    """
-    Annotate the top/bottom of the plot with the amount by which a band would
-    exceed the y-limits (after clipping).
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-    side : {'top','bottom'}
-    label : str
-    cm_excess : float
-    color : str
-    """
+    """Place a small note at top/bottom showing band exceedance beyond y-limits."""
     if not np.isfinite(cm_excess) or cm_excess <= 1e-6:
         return
     if side == "top":
@@ -259,23 +192,16 @@ def _shade_band_clipped(ax, x, ylo, yhi, color, *,
                         hatched: bool = False, alpha: float = 0.18, z: int = 1,
                         y_min: float = 0.0, y_max: float = 1.0, label_for_note: str = ""):
     """
-    Draw a percentile band clipped to [y_min, y_max] with optional hatching.
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-    x, ylo, yhi : array-like
-    color : str
-    hatched : bool, optional
-    alpha : float, optional
-    z : int, optional
-    y_min, y_max : float
-    label_for_note : str
+    Draw an uncertainty band, **clipped** to [y_min, y_max]. Any amount that would
+    have extended beyond is summarized with a small note (↑ / ↓).
     """
-
+    if x is None or len(x) == 0:
+        return
     x = np.asarray(x)
     ylo = np.asarray(ylo, dtype=float)
     yhi = np.asarray(yhi, dtype=float)
+    if ylo.size == 0 or yhi.size == 0:
+        return
 
     top_excess = float(np.nanmax(np.maximum(0.0, yhi - y_max))) if yhi.size else 0.0
     bot_excess = float(np.nanmax(np.maximum(0.0, y_min - ylo))) if ylo.size else 0.0
@@ -295,17 +221,7 @@ def _shade_band_clipped(ax, x, ylo, yhi, color, *,
     _annotate_clip(ax, "bottom", label_for_note, bot_excess, color)
 
 def _top_axis_ticks(ax, area_ref: float, n_list: List[int], xmin: float, xmax: float):
-    """
-    Create a mirrored top x-axis showing **number of gauges** aligned to the log density axis.
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-    area_ref : float
-        Reference area (km²) for mapping density ↔ gauge count.
-    n_list : list[int]
-    xmin, xmax : float
-    """
+    """Top x-axis with number of gauges (left many → right few)."""
     ax_top = ax.twiny()
     ax_top.set_xscale("log"); ax_top.set_xlim(xmin, xmax)
     n_sorted = sorted(set(int(n) for n in n_list if n > 0), reverse=True)
@@ -317,96 +233,89 @@ def _top_axis_ticks(ax, area_ref: float, n_list: List[int], xmin: float, xmax: f
     ax_top.set_xlabel("Number of calibration gauges")
     ax_top.tick_params(axis="x", labelsize=8)
 
-# -------------------------- Maps under the pair plot --------------------------
-def _plot_maps_row(fig, axes_bottom, area_dir: Path, pair_tag: str):
-    """
-    Render two map panels (Calibrated TI • 60% and IDW Δh_vis • 60%) below a per-pair plot.
+# -------------------------- Map helpers --------------------------------------
+def _read_tif_array(path: Path) -> Optional[np.ndarray]:
+    if not path or not path.exists():
+        return None
+    with rasterio.open(path) as ds:
+        a = ds.read(1).astype(float)
+        if ds.nodata is not None and not np.isnan(ds.nodata):
+            a = np.where(a == ds.nodata, np.nan, a)
+        extent = (ds.bounds.left, ds.bounds.right, ds.bounds.bottom, ds.bounds.top)
+        return a, extent
 
-    Inputs
-    ------
-    <AREA>/results/cal_ti_60pct_*_<PAIR>.tif  (any DEM)
-    <AREA>/results/idw60_<PAIR>.tif
-
-    Notes
-    -----
-    - Uses a shared color scale from the 2-98th percentile across available panels.
-    """
+def _plot_maps_row_two(fig, axes_bottom, area_dir: Path, pair_tag: str):
+    """Render the 60% calibrated TI and 60% IDW maps under the core per-pair plot."""
     ax1, ax2 = axes_bottom
-
     resdir = area_dir / "results"
-    candidates = list(resdir.glob(f"cal_ti_60pct_*_{pair_tag}.tif"))
-    cal_ti = candidates[0] if candidates else None
+    cal_ti = next(iter(resdir.glob(f"cal_ti_60pct_*_{pair_tag}.tif")), None)
     idw_tif = resdir / f"idw60_{pair_tag}.tif"
 
-    # Read arrays to set a consistent color scale
-    arrs = []
-    if cal_ti and cal_ti.exists():
-        with rasterio.open(cal_ti) as ds:
-            a = ds.read(1).astype(float)
-            if ds.nodata is not None and not np.isnan(ds.nodata):
-                a = np.where(a == ds.nodata, np.nan, a)
-            arrs.append(a[np.isfinite(a)])
-    if idw_tif.exists():
-        with rasterio.open(idw_tif) as ds:
-            b = ds.read(1).astype(float)
-            if ds.nodata is not None and not np.isnan(ds.nodata):
-                b = np.where(b == ds.nodata, np.nan, b)
-            arrs.append(b[np.isfinite(b)])
+    arrays = []
+    a1 = _read_tif_array(cal_ti) if cal_ti else None
+    a2 = _read_tif_array(idw_tif) if idw_tif.exists() else None
+    if a1: arrays.append(a1[0][np.isfinite(a1[0])])
+    if a2: arrays.append(a2[0][np.isfinite(a2[0])])
     vmin, vmax = (0.0, 1.0)
-    if arrs:
-        vals = np.concatenate(arrs) if len(arrs) > 1 else arrs[0]
+    if arrays:
+        vals = np.concatenate(arrays) if len(arrays) > 1 else arrays[0]
         if vals.size:
             vmin, vmax = np.nanpercentile(vals, [2, 98])
 
-    # Plot calibrated TI
-    if cal_ti and cal_ti.exists():
-        with rasterio.open(cal_ti) as ds:
-            a = ds.read(1)
-            if ds.nodata is not None and not np.isnan(ds.nodata):
-                a = np.where(a == ds.nodata, np.nan, a)
-            im = ax1.imshow(a, extent=(ds.bounds.left, ds.bounds.right, ds.bounds.bottom, ds.bounds.top),
-                            origin='upper', cmap=CMAP_INV, vmin=vmin, vmax=vmax)
-            ax1.set_title(f"Calibrated TI (60%) — {cal_ti.stem}", fontsize=10)
-            cb = plt.colorbar(im, ax=ax1, fraction=0.042, pad=0.02); cb.set_label("cm")
+    if a1:
+        im = ax1.imshow(a1[0], extent=a1[1], origin='upper', cmap=CMAP_INV, vmin=vmin, vmax=vmax)
+        ax1.set_title(f"Calibrated Interferogram (60%) ", fontsize=10)
+        cb = plt.colorbar(im, ax=ax1, fraction=0.042, pad=0.02); cb.set_label("cm")
     else:
-        ax1.text(0.5, 0.5, "Missing calibrated TI (60%)", ha="center", va="center")
-        ax1.set_axis_off()
+        ax1.text(0.5, 0.5, "Missing calibrated TI (60%)", ha="center", va="center"); ax1.set_axis_off()
 
-    # Plot IDW(Δh_vis) 60%
-    if idw_tif.exists():
-        with rasterio.open(idw_tif) as ds:
-            a = ds.read(1)
-            if ds.nodata is not None and not np.isnan(ds.nodata):
-                a = np.where(a == ds.nodata, np.nan, a)
-            im = ax2.imshow(a, extent=(ds.bounds.left, ds.bounds.right, ds.bounds.bottom, ds.bounds.top),
-                            origin='upper', cmap=CMAP_INV, vmin=vmin, vmax=vmax)
-            ax2.set_title(f"IDW Δh_vis (60%) — {idw_tif.stem}", fontsize=10)
-            cb = plt.colorbar(im, ax=ax2, fraction=0.042, pad=0.02); cb.set_label("cm")
+    if a2:
+        im = ax2.imshow(a2[0], extent=a2[1], origin='upper', cmap=CMAP_INV, vmin=vmin, vmax=vmax)
+        ax2.set_title(f"Inverse Distance Weighted Watergauges (60%)", fontsize=10)
+        cb = plt.colorbar(im, ax=ax2, fraction=0.042, pad=0.02); cb.set_label("cm")
     else:
-        ax2.text(0.5, 0.5, "Missing IDW 60% TIFF", ha="center", va="center")
-        ax2.set_axis_off()
+        ax2.text(0.5, 0.5, "Missing IDW 60% TIFF", ha="center", va="center"); ax2.set_axis_off()
 
-# ---------------------- Per-pair per-area acc_den (+maps) --------------------
+def _plot_maps_row_three(fig, axes_bottom, area_dir: Path, pair_tag: str):
+    """
+    Render three smaller maps (left→right):
+      1) cal_ti_60pct_SRTM_IONO_<PAIR>.tif
+      2) cal_ti_60pct_SRTM_TROPO_IONO_<PAIR>.tif
+      3) idw90_<PAIR>.tif  (fallback: idw60_<PAIR>.tif)
+    """
+    ax1, ax2, ax3 = axes_bottom
+    resdir = area_dir / "results"
+    tif_iono = resdir / f"cal_ti_60pct_SRTM_IONO_{pair_tag}.tif"
+    tif_ti   = resdir / f"cal_ti_60pct_SRTM_TROPO_IONO_{pair_tag}.tif"
+    tif_idw = resdir / f"idw60_{pair_tag}.tif"
+
+    items = [
+        ("Interferogram SRTM Iono corrected (60%)", _read_tif_array(tif_iono), ax1, tif_iono.stem if tif_iono.exists() else None),
+        ("Interferogram SRTM Tropo + Iono corrected (60%)", _read_tif_array(tif_ti), ax2, tif_ti.stem if tif_ti.exists() else None),
+        ("Inverse Distance Weighted Watergauges (60%)", _read_tif_array(tif_idw), ax3, tif_idw.stem if tif_idw.exists() else None),
+    ]
+
+    arrays = [it[1][0][np.isfinite(it[1][0])] for it in items if it[1] is not None]
+    vmin, vmax = (0.0, 1.0)
+    if arrays:
+        vals = np.concatenate(arrays) if len(arrays) > 1 else arrays[0]
+        if vals.size:
+            vmin, vmax = np.nanpercentile(vals, [2, 98])
+
+    for title, data, ax, stem in items:
+        if data is None:
+            ax.text(0.5, 0.5, f"Missing {title}", ha="center", va="center")
+            ax.set_axis_off()
+            continue
+        arr, extent = data
+        im = ax.imshow(arr, extent=extent, origin='upper', cmap=CMAP_INV, vmin=vmin, vmax=vmax)
+        ax.set_title(f"{title}", fontsize=9)
+        cb = plt.colorbar(im, ax=ax, fraction=0.042, pad=0.02); cb.set_label("cm")
+
+# ---------------------- Core per-pair acc_den (+maps) ------------------------
 def plot_acc_den_pair(area_dir: Path, df_area: pd.DataFrame, pair_tag: str,
                       idw_dem_pref: str = IDW_DEM_DENSITY_DEFAULT):
-    """
-    Per-PAIR, per-AREA accuracy-vs-density plot (TROPO_IONO only) + two map panels.
-
-    Curves
-    ------
-    - LS • SRTM (solid + translucent band)
-    - LS • 3DEP (solid + translucent band)
-    - IDW (dashed + hatched band)
-
-    Parameters
-    ----------
-    area_dir : Path
-    df_area : pandas.DataFrame
-    pair_tag : str
-    idw_dem_pref : str
-        'SRTM' | '3DEP' | 'AUTO' for choosing IDW x-axis density.
-    """
-
+    """Core TROPO_IONO trio: LS•SRTM, LS•3DEP, IDW (per pair) + two maps under it."""
     area_name = area_dir.name
     ref_iso, sec_iso = _pair_dates_from_tag(pair_tag)
     sub = df_area[(df_area["pair_ref"] == ref_iso) &
@@ -442,20 +351,20 @@ def plot_acc_den_pair(area_dir: Path, df_area: pd.DataFrame, pair_tag: str,
     med_max = max((g["med_rmse"].max() for g in curves.values() if not g.empty), default=1.0)
     y_min, y_max = 0.0, float(med_max * 1.15 if np.isfinite(med_max) and med_max > 0 else 1.0)
     ax.set_ylim(y_min, y_max)
-
+    
     _init_clip_notes(ax)
 
     # Plot lines + clipped bands
     all_n = set()
     for key, g in curves.items():
         if key == "IDW":
-            ax.plot(g["med_density"], g["med_rmse"], "--", color=colors["IDW"], lw=1.9, label="IDW • TROPO_IONO")
+            ax.plot(g["med_density"], g["med_rmse"], "--", color=colors["IDW"], lw=1.9, label="IDW")
             _shade_band_clipped(ax, g["med_density"], g["p_low"], g["p_high"], colors["IDW"],
                                 hatched=True, alpha=0.14, z=1, y_min=y_min, y_max=y_max,
                                 label_for_note="IDW")
         else:
             dem = key.split("_", 1)[1]
-            label = f"LS • {dem}"
+            label = f"Interferogram • {dem}"
             ax.plot(g["med_density"], g["med_rmse"], "-", color=colors[dem], lw=1.9, label=label)
             _shade_band_clipped(ax, g["med_density"], g["p_low"], g["p_high"], colors[dem],
                                 hatched=False, alpha=0.22, z=1, y_min=y_min, y_max=y_max,
@@ -463,7 +372,6 @@ def plot_acc_den_pair(area_dir: Path, df_area: pd.DataFrame, pair_tag: str,
         if "n_cal" in g.columns:
             all_n.update(g["n_cal"].tolist())
 
-    # Axis cosmetics
     xmin = min(g["med_density"].min() for g in curves.values())
     xmax = max(g["med_density"].max() for g in curves.values())
     ax.set_xscale("log"); ax.set_xlim(xmin, xmax)
@@ -472,39 +380,118 @@ def plot_acc_den_pair(area_dir: Path, df_area: pd.DataFrame, pair_tag: str,
     ax.xaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(1, 10)*0.1))
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.set_ylabel("RMSE (cm)")
-    ax.set_xlabel("Gauge density (km² per gauge) — lower is denser  [log scale]")
+    ax.set_xlabel("Gauge density (km² per gauge) (log scale)")
     ax.grid(True, alpha=0.3, which="both")
-    ax.set_title(f"{area_name} • {pair_tag} — Accuracy vs Density (TROPO_IONO; SRTM & 3DEP LS + IDW)", fontsize=12)
+    ax.set_title(f"{area_name} — {pair_tag} — Error vs Density — SRTM vs 3DEP ", fontsize=12)
     ax.legend(ncols=3, fontsize=9)
 
-    # Top axis: number of gauges. Use median area from chosen IDW DEM rows.
     area_ref = float(sidw["area_km2"].median()) if not sidw.empty else float(sub["area_km2"].median())
     _top_axis_ticks(ax, area_ref, sorted(list(all_n), reverse=True), xmin, xmax)
 
-    # Bottom row maps (bigger & closer)
     ax1 = fig.add_subplot(gs[1, 0])
     ax2 = fig.add_subplot(gs[1, 1])
-    _plot_maps_row(fig, (ax1, ax2), area_dir, pair_tag)
+    _plot_maps_row_two(fig, (ax1, ax2), area_dir, pair_tag)
 
-    out = area_dir / "results" / f"acc_den_pair_{pair_tag}.png"
+    out = area_dir / "results" / f"acc_den_pair_DEM_{pair_tag}.png"
     fig.savefig(out, dpi=140, bbox_inches="tight")
     plt.close(fig)
     print(f"📈 Pair acc_den+maps written: {out}")
 
-# ---------------------- Per-area, all pairs acc_den --------------------------
+# ---------- NEW: Per-pair SRTM corrs (IONO vs TROPO_IONO) + 3-map row --------
+def plot_acc_den_pair_srtm_corrs(area_dir: Path, df_area: pd.DataFrame, pair_tag: str,
+                                 idw_dem_pref: str = "SRTM"):
+    """Per-pair comparison: LS•SRTM(IONO), LS•SRTM(TROPO_IONO), IDW(TROPO_IONO) + 3 maps."""
+    area_name = area_dir.name
+    ref_iso, sec_iso = _pair_dates_from_tag(pair_tag)
+    sub = df_area[(df_area["pair_ref"] == ref_iso) &
+                  (df_area["pair_sec"] == sec_iso)].copy()
+    if sub.empty:
+        print(f"⏭️  No rows for {area_name}:{pair_tag}; skipping SRTM-corrs pair plot.")
+        return
+
+    s_iono = sub[(sub["dem"] == "SRTM") & (sub["method"] == METHOD_LS) & (sub["corr"] == CORR_IONO)]
+    s_ti   = sub[(sub["dem"] == "SRTM") & (sub["method"] == METHOD_LS) & (sub["corr"] == CORR_TROPO_IONO)]
+    idw_dem = _choose_idw_dem(sub[sub["method"] == METHOD_IDW], idw_dem_pref) or "SRTM"
+    s_idw  = sub[(sub["dem"] == idw_dem) & (sub["method"] == METHOD_IDW) & (sub["corr"] == CORR_TROPO_IONO)]
+
+    curves = {}
+    if not s_iono.empty: curves["SRTM_IONO"] = _agg_curve(s_iono)
+    if not s_ti.empty:   curves["SRTM_TI"]   = _agg_curve(s_ti)
+    if not s_idw.empty:  curves["IDW_TI"]    = _agg_curve(s_idw)
+
+    if not curves:
+        print(f"⏭️  No curves for {area_name}:{pair_tag} SRTM-corrs."); return
+
+    # Colors: distinguish the two SRTM corrs
+    c_iono = "#1b9e77"   # greenish
+    c_ti   = "#e7298a"   # magenta
+    c_idw  = "#ff7f0e"   # orange
+
+    fig = plt.figure(figsize=(13.6, 9.0), dpi=140, constrained_layout=False)
+    gs = fig.add_gridspec(nrows=2, ncols=3, height_ratios=[3.0, 2.4], hspace=0.28, wspace=0.06)
+    ax = fig.add_subplot(gs[0, :])
+
+    med_max = max((g["med_rmse"].max() for g in curves.values() if not g.empty), default=1.0)
+    y_min, y_max = 0.0, float(med_max * 1.15 if np.isfinite(med_max) and med_max > 0 else 1.0)
+    ax.set_ylim(y_min, y_max)
+    _init_clip_notes(ax)
+
+    all_n = set()
+    if "SRTM_IONO" in curves:
+        g = curves["SRTM_IONO"]
+        ax.plot(g["med_density"], g["med_rmse"], "-", color=c_iono, lw=1.9, label="Interferogram • Iono")
+        _shade_band_clipped(ax, g["med_density"], g["p_low"], g["p_high"], c_iono,
+                            hatched=False, alpha=0.22, z=1, y_min=y_min, y_max=y_max,
+                            label_for_note="Interferogram Iono")
+        if "n_cal" in g.columns: all_n.update(g["n_cal"].tolist())
+
+    if "SRTM_TI" in curves:
+        g = curves["SRTM_TI"]
+        ax.plot(g["med_density"], g["med_rmse"], "-", color=c_ti, lw=1.9, label="Interferogram • TROPO+IONO")
+        _shade_band_clipped(ax, g["med_density"], g["p_low"], g["p_high"], c_ti,
+                            hatched=False, alpha=0.22, z=1, y_min=y_min, y_max=y_max,
+                            label_for_note="Interferogram Tropo + Iono")
+        if "n_cal" in g.columns: all_n.update(g["n_cal"].tolist())
+
+    if "IDW_TI" in curves:
+        g = curves["IDW_TI"]
+        ax.plot(g["med_density"], g["med_rmse"], "--", color=c_idw, lw=1.9, label="IDW")
+        _shade_band_clipped(ax, g["med_density"], g["p_low"], g["p_high"], c_idw,
+                            hatched=True, alpha=0.14, z=1, y_min=y_min, y_max=y_max,
+                            label_for_note="IDW")
+        if "n_cal" in g.columns: all_n.update(g["n_cal"].tolist())
+
+    xmin = min(g["med_density"].min() for g in curves.values())
+    xmax = max(g["med_density"].max() for g in curves.values())
+    ax.set_xscale("log"); ax.set_xlim(xmin, xmax)
+    ax.xaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:g}"))
+    ax.xaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(1, 10)*0.1))
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.set_ylabel("RMSE (cm)")
+    ax.set_xlabel("Gauge density (km² per gauge) (log scale)")
+    ax.grid(True, alpha=0.3, which="both")
+    ax.set_title(f"{area_name} — {pair_tag} — Error vs Density — With vs Without Tropospheric Correction (SRTM)", fontsize=12)
+    ax.legend(ncols=3, fontsize=9)
+
+    area_ref = float(s_idw["area_km2"].median()) if not s_idw.empty else float(sub["area_km2"].median())
+    _top_axis_ticks(ax, area_ref, sorted(list(all_n), reverse=True), xmin, xmax)
+
+    # Three smaller maps under the plot
+    ax1 = fig.add_subplot(gs[1, 0])
+    ax2 = fig.add_subplot(gs[1, 1])
+    ax3 = fig.add_subplot(gs[1, 2])
+    _plot_maps_row_three(fig, (ax1, ax2, ax3), area_dir, pair_tag)
+
+    out = area_dir / "results" / f"acc_den_pair_SRTM_CORRS_{pair_tag}.png"
+    fig.savefig(out, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"📈 Pair SRTM-corrs acc_den+3maps written: {out}")
+
+# ---------------------- Per-area, all pairs acc_den (core) -------------------
 def plot_acc_den_area(area_dir: Path, df_area: pd.DataFrame, show_mean: bool, show_median: bool,
                       idw_dem_pref: str = IDW_DEM_DENSITY_DEFAULT):
-    """
-    Per-AREA, all-pairs combined accuracy-vs-density plot (TROPO_IONO).
-
-    Parameters
-    ----------
-    area_dir : Path
-    df_area : pandas.DataFrame
-    show_mean : bool
-    show_median : bool
-    idw_dem_pref : str
-    """
+    """Core TROPO_IONO trio: LS•SRTM, LS•3DEP, IDW aggregated across pairs."""
     area_name = area_dir.name
     sub = df_area[df_area["corr"] == CORR_TROPO_IONO].copy()
     if sub.empty:
@@ -531,7 +518,6 @@ def plot_acc_den_area(area_dir: Path, df_area: pd.DataFrame, show_mean: bool, sh
 
     fig, ax = plt.subplots(figsize=(10.8, 6.2), dpi=140, constrained_layout=True)
 
-    # Robust y-limit from **median** lines only
     med_max = max((g["med_rmse"].max() for g in curves.values() if not g.empty), default=1.0)
     y_min, y_max = 0.0, float(med_max * 1.15 if np.isfinite(med_max) and med_max > 0 else 1.0)
     ax.set_ylim(y_min, y_max)
@@ -550,12 +536,12 @@ def plot_acc_den_area(area_dir: Path, df_area: pd.DataFrame, show_mean: bool, sh
         else:
             dem = key.split("_", 1)[1]
             if show_median:
-                ax.plot(g["med_density"], g["med_rmse"], "-", color=colors[dem], lw=1.9, label=f"{dem} median")
+                ax.plot(g["med_density"], g["med_rmse"], "-", color=colors[dem], lw=1.9, label=f"Interferogram • {dem} median")
             if show_mean:
-                ax.plot(g["med_density"], g["mean_rmse"], ":", color=colors[dem], lw=1.7, label=f"{dem} mean")
+                ax.plot(g["med_density"], g["mean_rmse"], ":", color=colors[dem], lw=1.7, label=f"Interferogram • {dem} mean")
             _shade_band_clipped(ax, g["med_density"], g["p_low"], g["p_high"], colors[dem],
                                 hatched=False, alpha=0.22, z=1, y_min=y_min, y_max=y_max,
-                                label_for_note=f"LS • {dem}")
+                                label_for_note=f"{dem}")
         if "n_cal" in g.columns:
             all_n.update(g["n_cal"].tolist())
 
@@ -567,9 +553,9 @@ def plot_acc_den_area(area_dir: Path, df_area: pd.DataFrame, show_mean: bool, sh
     ax.xaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(1, 10)*0.1))
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.set_ylabel("RMSE (cm)")
-    ax.set_xlabel("Gauge density (km² per gauge) — lower is denser  [log scale]")
+    ax.set_xlabel("Gauge density (km² per gauge) (log scale)")
     ax.grid(True, alpha=0.3, which="both")
-    ax.set_title(f"{area_name} — Accuracy vs Density (TROPO_IONO) — all pairs")
+    ax.set_title(f"{area_name} — Accuracy vs Density — SRTM vs 3DEP — All Pairs")
     ax.legend(ncols=3, fontsize=9)
 
     area_ref = float(sidw["area_km2"].median()) if not sidw.empty else float(sub["area_km2"].median())
@@ -580,20 +566,90 @@ def plot_acc_den_area(area_dir: Path, df_area: pd.DataFrame, show_mean: bool, sh
     plt.close(fig)
     print(f"📈 Area acc_den written: {out}")
 
+# ---------- NEW: Per-area SRTM corrs (IONO vs TROPO_IONO) --------------------
+def plot_acc_den_area_srtm_corrs(area_dir: Path, df_area: pd.DataFrame,
+                                 show_mean: bool, show_median: bool,
+                                 idw_dem_pref: str = "SRTM"):
+    """Area-level comparison: LS•SRTM(IONO), LS•SRTM(TROPO_IONO), IDW(TROPO_IONO)."""
+    area_name = area_dir.name
+    sub = df_area.copy()
+    s_iono = sub[(sub["dem"] == "SRTM") & (sub["method"] == METHOD_LS) & (sub["corr"] == CORR_IONO)]
+    s_ti   = sub[(sub["dem"] == "SRTM") & (sub["method"] == METHOD_LS) & (sub["corr"] == CORR_TROPO_IONO)]
+    idw_dem = _choose_idw_dem(sub[sub["method"] == METHOD_IDW], idw_dem_pref) or "SRTM"
+    s_idw  = sub[(sub["dem"] == idw_dem) & (sub["method"] == METHOD_IDW) & (sub["corr"] == CORR_TROPO_IONO)]
+
+    if s_iono.empty and s_ti.empty and s_idw.empty:
+        print(f"⏭️  No SRTM-corr rows for {area_name}; skipping SRTM-corrs area acc_den.")
+        return
+
+    c_iono = "#1b9e77"
+    c_ti   = "#e7298a"
+    c_idw  = "#ff7f0e"
+
+    curves = {}
+    if not s_iono.empty: curves["SRTM_IONO"] = _agg_curve(s_iono)
+    if not s_ti.empty:   curves["SRTM_TI"]   = _agg_curve(s_ti)
+    if not s_idw.empty:  curves["IDW_TI"]    = _agg_curve(s_idw)
+
+    fig, ax = plt.subplots(figsize=(10.8, 6.0), dpi=140, constrained_layout=True)
+
+    med_max = max((g["med_rmse"].max() for g in curves.values() if not g.empty), default=1.0)
+    y_min, y_max = 0.0, float(med_max * 1.15 if np.isfinite(med_max) and med_max > 0 else 1.0)
+    ax.set_ylim(y_min, y_max)
+    _init_clip_notes(ax)
+
+    all_n = set()
+    if "SRTM_IONO" in curves:
+        g = curves["SRTM_IONO"]
+        if show_median: ax.plot(g["med_density"], g["med_rmse"], "-", color=c_iono, lw=1.9, label="Iono median")
+        if show_mean:   ax.plot(g["med_density"], g["mean_rmse"], ":", color=c_iono, lw=1.7, label="Iono mean")
+        _shade_band_clipped(ax, g["med_density"], g["p_low"], g["p_high"], c_iono,
+                            hatched=False, alpha=0.22, z=1, y_min=y_min, y_max=y_max,
+                            label_for_note="Iono")
+        if "n_cal" in g.columns: all_n.update(g["n_cal"].tolist())
+
+    if "SRTM_TI" in curves:
+        g = curves["SRTM_TI"]
+        if show_median: ax.plot(g["med_density"], g["med_rmse"], "-", color=c_ti, lw=1.9, label="Tropo + Iono median")
+        if show_mean:   ax.plot(g["med_density"], g["mean_rmse"], ":", color=c_ti, lw=1.7, label="Tropo + Iono mean")
+        _shade_band_clipped(ax, g["med_density"], g["p_low"], g["p_high"], c_ti,
+                            hatched=False, alpha=0.22, z=1, y_min=y_min, y_max=y_max,
+                            label_for_note="Tropo + Iono")
+        if "n_cal" in g.columns: all_n.update(g["n_cal"].tolist())
+
+    if "IDW_TI" in curves:
+        g = curves["IDW_TI"]
+        if show_median: ax.plot(g["med_density"], g["med_rmse"], "--", color=c_idw, lw=1.9, label="IDW median")
+        if show_mean:   ax.plot(g["med_density"], g["mean_rmse"], ":", color=c_idw, lw=1.7, label="IDW mean")
+        _shade_band_clipped(ax, g["med_density"], g["p_low"], g["p_high"], c_idw,
+                            hatched=True, alpha=0.14, z=1, y_min=y_min, y_max=y_max,
+                            label_for_note="IDW")
+        if "n_cal" in g.columns: all_n.update(g["n_cal"].tolist())
+
+    xmin = min(g["med_density"].min() for g in curves.values())
+    xmax = max(g["med_density"].max() for g in curves.values())
+    ax.set_xscale("log"); ax.set_xlim(xmin, xmax)
+    ax.xaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:g}"))
+    ax.xaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(1, 10)*0.1))
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.set_ylabel("RMSE (cm)")
+    ax.set_xlabel("Gauge density (km² per gauge) (log scale)")
+    ax.grid(True, alpha=0.3, which="both")
+    ax.set_title(f"{area_name} — Error vs Density — With vs Without Tropospheric Correction (SRTM) — All Pairs")
+    ax.legend(ncols=3, fontsize=9)
+
+    area_ref = float(s_idw["area_km2"].median()) if not s_idw.empty else float(sub["area_km2"].median())
+    _top_axis_ticks(ax, area_ref, sorted(list(all_n), reverse=True), xmin, xmax)
+
+    out = area_dir / "results" / f"acc_den_area_SRTM_CORRS_{area_name}.png"
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+    print(f"📈 Area SRTM-corrs acc_den written: {out}")
+
 # ------------------- All-areas combined acc_den (one plot) -------------------
 def plot_acc_den_all_areas(root: Path, df_all: pd.DataFrame, show_mean: bool, show_median: bool,
                            idw_dem_pref: str = IDW_DEM_DENSITY_DEFAULT):
-    """
-    ALL-AREAS combined accuracy-vs-density plot (TROPO_IONO).
-
-    Parameters
-    ----------
-    root : Path
-    df_all : pandas.DataFrame
-    show_mean : bool
-    show_median : bool
-    idw_dem_pref : str
-    """
     if df_all.empty:
         print("⏭️  No metrics loaded for ALL-AREAS acc_den."); return
     sub = df_all[df_all["corr"] == CORR_TROPO_IONO].copy()
@@ -619,7 +675,6 @@ def plot_acc_den_all_areas(root: Path, df_all: pd.DataFrame, show_mean: bool, sh
 
     fig, ax = plt.subplots(figsize=(11.6, 6.3), dpi=140, constrained_layout=True)
 
-    # Robust y-limit from **median** lines only
     med_max = max((g["med_rmse"].max() for g in curves.values() if not g.empty), default=1.0)
     y_min, y_max = 0.0, float(med_max * 1.15 if np.isfinite(med_max) and med_max > 0 else 1.0)
     ax.set_ylim(y_min, y_max)
@@ -643,7 +698,7 @@ def plot_acc_den_all_areas(root: Path, df_all: pd.DataFrame, show_mean: bool, sh
                 ax.plot(g["med_density"], g["mean_rmse"], ":", color=colors[dem], lw=1.7, label=f"{dem} mean")
             _shade_band_clipped(ax, g["med_density"], g["p_low"], g["p_high"], colors[dem],
                                 hatched=False, alpha=0.22, z=1, y_min=y_min, y_max=y_max,
-                                label_for_note=f"LS • {dem}")
+                                label_for_note=f"Interferogram • {dem}")
         if "n_cal" in g.columns:
             all_n.update(g["n_cal"].tolist())
 
@@ -655,9 +710,9 @@ def plot_acc_den_all_areas(root: Path, df_all: pd.DataFrame, show_mean: bool, sh
     ax.xaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(1, 10)*0.1))
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.set_ylabel("RMSE (cm)")
-    ax.set_xlabel("Gauge density (km² per gauge) — lower is denser  [log scale]")
+    ax.set_xlabel("Gauge density (km² per gauge) (log scale)")
     ax.grid(True, alpha=0.3, which="both")
-    ax.set_title("ALL AREAS — Accuracy vs Density (TROPO_IONO)")
+    ax.set_title("All Areas — Accuracy vs Density")
     ax.legend(ncols=3, fontsize=9)
 
     area_ref = float(sidw["area_km2"].median()) if not sidw.empty else float(sub["area_km2"].median())
@@ -672,19 +727,7 @@ def plot_acc_den_all_areas(root: Path, df_all: pd.DataFrame, show_mean: bool, sh
 
 # ------------------------ Time-series boxplots (area) ------------------------
 def _pick_rows_for_target_density(df: pd.DataFrame, target_km2: float) -> pd.DataFrame:
-    """
-    For each (pair, DEM), pick rows whose n_cal yields density closest to `target_km2`.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-    target_km2 : float
-
-    Returns
-    -------
-    pandas.DataFrame
-        Subset keeping all replicates at the chosen n_cal per (pair, DEM).
-    """
+    """For each (pair, dem), choose rows for the n_cal closest to 'target_km2' (keep all replicates)."""
     df = df.copy()
     df["density"] = df["area_km2"] / df["n_cal"].astype(float)
     picks = []
@@ -701,24 +744,10 @@ def _pick_rows_for_target_density(df: pd.DataFrame, target_km2: float) -> pd.Dat
     return pd.concat(picks, ignore_index=True)
 
 def plot_period_area(area_dir: Path, df_area: pd.DataFrame, target_km2: float):
-    """
-    Per-AREA time-series boxplots for IDW • TROPO_IONO at a target density.
-
-    Outputs
-    -------
-    <AREA>/results/acc_period_<AREA>_SRTM_<D>.png
-    <AREA>/results/acc_period_<AREA>_3DEP_<D>.png
-    <AREA>/results/acc_period_<AREA>_COMBINED_<D>.png
-
-    Notes
-    -----
-    - Boxes span the **pair date range**; width encodes duration.
-    - Combined plot draws paired SRTM/3DEP boxes for each pair window.
-    """
     area_name = area_dir.name
-    sub = df_area[(df_area["method"] == METHOD_IDW) & (df_area["corr"] == CORR_TROPO_IONO)].copy()
+    sub = df_area[(df_area["method"] == METHOD_LS) & (df_area["corr"] == CORR_TROPO_IONO)].copy()
     if sub.empty:
-        print(f"⏭️  No IDW TROPO_IONO rows for {area_name}; skipping period plots.")
+        print(f"⏭️  No LS TROPO_IONO rows for {area_name}; skipping period plots.")
         return
     picked = _pick_rows_for_target_density(sub, target_km2)
     if picked.empty:
@@ -754,11 +783,11 @@ def plot_period_area(area_dir: Path, df_area: pd.DataFrame, target_km2: float):
         for med in bp["medians"]:    med.set(color="k", linewidth=1.8)
         for fl in bp["fliers"]:      fl.set(marker="o", ms=3.5, mfc=c, mec="white", alpha=0.85)
 
-        ax.set_ylabel("RMSE (cm) — box: IQR; whiskers: 1.5×IQR; dots: outliers")
+        ax.set_ylabel("RMSE (cm) — box: IQR; whiskers: 1.5xIQR; dots: outliers")
         ax.set_xlabel("Time (box width spans the pair dates)")
         ax.grid(True, alpha=0.3, axis="y")
         ax.xaxis_date(); ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-        ax.set_title(f"{area_name} • DEM={dem} • IDW(TROPO_IONO) at ≈ {target_km2:g} km²/g")
+        ax.set_title(f"{area_name} — {dem} — Interferogram at ≈ {target_km2:g} km² per Gauge Calibration")
         fig.autofmt_xdate()
         fig.savefig(out, dpi=140); plt.close(fig)
         print(f"📈 Period (per-DEM) written: {out}")
@@ -795,19 +824,19 @@ def plot_period_area(area_dir: Path, df_area: pd.DataFrame, target_km2: float):
                 continue
             bp = ax.boxplot([vals], positions=[xpos], widths=[w_each], whis=1.5, patch_artist=True, showfliers=True)
             for box in bp["boxes"]: box.set(facecolor=to_rgba(colors[dem],0.30), edgecolor=colors[dem], linewidth=1.2, hatch=hatches[dem])
-            for whisk in bp["whiskers"]: whisk.set_color=colors[dem]; whisk.set(linewidth=1.2)
+            for whisk in bp["whiskers"]: whisk.set(color=colors[dem], linewidth=1.2)
             for cap in bp["caps"]:       cap.set(color=colors[dem], linewidth=1.2)
             for med in bp["medians"]:    med.set(color="k", linewidth=1.8)
             for fl in bp["fliers"]:      fl.set(marker="o", ms=3.5, mfc=colors[dem], mec="white", alpha=0.85)
 
-    ax.set_ylabel("RMSE (cm) — box: IQR; whiskers: 1.5×IQR; dots: outliers")
-    ax.set_xlabel("Time (paired boxes span each pair’s dates)")
+    ax.set_ylabel("RMSE (cm) — box: IQR; whiskers: 1.5xIQR; dots: outliers")
+    ax.set_xlabel("Time (paired boxes span each pair's dates)")
     ax.grid(True, alpha=0.3, axis="y")
     ax.xaxis_date(); ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     ax.legend(handles=[Patch(facecolor=to_rgba(colors["SRTM"],0.30), edgecolor=colors["SRTM"], hatch=hatches["SRTM"], label="SRTM"),
                        Patch(facecolor=to_rgba(colors["3DEP"],0.30), edgecolor=colors["3DEP"], hatch=hatches["3DEP"], label="3DEP")],
               loc="upper right")
-    ax.set_title(f"{area_name} • IDW(TROPO_IONO) at ≈ {target_km2:g} km²/g — Combined DEMs")
+    ax.set_title(f"{area_name} — Interferogram at ≈ {target_km2:g} km² per Gauge Calibration — Combined DEMs")
     fig.autofmt_xdate()
     out = area_dir / "results" / f"acc_period_{area_name}_COMBINED_{str(target_km2).replace('.','p')}.png"
     fig.savefig(out, dpi=140); plt.close(fig)
@@ -815,16 +844,9 @@ def plot_period_area(area_dir: Path, df_area: pd.DataFrame, target_km2: float):
 
 # ------------------- All-areas combined time-series boxplot ------------------
 def plot_period_all_areas(root: Path, df_all: pd.DataFrame, target_km2: float):
-    """
-    ALL-AREAS time-series boxplot for IDW • TROPO_IONO at a target density.
-
-    Output
-    ------
-    <areas_root>/results/acc_period_ALL_AREAS_<D>.png
-    """
-    sub = df_all[(df_all["method"] == METHOD_IDW) & (df_all["corr"] == CORR_TROPO_IONO)].copy()
+    sub = df_all[(df_all["method"] == METHOD_LS) & (df_all["corr"] == CORR_TROPO_IONO)].copy()
     if sub.empty:
-        print("⏭️  No IDW TROPO_IONO rows for ALL-AREAS period plot."); return
+        print("⏭️  No LS TROPO_IONO rows for ALL-AREAS period plot."); return
     picked = _pick_rows_for_target_density(sub, target_km2)
     if picked.empty:
         print("⏭️  No rows near target density for ALL-AREAS period plot."); return
@@ -864,14 +886,14 @@ def plot_period_all_areas(root: Path, df_all: pd.DataFrame, target_km2: float):
             for med in bp["medians"]:    med.set(color="k", linewidth=1.8)
             for fl in bp["fliers"]:      fl.set(marker="o", ms=3.5, mfc=colors[dem], mec="white", alpha=0.85)
 
-    ax.set_ylabel("RMSE (cm) — box: IQR; whiskers: 1.5×IQR; dots: outliers")
-    ax.set_xlabel("Time (paired boxes span each pair’s dates)")
+    ax.set_ylabel("RMSE (cm) — box: IQR; whiskers: 1.5xIQR; dots: outliers")
+    ax.set_xlabel("Time (paired boxes span each pair's dates)")
     ax.grid(True, alpha=0.3, axis="y")
     ax.xaxis_date(); ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     ax.legend(handles=[Patch(facecolor=to_rgba(colors["SRTM"],0.30), edgecolor=colors["SRTM"], hatch=hatches["SRTM"], label="SRTM"),
                        Patch(facecolor=to_rgba(colors["3DEP"],0.30), edgecolor=colors["3DEP"], hatch=hatches["3DEP"], label="3DEP")],
               loc="upper right")
-    ax.set_title(f"ALL AREAS • IDW(TROPO_IONO) at ≈ {target_km2:g} km²/g — Combined DEMs")
+    ax.set_title(f"All Areas — Interferogram at ≈ {target_km2:g} km² per Gauge Calibration — Combined DEMs")
     fig.autofmt_xdate()
 
     outdir = root / "results"
@@ -882,24 +904,7 @@ def plot_period_all_areas(root: Path, df_all: pd.DataFrame, target_km2: float):
 
 # ----------------------------------- CLI -------------------------------------
 def main():
-    """
-    CLI entry point.
-
-    Arguments
-    ---------
-    --areas-root : str     # root with per-area subfolders (default: /mnt/DATA2/.../areas)
-    --area : str           # only this AREA
-    --target-density : float  # km²/gauge for period selection (closest n_cal)
-    --idw-dem-density : {'SRTM','3DEP','AUTO'}  # which DEM to use for IDW x-axis
-    --no-show-mean : flag  # hide mean curves on area/all-areas acc_den
-    --no-show-median : flag  # hide median curves on area/all-areas acc_den
-
-    Behavior
-    --------
-    Loads per-area metrics, renders per-pair + per-area plots, then ALL-AREAS plots.
-    Writes PNGs to the 'results' folders described above.
-    """
-    ap = argparse.ArgumentParser(description="Visualize accuracy metrics and exported TIFFs (with clipped uncertainty bands).")
+    ap = argparse.ArgumentParser(description="Visualize accuracy metrics and exported TIFFs (with clipped 5–95% uncertainty bands).")
     ap.add_argument("--areas-root", type=str, default=str(AREAS_ROOT_DEFAULT),
                     help="Root folder containing per-area subfolders (default: %(default)s)")
     ap.add_argument("--area", type=str,
@@ -908,7 +913,7 @@ def main():
                     help="Target density (km²/gauge) for period boxplots (closest n_cal is chosen).")
     ap.add_argument("--idw-dem-density", type=str, default=IDW_DEM_DENSITY_DEFAULT,
                     choices=["SRTM", "3DEP", "AUTO"],
-                    help="Which DEM’s density to use for IDW line’s x-axis (default: %(default)s).")
+                    help="Which DEM's density to use for IDW line's x-axis (default: %(default)s).")
     ap.add_argument("--no-show-mean", action="store_true", help="Hide mean lines on area/all-areas acc_den.")
     ap.add_argument("--no-show-median", action="store_true", help="Hide median lines on area/all-areas acc_den.")
     args = ap.parse_args()
@@ -935,9 +940,9 @@ def main():
     for area_name, df_area in area_metrics.items():
         area_dir = root / area_name
 
-        # 1) Per-pair acc_den + maps
+        # 1) Per-pair acc_den (core trio) + maps
         resdir = area_dir / "results"
-        pairs_from_tifs = sorted({
+        pairs = sorted({
             m.group(1)
             for p in resdir.glob("idw60_*.tif")
             for m in [re.match(r"idw60_(\d{8}_\d{8})\.tif", p.name)]
@@ -947,20 +952,31 @@ def main():
              df_area["pair_sec"].astype(str).str.replace("-", "", regex=False)).tolist()
         ))
 
-        for pair_tag in pairs_from_tifs:
+        for pair_tag in pairs:
             try:
                 plot_acc_den_pair(area_dir, df_area, pair_tag, idw_dem_pref=args.idw_dem_density)
             except Exception as e:
-                print(f"⚠️  Pair plot failed for {area_name}:{pair_tag}: {e}")
+                print(f"⚠️  Pair plot failed for {area_name}:{pair_tag} (core): {e}")
+            try:
+                plot_acc_den_pair_srtm_corrs(area_dir, df_area, pair_tag, idw_dem_pref="SRTM")
+            except Exception as e:
+                print(f"⚠️  Pair plot failed for {area_name}:{pair_tag} (SRTM corrs): {e}")
 
-        # 2) Per-area acc_den (all pairs)
+        # 2) Per-area acc_den (core)
         try:
             plot_acc_den_area(area_dir, df_area, show_mean=show_mean, show_median=show_median,
                               idw_dem_pref=args.idw_dem_density)
         except Exception as e:
-            print(f"⚠️  Area acc_den failed for {area_name}: {e}")
+            print(f"⚠️  Area acc_den failed for {area_name} (core): {e}")
 
-        # 3) Period plots (per-DEM and combined)
+        # 3) Per-area acc_den (SRTM corrections)
+        try:
+            plot_acc_den_area_srtm_corrs(area_dir, df_area, show_mean=show_mean, show_median=show_median,
+                                         idw_dem_pref="SRTM")
+        except Exception as e:
+            print(f"⚠️  Area acc_den failed for {area_name} (SRTM corrs): {e}")
+
+        # 4) Period plots (per-DEM and combined)
         try:
             plot_period_area(area_dir, df_area, target_km2=args.target_density)
         except Exception as e:

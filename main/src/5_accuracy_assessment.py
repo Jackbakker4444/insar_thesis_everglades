@@ -938,9 +938,38 @@ def _evaluate_pair_with_shared_split_and_exports(
             print(f"  🗺️  Calibrated TI (1 gauge) written: {out_cal1}")
         except Exception as e:
             print(f"  ⚠️  Calibrated TI (1 gauge) failed for {pair_tag}: {e}")
+
+        # --- Extra per-pair exports used by 6_visualization.py (SRTM IONO & SRTM TI @60%) ---
+        # These are independent of chosen_ti_key; we export them whenever the rasters exist.
+        try:
+            # We use the SAME 60% calibration set (export_plan['cal60_idx']) that was used above.
+            cal60_idx = export_plan["cal60_idx"] if export_plan else None
+
+            if cal60_idx is not None:
+                # 2b-i) SRTM • IONO (60%) → cal_ti_60pct_SRTM_IONO_<PAIR>.tif
+                if ("SRTM", "IONO") in rasters:
+                    insar_srtm_iono = insar_by_key[("SRTM", "IONO")]
+                    a_si, b_si = _fit_ls_params(insar_srtm_iono[cal60_idx], dh_all[cal60_idx])
+                    arr_si = _apply_calibration_to_raster(rasters[("SRTM", "IONO")], a_si, b_si)
+                    out_si = results_dir / f"cal_ti_60pct_SRTM_IONO_{pair_tag}.tif"
+                    _write_tif_like(rasters[("SRTM", "IONO")], out_si, arr_si)
+                    print(f"  🗺️  Calibrated SRTM IONO (60%) written: {out_si}")
+
+                # 2b-ii) SRTM • TROPO_IONO (60%) → cal_ti_60pct_SRTM_TROPO_IONO_<PAIR>.tif
+                if ("SRTM", "TROPO_IONO") in rasters:
+                    insar_srtm_ti = insar_by_key[("SRTM", "TROPO_IONO")]
+                    a_st, b_st = _fit_ls_params(insar_srtm_ti[cal60_idx], dh_all[cal60_idx])
+                    arr_st = _apply_calibration_to_raster(rasters[("SRTM", "TROPO_IONO")], a_st, b_st)
+                    out_st = results_dir / f"cal_ti_60pct_SRTM_TROPO_IONO_{pair_tag}.tif"
+                    _write_tif_like(rasters[("SRTM", "TROPO_IONO")], out_st, arr_st)
+                    print(f"  🗺️  Calibrated SRTM TROPO+IONO (60%) written: {out_st}")
+            else:
+                print(f"  ℹ️  No 60% calibration set captured; skipping SRTM IONO/TI 60% exports for {pair_tag}.")
+        except Exception as e:
+            print(f"  ⚠️  SRTM 60% calibrated exports failed for {pair_tag}: {e}")
     else:
         print(f"  ℹ️  No TROPO_IONO raster for {pair_tag} → calibrated TI exports skipped.")
-
+        
     # --------------------------------------------------------------------------
     return pd.DataFrame.from_records(records)
 
