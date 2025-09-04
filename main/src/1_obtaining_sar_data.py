@@ -1,21 +1,61 @@
 #!/usr/bin/env python3
-"""obtaining_sar_data.py
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Ultra-lean helper for the InSAR thesis workflow.
+"""
+1_obtaining_sar_data.py — Download & organize ASF SAR archives for the InSAR thesis
 
-* Launches your ASF bulk-download script via *subprocess* so that all ZIPs land
-  in `main/data/raw/tmp_downloads/` (per the edits you already made).
-* For every freshly downloaded ZIP it
-    1. finds the matching metadata row in the Vertex CSV that lives in the
-       same **tmp_downloads** directory,
-    2. builds the final target path
-       `main/data/raw/path<PATH_NUM>/<YYYYMMDD>/`,
-    3. unzips the archive there,
-    4. drops a `<GRANULE_NAME>.txt` file containing the full metadata row, and
-    5. **deletes** the original ZIP once everything succeeded to save space.
+Purpose
+-------
+Automate two steps:
+1) Invoke your ASF/Vertex bulk-downloader so newly fetched ZIPs land in the raw
+   staging area, and
+2) Unpack and file each scene into its final location while saving the metadata
+   and deleting the original ZIPs.
 
+Needed data (inputs & assumptions)
+----------------------------------
+- Temporary download folder with new ASF ZIP archives and a Vertex CSV:
+  <RAW_DIR>/tmp_downloads/
+  * The CSV must include the columns: Granule Name, Path Number, Acquisition Date (YYYY-MM-DD...).
+  * Each ZIP filename must start with the Granule Name (e.g., ALPSRP268560510-...zip).
+- A Python downloader script placed next to this file:
+  help_download_all_path_150.py  (rename here if your downloader name changes).
 
-Everything happens inside a single `run()` function to keep the script minimal.
+Dependencies
+------------
+- Python standard library: csv, subprocess, zipfile, pathlib.
+- External but called by this script: your ASF/Vertex downloader that writes into
+  <RAW_DIR>/tmp_downloads/.
+
+Outputs & directories
+---------------------
+- Unpacked scenes organized by path and date:
+  <RAW_DIR>/path<PATH_NUM>/<YYYYMMDD>/
+  e.g., /mnt/DATA2/bakke326l/raw/path150/20071231/
+- One sidecar metadata text per scene:
+  <RAW_DIR>/path<PATH_NUM>/<YYYYMMDD>/<GRANULE_NAME>.txt  (full CSV row).
+- Original ZIPs in <RAW_DIR>/tmp_downloads/ are deleted after successful extraction.
+
+How it works
+------------
+1) Run the downloader; expect ZIPs + a CSV in tmp_downloads/.
+2) Read the first *.csv in tmp_downloads/ and index rows by Granule Name.
+3) For each *.zip:
+   - infer GRANULE_NAME,
+   - look up its CSV row,
+   - build path<PATH_NUM>/<YYYYMMDD>,
+   - unzip there,
+   - write <GRANULE_NAME>.txt with the metadata row,
+   - delete the ZIP.
+
+How to run
+----------
+From a shell (Python 3.x):
+    python 1_obtaining_sar_data.py
+
+Notes
+-----
+- If the downloader script is missing, a FileNotFoundError is raised.
+- If the downloader exits non-zero, a subprocess.CalledProcessError is raised.
+- ZIPs without matching metadata rows are skipped and left in tmp_downloads/.
 """
 from __future__ import annotations
 
@@ -25,7 +65,37 @@ import zipfile
 from pathlib import Path
 
 def run() -> None:
-    """Kick off the download and tidy the results in one go."""
+    """
+    Execute the end-to-end fetch -> organize workflow.
+
+    Steps
+    -----
+    1) Call the local downloader (help_download_all_path_150.py) so new ASF ZIPs and a
+    Vertex CSV appear in <RAW_DIR>/tmp_downloads/.
+    2) Load the first *.csv in tmp_downloads/ and map rows by Granule Name.
+    3) For each ZIP:
+    - determine target folder <RAW_DIR>/path<PATH_NUM>/<YYYYMMDD>/,
+    - extract the ZIP there,
+    - write <GRANULE_NAME>.txt with the full CSV row,
+    - delete the ZIP on success.
+
+    Side effects
+    ------------
+    - Reads:  <RAW_DIR>/tmp_downloads/  (ZIPs, CSV)
+    - Writes: <RAW_DIR>/path<PATH_NUM>/<YYYYMMDD>/  (unpacked scene, metadata)
+    - Deletes: original ZIPs after successful extraction
+
+    Raises
+    ------
+    FileNotFoundError
+        If the downloader script cannot be found next to this file.
+    subprocess.CalledProcessError
+        If the downloader script exits with a non-zero status.
+
+    Returns
+    -------
+    None
+    """
     print("🚀 script started, download of data an unzipping will be done")
     # ------------------------------------------------------------------ paths
     # Script paths
