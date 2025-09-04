@@ -11,13 +11,14 @@ What it does
        eden_metadata.csv
 
 2) Finds vertical displacement rasters produced by your pipeline:
-   <pair_dir>/inspect/vertical_displacement_cm_<REF>_<SEC>.geo.tif
+   <pair_dir>/inspect/vertical_displacement_cm_<REF>_<SEC>_{RAW|TROPO|IONO|TROPO_IONO}.geo.tif
 
    For each raster, clips it by each water area and writes (if coverage passes):
    /mnt/DATA2/bakke326l/processing/areas/<AREA>/
-       <AREA>_vertical_cm_<REF_SEC>_<DEM>.tif
-       <AREA>_vertical_cm_<REF_SEC>_<DEM>.png
+       <AREA>_vertical_cm_<REF_SEC>_<DEM>_<CORR>.tif
+       <AREA>_vertical_cm_<REF_SEC>_<DEM>_<CORR>.png
    where <DEM> is parsed from the pair directory name suffix: _SRTM or _3DEP
+   and <CORR> is one of RAW, TROPO, IONO, TROPO_IONO.
 
 3) Writes a coverage report for everything processed:
    /mnt/DATA2/bakke326l/processing/areas/_reports/coverage_report.csv
@@ -29,22 +30,33 @@ python 4_organize_areas.py
 
 # One file
 python 4_organize_areas.py \
-  --vertical-file /mnt/DATA2/bakke326l/processing/interferograms/path150_20071216_20080131_SRTM/inspect/vertical_displacement_cm_20071216_20080131.geo.tif
+  --vertical-file /mnt/DATA2/bakke326l/processing/interferograms/path150_20071216_20080131_SRTM/inspect/vertical_displacement_cm_20071216_20080131_RAW.geo.tif
 
 # One pair directory (searches pair_dir/inspect/)
 python 4_organize_areas.py \
   --pair-dir /mnt/DATA2/bakke326l/processing/interferograms/path150_20071216_20080131_SRTM
 
-# Tweak coverage thresholds
-python 4_organize_areas.py --min-coverage-pct 50.0 --min-valid-pixels 500
+# Tweak coverage threshold
+python 4_organize_areas.py --min-coverage-pct 50.0
 """
 
 from __future__ import annotations
+
+# --- silence DEBUG spam ---
+import os, logging
+os.environ.setdefault("CPL_DEBUG", "OFF")
+os.environ.setdefault("CPL_LOG", "/dev/null")
+os.environ.setdefault("RIO_LOG_LEVEL", "CRITICAL")
+logging.basicConfig(level=logging.INFO, force=True)
+for name in ("rasterio", "matplotlib", "fiona", "shapely", "geopandas"):
+    logging.getLogger(name).setLevel(logging.WARNING)
+
 
 import argparse
 import re
 from pathlib import Path
 import sys
+import re
 
 import numpy as np
 import pandas as pd
@@ -53,6 +65,7 @@ import rasterio
 from rasterio import mask as rio_mask
 from rasterio import features as rio_features
 import matplotlib.pyplot as plt
+from matplotlib import colormaps
 from shapely.geometry import Point, shape as shp_shape
 from shapely.ops import unary_union
 from shapely.validation import make_valid
@@ -83,6 +96,10 @@ TYPE_FLD    = 'Type of Station (Physical Location)'
 EDEN_FLD    = 'EDEN Station Name'   # used as StationID fallback if needed
 VALID_TYPES = {'marsh', 'forest', 'river'}
 
+# Varibales for correction the water level to water elevation 
+EDEN_GROUND_TXT      = BASE_DIR / 'data/aux/gauges/eden_ground_elevation.txt'
+EDEN_WATER_ELEV_CSV  = BASE_DIR / 'data/aux/gauges/eden_water_elevation.csv'
+FT_TO_CM             = 30.48
 
 # -----------------------------------------------------------------------------
 # Small helpers (simple & explicit)
@@ -94,7 +111,7 @@ def _save_png(png_path: Path, arr_cm: np.ndarray, title: str) -> None:
     finite = m.compressed()
     vmin, vmax = (0.0, 1.0) if finite.size == 0 else (float(np.nanpercentile(finite, 2)),
                                                       float(np.nanpercentile(finite, 98)))
-    cmap = plt.cm.get_cmap('viridis').copy()
+    cmap = colormaps.get_cmap('viridis').copy()
     cmap.set_bad('white', alpha=0)  # NaNs transparent
     im = plt.imshow(m, vmin=vmin, vmax=vmax, cmap=cmap)
     plt.title(title, fontsize=10)
@@ -193,6 +210,87 @@ def _load_eden_csv(csv_path: Path) -> pd.DataFrame:
     df['StationID'] = df['StationID'].str.strip()
     return df
 
+def _make_above_ground_csv_same_columns(
+    eden_csv: Path,
+    ground_txt: Path,
+    out_csv: Path,
+    ground_col_ft: str = "Average Ground Elevation (ft NAVD88)",
+    name_col: str = "EDEN Station Name",
+) -> Path:
+    """
+    Build a corrected CSV with the *same columns* as the source EDEN CSV,
+    where every YYYY-MM-DD column is water level *above ground* (cm),
+    and keep **only** stations that appear in the ground-elevation file.
+
+    Join key: StationID == 'EDEN Station Name'.
+    """
+    
+    # 1) Read source EDEN levels (wide; cm NAVD88)
+    df = pd.read_csv(eden_csv, dtype={"StationID": str})
+    if "StationID" not in df.columns:
+        raise SystemExit("EDEN CSV must contain 'StationID'.")
+    df["StationID"] = df["StationID"].astype(str).str.strip()
+    original_cols = list(df.columns)
+    total_src = len(df)
+
+    # 2) Read ground elevations (ft NAVD88) and normalize columns
+    try:
+        elev = pd.read_csv(ground_txt, sep="\t")
+    except Exception:
+        elev = pd.read_csv(ground_txt)
+
+    canon = {c.strip(): c for c in elev.columns}
+    if name_col not in canon or ground_col_ft not in canon:
+        raise SystemExit(
+            f"Ground-elevation file must contain '{name_col}' and '{ground_col_ft}'."
+        )
+
+    elev = elev.rename(columns={
+        canon[name_col]: "EDEN_Name",
+        canon[ground_col_ft]: "ground_ft",
+    })
+    elev["EDEN_Name"] = elev["EDEN_Name"].astype(str).str.strip()
+    elev["ground_cm"] = round(pd.to_numeric(elev["ground_ft"], errors="coerce") * FT_TO_CM, 3)
+
+    # Ensure unique EDEN_Name to avoid duplicating rows on merge
+    if elev["EDEN_Name"].duplicated().any():
+        print("⚠️  Duplicate EDEN names in ground table — keeping first occurrence.")
+        elev = elev.drop_duplicates(subset=["EDEN_Name"])
+
+    # 3) **INNER JOIN** → drop any gauges not present in ground-elevation table
+    df = df.merge(
+        elev[["EDEN_Name", "ground_cm"]],
+        left_on="StationID",
+        right_on="EDEN_Name",
+        how="inner",
+    )
+    matched = len(df)
+    dropped = total_src - matched
+    print(f"   → Ground elevation matched for {matched}/{total_src} stations "
+          f"(dropped {dropped}).")
+
+    if matched == 0:
+        raise SystemExit("No stations matched between EDEN CSV and ground-elevation file.")
+
+    # 4) Subtract ground from every date column (YYYY-MM-DD)
+    date_cols = [c for c in df.columns if re.fullmatch(r"\d{4}-\d{2}-\d{2}", c)]
+    if not date_cols:
+        raise SystemExit("No date columns detected (expected YYYY-MM-DD headers).")
+
+    for c in date_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce") - df["ground_cm"]
+
+    # 5) Restore original schema: same headers/order as input; drop helper columns
+    for hc in ("EDEN_Name", "ground_cm"):
+        if hc in df.columns and hc not in original_cols:
+            df.drop(columns=hc, inplace=True)
+
+    df_out = df[[c for c in original_cols if c in df.columns]]
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df_out.to_csv(out_csv, index=False)
+    print(f"✅ Wrote water-above-ground (cm) CSV with same headers: {out_csv}")
+    return out_csv
 
 def _enrich_and_filter_gauges(eden_df: pd.DataFrame) -> gpd.GeoDataFrame:
     """
@@ -298,15 +396,22 @@ def main() -> None:
                         help='Path to ONE pair directory; searches pair_dir/inspect/ for rasters.')
     parser.add_argument('--vertical-root', type=str, default=str(VERT_ROOT),
                         help='Root to search recursively for */inspect/vertical_displacement_cm_*.geo.tif (default: global search).')
-    parser.add_argument('--min-coverage-pct', type=float, default=50.0,
+    parser.add_argument('--min-coverage-pct', type=float, default=65.0,
                         help='Minimum polygon coverage (percent) to write outputs. Default: 50.0')
-    parser.add_argument('--min-valid-pixels', type=int, default=500,
-                        help='Minimum number of finite pixels to write outputs. Default: 500')
     args = parser.parse_args()
 
     # ---- Gauges: read, join, export per area ----
+    print('🔹 Computing EDEN water *above ground* (cm) for ALL dates …')
+    
+    eden_corrected_csv = _make_above_ground_csv_same_columns(
+        eden_csv=EDEN_CSV,
+        ground_txt=EDEN_GROUND_TXT,
+        out_csv=EDEN_WATER_ELEV_CSV
+    )
+
+    
     print('🔹 Reading EDEN CSV …')
-    eden_df = _load_eden_csv(EDEN_CSV)
+    eden_df = _load_eden_csv(eden_corrected_csv)
 
     print('🔹 Reading acquisition dates …')
     acq_df = pd.read_csv(ACQ_CSV)
@@ -373,6 +478,19 @@ def main() -> None:
         pair_dir = vpath.parent.parent  # .../<pair>/inspect/<file>
         m_dem = re.search(r'_(SRTM|3DEP)\b', pair_dir.name, flags=re.IGNORECASE)
         dem_tag = m_dem.group(1).upper() if m_dem else 'DEM'
+        
+        # Identify which correction this raster came from
+        stem = vpath.stem.upper()
+        if "TROPO_IONO" in stem:
+            corr_tag = "TROPO_IONO"
+        elif stem.endswith("_IONO") or "_IONO" in stem:
+            corr_tag = "IONO"
+        elif stem.endswith("_TROPO") or "_TROPO" in stem:
+            corr_tag = "TROPO"
+        elif stem.endswith("_RAW") or "_RAW" in stem:
+            corr_tag = "RAW"
+        else:
+            corr_tag = "RAW"  # fallback for legacy files without a suffix
 
         with rasterio.open(vpath) as src:
             raster_crs = src.crs
@@ -382,7 +500,7 @@ def main() -> None:
             if footprint is None:
                 for _, arow in areas_wgs84.iterrows():
                     report_rows.append({
-                        'pair': dates, 'dem': dem_tag, 'area': arow['area'],
+                        'pair': dates, 'dem': dem_tag, 'corr': corr_tag,'area': arow['area'],
                         'coverage_pct': 0.0, 'valid_pixels': 0,
                         'wrote': False, 'reason': 'no_valid_data_in_raster'
                     })
@@ -391,7 +509,7 @@ def main() -> None:
 
             for _, arow in areas_wgs84.iterrows():
                 area = arow['area']
-                area_dir = OUT_DIR / area
+                area_dir = OUT_DIR / area / "interferograms"
                 area_dir.mkdir(parents=True, exist_ok=True)
 
                 # Reproject area polygon to raster CRS and repair
@@ -399,7 +517,7 @@ def main() -> None:
                 area_geom = _poly_only(area_geom)
                 if area_geom is None:
                     report_rows.append({
-                        'pair': dates, 'dem': dem_tag, 'area': area,
+                        'pair': dates, 'dem': dem_tag, 'corr': corr_tag,'area': area,
                         'coverage_pct': 0.0, 'valid_pixels': 0,
                         'wrote': False, 'reason': 'invalid_area_geom'
                     })
@@ -409,7 +527,7 @@ def main() -> None:
                 inter = _safe_intersection(area_geom, footprint)
                 if inter is None or inter.is_empty or inter.area == 0:
                     report_rows.append({
-                        'pair': dates, 'dem': dem_tag, 'area': area,
+                        'pair': dates, 'dem': dem_tag, 'corr': corr_tag, 'area': area,
                         'coverage_pct': 0.0, 'valid_pixels': 0,
                         'wrote': False, 'reason': 'no_overlap'
                     })
@@ -419,54 +537,54 @@ def main() -> None:
                 poly_area = float(area_geom.area) if area_geom.area else 0.0
                 coverage_pct = (float(inter.area) / poly_area * 100.0) if poly_area > 0 else 0.0
 
-                # Clip by polygon; out-of-footprint → NaN (via nodata=np.nan)
+                # Clip **by the intersection geometry**; out-of-footprint → NaN via nodata
                 try:
                     out_image, out_transform = rio_mask.mask(
-                        src, shapes=[area_geom.__geo_interface__],
-                        crop=True, filled=True, nodata=np.nan, indexes=1
+                        src,
+                        shapes=[inter.__geo_interface__],
+                        crop=True,
+                        filled=True,
+                        nodata=np.nan,
+                        indexes=[1],          # <<— make it 3-D: (1, rows, cols)
                     )
                 except Exception as e:
-                    report_rows.append({
-                        'pair': dates, 'dem': dem_tag, 'area': area,
-                        'coverage_pct': coverage_pct, 'valid_pixels': 0,
-                        'wrote': False, 'reason': f'clip_error:{type(e).__name__}'
-                    })
+                    ...
                     continue
 
                 if out_image.size == 0:
-                    report_rows.append({
-                        'pair': dates, 'dem': dem_tag, 'area': area,
-                        'coverage_pct': coverage_pct, 'valid_pixels': 0,
-                        'wrote': False, 'reason': 'empty_clip'
-                    })
+                    ...
                     continue
 
-                clipped = out_image[0].astype('float32')
+                # Handle both 2-D (rows, cols) and 3-D (1, rows, cols) returns safely
+                if out_image.ndim == 3:
+                    clipped = out_image[0].astype('float32')
+                else:  # 2-D already
+                    clipped = out_image.astype('float32')
 
-                # Replace literal zeros with NaN (common for "no data" in some chains)
-                zmask = (clipped == 0) | np.isclose(clipped, 0.0)
-                clipped[zmask] = np.nan
+                # Extra guard: if something still came back 1-D, expand it to a single row
+                if clipped.ndim == 1:
+                    clipped = clipped.reshape(1, -1)
 
-                # Count finite pixels only
+                # Count finite pixels only (for reporting; not used for threshold)
                 valid_pixels = int(np.count_nonzero(np.isfinite(clipped)))
 
-                # Threshold test
+                # Threshold test: ONLY coverage % (still skip if all-NaN)
                 if valid_pixels == 0:
                     wrote = False; reason = 'all_nan'
-                elif coverage_pct < float(args.min_coverage_pct) or valid_pixels < int(args.min_valid_pixels):
+                elif coverage_pct < float(args.min_coverage_pct):
                     wrote = False; reason = 'below_threshold'
                 else:
-                    # Include DEM tag so SRTM/3DEP don't overwrite one another
-                    tif_out = area_dir / f"{area}_vertical_cm_{dates}_{dem_tag}.tif"
+                    # Include DEM and CORR tag so variants don't overwrite one another
+                    tif_out = area_dir / f"{area}_vertical_cm_{dates}_{dem_tag}_{corr_tag}.tif"
                     _write_geotiff(tif_out, clipped, src.profile, out_transform)
 
-                    png_out = area_dir / f"{area}_vertical_cm_{dates}_{dem_tag}.png"
-                    _save_png(png_out, clipped, title=f"{area} • vertical (cm) • {dates} • {dem_tag}")
+                    png_out = area_dir / f"{area}_vertical_cm_{dates}_{dem_tag}_{corr_tag}.png"
+                    _save_png(png_out, clipped, title=f"{area} • vertical (cm) • {dates} • {dem_tag} • {corr_tag}")
 
                     wrote = True; reason = 'ok'
 
                 report_rows.append({
-                    'pair': dates, 'dem': dem_tag, 'area': area,
+                    'pair': dates, 'dem': dem_tag, 'corr': corr_tag, 'area': area,
                     'coverage_pct': round(coverage_pct, 3),
                     'valid_pixels': valid_pixels,
                     'wrote': wrote,
