@@ -1,53 +1,75 @@
 #!/usr/bin/env python3
 """
-run_allpairs.py
-================
+2_run_insar.py — Batch-run ALOS PALSAR interferograms with fixed settings (SRTM & 3DEP)
 
 Purpose
 -------
-Run ALOS pairs listed in /home/bakke326l/InSAR/main/data/pairs.csv with fixed
-settings (range=10, az=16, alpha=0.6). For **each pair** the script runs **twice**:
-once using the **SRTM DEM** and once using the **3DEP DTM**, then moves on
-to the next pair.
+Batch-process ALOS pairs listed in a CSV using ISCE2 with fixed parameters
+(range=10, az=16, alpha=0.6). For each pair the script runs **twice**:
+first with the **3DEP DTM**, then with the **SRTM DEM**. It supports
+resume-safe execution and writes a simple status log per attempt.
 
-Where results go
-----------------
-/mnt/DATA2/bakke326l/processing/interferograms/
-    path<PATH>_<REF>_<SEC>_SRTM/   # ISCE workdir + products + inspect quicklooks
-    path<PATH>_<REF>_<SEC>_3DEP/
+Needed data (inputs & assumptions)
+----------------------------------
+- Pairs table (CSV): /home/bakke326l/InSAR/main/data/pairs.csv
+  Columns: path,reference,secondary   (header is skipped automatically)
+  • All rows are processed as-is (no path filtering in batch mode).
+- DEM sources (GeoTIFFs):
+  • SRTM : /home/bakke326l/InSAR/main/data/aux/dem/srtm_30m.tif
+  • 3DEP : /home/bakke326l/InSAR/main/data/aux/dem/3dep_10m.tif
+  The script will auto-generate ISCE-compatible binaries alongside each TIF:
+  <tif>.dem.wgs84 and <tif>.wgs84.xml
+- Raw ALOS archives organized under:
+  /mnt/DATA2/bakke326l/raw/
+- ISCE2 installed and usable via $ISCE_HOME/applications/stripmapApp.py
+- System GDAL: gdal_translate must be on PATH.
 
-Quicklook PNG copies are also written to:
-~/InSAR/main/processing/inspect/
+Dependencies
+------------
+- Python: numpy, rasterio, matplotlib
+- System tools: gdal_translate
+- Local helpers (same repo/dir):
+  • help_xml_isce.write_stripmap_xml
+  • help_xml_dem.write_dem_report  (+ CLI in help_xml_dem.py)
+  • help_show_fringes.create_fringe_tif
 
-Inputs & assumptions
---------------------
-- CSV: /home/bakke326l/InSAR/main/data/pairs.csv
-  columns: path,reference,secondary   (header is skipped)
-  All rows are processed as-is (no path filter).
-- DEMs:
-  - SRTM:  /home/bakke326l/InSAR/main/data/aux/dem/srtm_30m.tif
-  - 3DEP:  /home/bakke326l/InSAR/main/data/aux/dem/3dep_10m.tif
-  (The script auto-builds the *.dem.wgs84 and *.wgs84.xml if missing.)
-- ISCE2 is installed and ISCE_HOME is set.
-- gdal_translate is available on PATH.
+Outputs & directories
+---------------------
+- Work dirs per pair & DEM:
+  /mnt/DATA2/bakke326l/processing/interferograms/
+      path<PATH>_<REF>_<SEC>_3DEP/
+      path<PATH>_<REF>_<SEC>_SRTM/
+  Containing:
+  • stripmapApp.xml
+  • interferogram/  (e.g., filt_topophase.unw.geo(.vrt), topophase.cor.geo.vrt, phsig.cor.geo.vrt)
+  • inspect/        (GeoTIFF + PNG quicklooks for key products, plus FRINGES_*.tif/.png)
+- DEM binaries and XML sidecars are created **next to** the source TIFs.
+- Status log (append-only):
+  /mnt/DATA2/bakke326l/processing/interferograms/_reports/path_status.csv
 
 How to run
 ----------
-# 1) Batch mode (default): run ALL pairs from the CSV
-python 2_run_pair_conda.py
+# 1) Batch mode: run ALL pairs from the CSV (default parameters)
+python 2_run_insar.py
 
-# 2) Batch but limit number of rows (useful for smoke tests)
-python 2_run_pair_conda.py --n 10
+# 2) Batch but limit number of rows (smoke test)
+python 2_run_insar.py --n 10
 
-# 3) Single pair (also runs both SRTM and 3DEP)
-python 2_run_pair_conda.py --path 150 20071216 20080131
-# (omit --path to default to 150)
+# 3) Single pair (runs both 3DEP and SRTM)
+python 2_run_insar.py --path 150 20071216 20080131
 
-# 4) (Optional) override fixed processing settings
-python 2_run_pair_conda.py --range 10 --az 16 --alpha 0.6
+# 4) Override fixed processing knobs
+python 2_run_insar.py --range 10 --az 16 --alpha 0.6
 
-# 5) Resume mode (skip ISCE if interferogram already exists, rebuild inspect)
-python 2_run_pair_conda.py --resume
+# 5) Resume mode (skip ISCE if IFG exists; rebuild inspect only)
+python 2_run_insar.py --resume
+
+Notes
+-----
+- Resume mode detects completion via the presence of filt_topophase.unw.geo(.vrt)
+  inside the pair's interferogram/ directory.
+- Quicklooks are generated with downsampled reads to reduce RAM and file size.
+- Failures are recorded in _reports/path_status.csv with action and notes.
 """
 
 from __future__ import annotations
@@ -261,8 +283,44 @@ def run_pair_with_dem(
     resume: bool = False,
 ) -> None:
     """
-    Run ONE pair for ONE DEM/DTM. Naming: path<path>_<ref>_<sec>_<DEM>.
-    Adds status logging and resume support.
+    Run ONE pair for ONE DEM/DTM with ISCE2 and build inspect quicklooks.
+
+    Parameters
+    ----------
+    path : int
+        ALOS path/track number (e.g., 150).
+    ref, sec : str
+        Reference and secondary acquisition dates in YYYYMMDD.
+    dem_label : str
+        Label for the elevation model ("SRTM" or "3DEP") used in naming.
+    dem_tif : pathlib.Path
+        Source DEM/DTM GeoTIFF to convert into ISCE WGS84 binary.
+    range_looks : int, default=DEF_RANGE
+    az_looks : int, default=DEF_AZ
+    alpha : float, default=DEF_ALPHA
+        Goldstein filter strength.
+    resume : bool, default=False
+        If True and a core IFG already exists, skip ISCE run and only (re)build inspect outputs.
+
+    Side effects
+    ------------
+    - Ensures <tif>.dem.wgs84 and .wgs84.xml exist next to the input DEM TIF.
+    - Creates the work dir:
+    /mnt/DATA2/bakke326l/processing/interferograms/path<path>_<ref>_<sec>_<DEM>/
+    - Writes stripmapApp.xml, runs stripmapApp.py --steps, and generates:
+    • interferogram/ products (VRT/TIF as produced by ISCE2)
+    • inspect/ quicklooks: PNGs (and lightweight GeoTIFF copies where configured)
+    • FRINGES_<ref>_<sec>_<DEM>.tif/.png (renamed from helper’s parameterized name)
+    - Appends a status row to:
+    /mnt/DATA2/bakke326l/processing/interferograms/_reports/path_status.csv
+    with action ∈ {"run_isce","resume"} and result ∈ {"ok","failed"}.
+
+    Raises
+    ------
+    FileNotFoundError
+        If $ISCE_HOME/applications/stripmapApp.py cannot be found.
+    subprocess.CalledProcessError
+        If external commands fail (help_xml_dem.py or stripmapApp.py).
     """
     dem_wgs84 = _ensure_dem(dem_tif)
     pair_id   = _pair_dir_name(path, ref, sec, dem_label)
@@ -332,9 +390,34 @@ def run_pair_with_dem(
 # ─────────────────────────── batch (no path filter) ───────────────────────────
 def batch_from_csv(n_pairs: int = 999999, resume: bool = False) -> None:
     """
-    Read pairs.csv and run *every* row (no path filter).
-    For each (path, ref, sec) run SRTM then 3DEP before moving to the next row.
-    """
+    Read pairs.csv and execute every row (no path filter). For each (path, ref, sec),
+    run 3DEP first then SRTM, capturing failures and continuing.
+
+    Parameters
+    ----------
+    n_pairs : int, default=999999
+        Upper limit on the number of CSV rows to process (for smoke tests).
+    resume : bool, default=False
+        If True, skip ISCE runs for pairs whose core IFG already exists
+        and only (re)build inspect outputs.
+
+    Inputs
+    ------
+    CSV at /home/bakke326l/InSAR/main/data/pairs.csv with columns:
+    path,reference,secondary  (a single header row is skipped automatically)
+
+    Outputs
+    -------
+    Work dirs under:
+    /mnt/DATA2/bakke326l/processing/interferograms/path<PATH>_<REF>_<SEC>_{3DEP,SRTM}/
+    Status CSV appended at:
+    /mnt/DATA2/bakke326l/processing/interferograms/_reports/path_status.csv
+
+    Behavior
+    --------
+    - Continues past failures, logging each with action="outer" and result="failed".
+    - Processes rows in file order up to n_pairs.
+"""
     csv_path = PAIRS_CSV
     with csv_path.open() as f:
         rdr = csv.reader(f)

@@ -1,33 +1,81 @@
 #!/usr/bin/env python3
 """
-3_do_corrections.py
-==========================
+3_do_corrections.py — Apply iono/tropo corrections and export vertical displacement maps
 
-Run ionospheric and tropospheric corrections *after* interferograms are built.
-Works with your directory naming:
+Purpose
+-------
+Post-process finished interferograms per pair directory by:
+1) Generating a **RAW** vertical-displacement map from the base unwrapped phase.
+2) Creating **IONO-only** corrected unwrapped, quicklooks, and vertical map.
+3) Creating **TROPO-only** corrected unwrapped, quicklooks, and vertical map.
+4) Creating **TROPO+IONO** corrected unwrapped, quicklooks, and vertical map.
+All vertical products are masked to the SAR swath and written as GeoTIFFs
+(with PNG quicklooks saved both locally and to a global inspect folder).
 
-  /mnt/DATA2/bakke326l/processing/interferograms/
-      path150_<REF>_<SEC>_SRTM/
-      path150_<REF>_<SEC>_3DEP/
+Needed data (inputs & assumptions)
+----------------------------------
+- Pair directories laid out as:
+    /mnt/DATA2/bakke326l/processing/interferograms/
+      path<PATH>_<REF>_<SEC>_<DEM>/
+        interferogram/
+          filt_topophase.unw.geo or filt_topophase.unw.geo.vrt   # base unwrapped
+        geometry/
+          los.rdr.geo or los.rdr.geo.vrt                         # line-of-sight (optional but needed for vertical)
+- Atmospheric aux data directory for tropospheric correction:
+    ~/InSAR/main/data/aux/tropo/  (GACOS tiles etc.)
+- Helper module providing correction routines:
+    help_atm_correction.do_iono_correction(...)
+    help_atm_correction.do_tropo_correction(...)
+- Assumes ALOS L-band wavelength λ = 0.2362 m for phase→LOS conversion.
+- Expects pair directory names like: path150_YYYYMMDD_YYYYMMDD_{SRTM|3DEP}
 
-For each pair dir it produces:
+Dependencies
+------------
+- Python: numpy, rasterio, matplotlib
+- Raster reprojection: rasterio.warp (reproject, Resampling)
+- System: gdal_translate on PATH
+- Local: help_atm_correction (iono/tropo), and standard scientific stack
+
+Outputs & directories
+---------------------
+Inside each pair directory:
   interferogram/
-    filt_topophase_iono.unw.geo            # IONO-only (single-band phase Geo)
-    filt_topophase_tropo.unw.geo           # TROPO-only intermediate (2-band ENVI)
-    filt_topophase_tropo_iono.unw.geo      # TROPO+IONO (single-band phase Geo)
+    filt_topophase_iono.unw.geo           # IONO-only
+    filt_topophase_tropo.unw.geo          # TROPO-only
+    filt_topophase_tropo_iono.unw.geo     # TROPO+IONO
   inspect/
-    <above>.tif + PNG quicklooks
-    vertical_displacement_cm_<REF>_<SEC>_{RAW|TROPO|IONO|TROPO_IONO}.geo.tif
-    (plus PNG quicklooks)
+    <above>.tif (translated quick GeoTIFF copies, where applicable)
+    <above>.png quicklooks
+    vertical_displacement_cm_<REF>_<SEC>_{RAW|IONO|TROPO|TROPO_IONO}.geo.tif
+    vertical_displacement_cm_<REF>_<SEC>_{...}.png
+Global PNG copies are also written to:
+  ~/InSAR/main/processing/inspect/
 
-Usage
------
-# one specific pair directory
+How it works
+------------
+- Reads unwrapped phase and applies a **swath mask**:
+  uses GDAL band mask (preferred) or amplitude!=0 if available; off-swath→NaN.
+- Converts phase→LOS displacement: d_LOS = (λ / 4π) * phase (meters).
+- Removes **LOS median** prior to vertical conversion to avoid 1/cos ramp.
+- Converts to **vertical**: d_vert = - d_LOS_zeroed / cos(incidence) in **cm**.
+- Regrids incidence to IFG grid if shape/CRS/transform differ.
+- Runs IONO/TROPO corrections via helpers; builds quicklooks throughout.
+
+How to run
+----------
+# One specific pair directory
 python 3_do_corrections.py /mnt/DATA2/bakke326l/processing/interferograms/path150_20071216_20080131_SRTM
 
-# batch under a root (will scan for dirs starting with 'path')
+# Batch under a root (will scan for subdirs starting with 'path')
 python 3_do_corrections.py --batch /mnt/DATA2/bakke326l/processing/interferograms
+
+Notes
+-----
+- If LOS is missing, vertical exports are skipped (corrections still produced).
+- Quicklooks use a robust 1-99% stretch and downsampled reads where possible.
+- All outputs use NaN off-swath; compression is DEFLATE for GeoTIFFs.
 """
+
 
 from __future__ import annotations
 import argparse
@@ -60,7 +108,29 @@ HOME_PROC  = BASE / "processing"                           # for global PNG copi
 
 # ------------------------------------------------------------ small utilities
 def quicklook_png(src: Path, dst: Path, band: int = 1) -> None:
-    """Save BAND as PNG."""
+    """
+    Write a compact PNG quicklook of a raster band with robust contrast.
+
+    Behavior
+    --------
+    - Reads the requested band as a masked array.
+    - If fully masked or empty, saves a black image of the same shape.
+    - Uses 1-99% percentiles for contrast stretching.
+    - Applies matplotlib's 'turbo' colormap and drops alpha channel.
+
+    Parameters
+    ----------
+    src : Path
+        Input raster (GeoTIFF/VRT) readable by rasterio.
+    dst : Path
+        Output PNG path.
+    band : int, default=1
+        1-based band index to visualize.
+
+    Outputs
+    -------
+    dst : PNG image saved to disk.
+    """
     turbo = colormaps.get_cmap("turbo")
     with rasterio.open(src) as ds:
         arr = ds.read(band, masked=True)  # uses GDAL mask/nodata if present
@@ -77,12 +147,39 @@ def quicklook_png(src: Path, dst: Path, band: int = 1) -> None:
     plt.imsave(dst, rgba[..., :3])  # drop alpha
 
 def translate_to_tif(src: Path, dst: Path) -> None:
-    """gdal_translate wrapper."""
+    """
+    Create a GeoTIFF copy of a source raster using gdal_translate.
+
+    Parameters
+    ----------
+    src : Path
+        Source raster (e.g., *.unw.geo, *.vrt).
+    dst : Path
+        Destination GeoTIFF.
+
+    Raises
+    ------
+    subprocess.CalledProcessError
+        If gdal_translate returns a non-zero exit code.
+    """
     subprocess.check_call(["gdal_translate", "-of", "GTiff", str(src), str(dst)])
 
 def parse_pair_id(pairdir: Path) -> tuple[int, str, str, str]:
     """
-    Parse path/ref/sec/DEMlabel from: path150_YYYYMMDD_YYYYMMDD_SRTM (or _3DEP)
+    Parse path, reference, secondary, and DEM label from a pair directory name.
+
+    Expected pattern
+    ----------------
+    path<PATH>_<YYYYMMDD>_<YYYYMMDD>_<DEM>
+
+    Returns
+    -------
+    (int path, str ref, str sec, str dem)
+
+    Raises
+    ------
+    ValueError
+        If the directory name does not match the expected pattern.
     """
     name = pairdir.name
     toks = name.split("_")
@@ -96,8 +193,22 @@ def parse_pair_id(pairdir: Path) -> tuple[int, str, str, str]:
 
 def find_base_unw(igram_dir: Path) -> Path:
     """
-    Return the best available base unwrapped file to correct against.
-    Prefers the .geo (ENVI) file, falls back to .vrt if needed.
+    Locate the base unwrapped interferogram to serve as the RAW input.
+
+    Search order
+    ------------
+    1) interferogram/filt_topophase.unw.geo
+    2) interferogram/filt_topophase.unw.geo.vrt
+
+    Returns
+    -------
+    Path
+        Path to the chosen base unwrapped product.
+
+    Raises
+    ------
+    FileNotFoundError
+        If neither candidate exists.
     """
     cand = igram_dir / "filt_topophase.unw.geo"
     if cand.exists():
@@ -131,10 +242,27 @@ def _regrid_to_match(src_arr, src_transform, src_crs, dst_shape, dst_transform, 
 # ---------- NEW: build a "swath mask" from the unwrapped dataset ----------
 def _swath_mask(unw_path: Path, count: int, phase_band: int) -> np.ndarray:
     """
-    True where pixels are in-swath (valid), False outside.
-    Preference order:
-      1) Use GDAL mask of the phase band.
-      2) If no useful mask and dataset has 2 bands (amp+phase), use amp != 0.
+    Build a boolean in-swath mask for the unwrapped dataset.
+
+    Logic
+    -----
+    1) Try GDAL's per-band mask for the phase band (preferred).
+    2) If unavailable and dataset has ≥2 bands, use amplitude (band 1) != 0.
+    3) Fallback to all-True if neither yields a usable mask.
+
+    Parameters
+    ----------
+    unw_path : Path
+        Path to the unwrapped product.
+    count : int
+        Number of bands in the dataset.
+    phase_band : int
+        1-based index of the phase band.
+
+    Returns
+    -------
+    np.ndarray of bool
+        True for valid in-swath pixels; False elsewhere.
     """
     with rasterio.open(unw_path) as ds:
         # (1) phase band mask if available
@@ -158,10 +286,26 @@ def _swath_mask(unw_path: Path, count: int, phase_band: int) -> np.ndarray:
 
 def _read_phase(unw_path: Path) -> tuple[np.ndarray, dict, any, any, tuple[int,int]]:
     """
-    Read phase from an unwrapped product and apply swath mask:
-      - For 2-band ISCE unw (amp+phase), phase is band 2.
-      - For single-band corrected (iono/tropo_iono), phase is band 1.
-    Returns (phase [float32 with NaNs off-swath], profile, crs, transform, shape).
+    Read the phase band from an unwrapped product and mask off-swath pixels.
+
+    Rules
+    -----
+    - If dataset has ≥2 bands (amp+phase), take band 2 as phase.
+    - Otherwise take band 1.
+    - Apply swath mask so off-swath is set to NaN.
+
+    Returns
+    -------
+    phase : np.ndarray (float32)
+        Phase array with NaN off-swath.
+    profile : dict
+        Rasterio profile of the input dataset.
+    crs : any
+        Coordinate reference system.
+    transform : affine.Affine
+        Geo-transform of the input dataset.
+    shape : (int, int)
+        (height, width) of the dataset.
     """
     with rasterio.open(unw_path) as ds:
         phase_band = 2 if ds.count >= 2 else 1
@@ -186,11 +330,42 @@ def _read_phase(unw_path: Path) -> tuple[np.ndarray, dict, any, any, tuple[int,i
 
 def write_vertical_cm(unw_path: Path, los_path: Path, out_path: Path, label: str = "") -> None:
     """
-    Convert unwrapped phase (radians) to vertical displacement (cm):
-      d_LOS = (λ / 4π) * phase, λ=0.2362 m (ALOS L-band)
-      vertical = - (d_LOS_zeroed / cos(inc))
-    We remove the **LOS median** before division to prevent a 1/cos ramp.
-    Pixels outside the SAR swath are forced to NaN (via _read_phase()).
+    Convert unwrapped phase (radians) to vertical displacement (centimeters).
+
+    Computation
+    -----------
+    - d_LOS = (λ / 4π) * phase, with λ = 0.2362 m (ALOS L-band).
+    - Subtract the median of d_LOS over valid pixels (removes constant offset and
+    mitigates a 1/cos(inc) ramp).
+    - vertical = - d_LOS_zeroed / cos(incidence).
+
+    Grid handling
+    -------------
+    - Reads incidence (degrees) from `los_path`.
+    - If CRS/transform/shape differ from the unwrapped grid, reprojects incidence
+    to match (bilinear).
+    - Off-swath pixels (from swath mask) are kept as NaN.
+
+    Parameters
+    ----------
+    unw_path : Path
+        Path to unwrapped phase product (RAW or corrected).
+    los_path : Path
+        Path to los.rdr.geo(.vrt) for incidence angles (degrees in band 1).
+    out_path : Path
+        Output GeoTIFF path for vertical displacement (cm).
+    label : str, optional
+        Short tag for logging (e.g., "RAW", "IONO").
+
+    Outputs
+    -------
+    - GeoTIFF at `out_path` with float32 data, NaN nodata, DEFLATE compression.
+    - PNG quicklook next to the GeoTIFF and a copy in ~/InSAR/main/processing/inspect/.
+
+    Raises
+    ------
+    Exception
+        Propagates any raster I/O or reprojection errors encountered.
     """
     WAVELENGTH = 0.2362  # m
 
@@ -262,6 +437,27 @@ def write_vertical_cm(unw_path: Path, los_path: Path, out_path: Path, label: str
 
 # --------------------------- readiness check (unchanged) ---------------------------
 def readiness(pairdir: Path) -> tuple[bool, str | None, Path | None]:
+    """
+    Check whether a pair directory has the required inputs to proceed.
+
+    Validates
+    ---------
+    - Presence of base unwrapped product:
+    interferogram/filt_topophase.unw.geo(.vrt)
+    - Line-of-sight file los.rdr.geo(.vrt) is optional; if missing, vertical
+    exports will be skipped but corrections may still run.
+
+    Parameters
+    ----------
+    pairdir : Path
+        Pair directory (path<PATH>_<REF>_<SEC>_<DEM>).
+
+    Returns
+    -------
+    (ok, reason, los_path) : (bool, Optional[str], Optional[Path])
+        ok=True if base unwrapped exists; `reason` holds a message when ok=False;
+        `los_path` is the chosen LOS file or None if not found.
+    """
     igram_dir = pairdir / "interferogram"
     geom_dir  = pairdir / "geometry"
 
@@ -281,11 +477,34 @@ def readiness(pairdir: Path) -> tuple[bool, str | None, Path | None]:
 # ------------------------------------------------------------ main per-pair
 def process_pair(pairdir: Path) -> bool:
     """
-    For a given pair directory:
-      1) Vertical for RAW (swath-masked).
-      2) IONO-only correction → vertical (swath-masked).
-      3) TROPO correction → vertical (swath-masked) → IONO on that (TROPO+IONO) → vertical (swath-masked).
-      4) Export TIF quicklooks along the way.
+    Run ionospheric and tropospheric corrections and export vertical maps for one pair.
+
+    Pipeline
+    --------
+    1) **RAW vertical** from base unwrapped (if LOS present).
+    2) **IONO-only** correction → quicklooks → vertical (if LOS present).
+    3) **TROPO-only** correction → quicklooks → vertical (if LOS present).
+    4) **TROPO+IONO** (iono applied to tropo product) → quicklooks → vertical.
+    All vertical GeoTIFFs are masked to the swath and compressed; PNG quicklooks
+    are written locally and to the global inspect dir.
+
+    Parameters
+    ----------
+    pairdir : Path
+        A single pair directory (path<PATH>_<REF>_<SEC>_{SRTM|3DEP}).
+
+    Returns
+    -------
+    bool
+        True if pair processed (or partially processed) without fatal errors;
+        False if the pair was skipped due to missing base inputs.
+
+    Side effects
+    ------------
+    Creates/updates:
+    - interferogram/filt_topophase_{iono|tropo|tropo_iono}.unw.geo
+    - inspect/*.tif and *.png quicklooks for each corrected unwrapped
+    - inspect/vertical_displacement_cm_<REF>_<SEC>_{RAW|IONO|TROPO|TROPO_IONO}.geo.tif (+ PNGs)
     """
     try:
         path_no, ref, sec, dem = parse_pair_id(pairdir)
@@ -414,11 +633,46 @@ def process_pair(pairdir: Path) -> bool:
 
 # -------------------------------------------------------------- batch helpers
 def collect_pairs(root: Path) -> list[Path]:
-    """Return immediate subdirectories that look like pair dirs."""
+    """
+    List immediate subdirectories under a root that look like pair directories.
+
+    Parameters
+    ----------
+    root : Path
+        Root folder expected to contain many path* subdirectories.
+
+    Returns
+    -------
+    list[Path]
+        Sorted list of subdirectories whose names start with 'path'.
+    """
     return sorted([d for d in root.iterdir() if d.is_dir() and d.name.startswith("path")])
 
 # ---------------------------------------------------------------------- CLI
 def main() -> None:
+    """
+    CLI entry point.
+
+    Usage
+    -----
+    # One or more explicit pair directories
+    python 3_do_corrections.py /.../path150_20071216_20080131_SRTM /.../path150_20080131_20080317_3DEP
+
+    # Batch over a root (auto-detects path* subdirectories)
+    python 3_do_corrections.py --batch /mnt/DATA2/bakke326l/processing/interferograms
+
+    Arguments
+    ---------
+    pairdir : Path, optional, repeated
+        One or more specific pair directories to process.
+    --batch : Path, optional
+        Root directory from which to collect path* subdirectories.
+
+    Behavior
+    --------
+    - If neither `pairdir` nor `--batch` is provided, exits with a message.
+    - Continues across pairs, reporting per-pair success/skip counts.
+    """
     ap = argparse.ArgumentParser(
         description="Apply ionosphere-only and tropospheric corrections to pair directories; export vertical displacement for RAW, TROPO, IONO, TROPO_IONO. All outputs are masked to the SAR swath."
     )

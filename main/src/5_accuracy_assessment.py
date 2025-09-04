@@ -1,69 +1,49 @@
 #!/usr/bin/env python3
 """
-5_accuracy_assessment.py
-========================
+5_accuracy_assessment.py — Shared-split accuracy metrics + 4 per-pair GeoTIFF exports
 
-Shared-split accuracy metrics + 4 per-pair GeoTIFF exports
-----------------------------------------------------------
+Purpose
+-------
+Evaluate per-area InSAR vertical-displacement rasters against EDEN gauges using a
+**shared calibration/validation split** across all DEM/CORR variants of each pair.
+For every (AREA, PAIR):
+- Build a common gauge set (only gauges that sample valid values in **every** raster).
+- Generate replicate calibration plans (farthest-point sampling, crowding reduction,
+  center-only final step).
+- Score two methods on the shared split:
+  • least_squares  (calibrate InSAR → Δh_vis via y = a·x + b; fix a = -1 when n_cal ≤ 2)
+  • idw_dhvis      (IDW interpolation of gauge Δh_vis at validation gauges)
+- Write one fresh metrics CSV per AREA.
+- Export four per-pair GeoTIFFs (from replicate #1): IDW(Δh_vis, 60%), calibrated
+  TROPO_IONO at 60%, at target density, and center-only.
 
-What this script does
+Needed data (inputs & assumptions)
+----------------------------------
+- Areas root (default):
+  /mnt/DATA2/bakke326l/processing/areas/<AREA>/
+    ├─ water_gauges/eden_gauges.csv
+    │     Columns: StationID, Lat, Lon, and wide daily 'YYYY-MM-DD' (must include REF & SEC dates)
+    └─ interferograms/
+          <AREA>_vertical_cm_<REF>_<SEC>_<DEM>_<CORR>.tif
+          where <REF>_<SEC> = YYYYMMDD_YYYYMMDD, <DEM> ∈ {SRTM, 3DEP}, <CORR> ∈ {RAW,TROPO,IONO,TROPO_IONO}
+- Rasters are single-band float (cm), EPSG:4326, nodata set (or NaN).
+
+Dependencies
+------------
+- Python: numpy, pandas, rasterio, pyproj (Geod)
+- No external command-line tools required.
+
+Outputs & directories
 ---------------------
-For each AREA (or a single AREA via --area), the script:
+Per AREA:
+  <areas_root>/<AREA>/results/accuracy_metrics.csv     # rebuilt fresh each run
 
-1) Discovers per-area interferograms named like:
-       <areas_root>/<AREA>/interferograms/
-         <AREA>_vertical_cm_<REF>_<SEC>_<DEM>_<CORR>.tif
-   where:
-     - <REF>_<SEC> = YYYYMMDD_YYYYMMDD (pair tag)
-     - <DEM>       ∈ {SRTM, 3DEP}                 (configurable)
-     - <CORR>      ∈ {RAW, TROPO, IONO, TROPO_IONO} (configurable)
-
-2) For each (AREA, PAIR) it:
-   - Loads the per-area gauge table:
-       <areas_root>/<AREA>/water_gauges/eden_gauges.csv
-     Required columns: StationID, Lat, Lon, and wide date columns 'YYYY-MM-DD' for REF and SEC.
-   - Computes Δh_vis (cm) = max(sec, 0) − max(ref, 0) for all gauges (per pair).
-   - Samples each available raster’s InSAR value at gauge locations (3×3 mean).
-   - Builds the **common gauge set** = gauges with a valid InSAR sample in **every** raster
-     available for that (AREA, PAIR). This guarantees a **shared** calibration/validation split
-     across *all* DEM/CORR variants of the pair.
-   - Creates replicate plans (default 50) per pair:
-       • Exclude the “center” gauge (closest to lon/lat centroid) from calibration/validation
-         until the final n_cal=1 step (center-only).
-       • Initial ~60% calibration is picked via farthest-point sampling (spread out);
-         the rest are validation (constant for the sweep).
-       • Iteratively remove the most crowded calibration gauge down to n_cal=2,
-         scoring at each step:
-            - least_squares  (calibrate InSAR→Δh_vis via y=a·x+b; if n_cal ≤ 2, force a=−1)
-            - idw_dhvis      (interpolate gauge Δh_vis at the validation gauges)
-       • Final step: n_cal=1 uses only the center gauge.
-
-3) **Writes one fresh CSV per AREA** (rebuilt each run):
-       <areas_root>/<AREA>/results/accuracy_metrics.csv
-   One row per (replicate, n_cal, DEM/CORR, method) with:
-     - area, pair_ref, pair_sec, dem, corr, method
-     - replicate, n_total, n_cal, n_val
-     - area_km2 (DEM’s valid area), area_per_gauge_km2 (= area_km2 / n_cal)
-     - rmse_cm, mae_cm, bias_cm, r
-     - a_gain, b_offset_cm (for LS; NaN for IDW)
-
-4) **Per pair, writes 4 GeoTIFFs** into <AREA>/results/ :
-   (built from **replicate #1** plan using the shared split)
-   1) **IDW (Δh_vis) @ first 60% calibration** subset (grid = chosen raster’s grid)
-      ->   idw60_<PAIR>.tif
-   2) **Calibrated TROPO_IONO @ first 60%** calibration (y = a·x + b) on the chosen
-      TROPO_IONO raster (prefer SRTM_TROPO_IONO, else 3DEP_TROPO_IONO).
-      ->   cal_ti_60pct_<DEMsel>_<PAIR>.tif
-   3) **Calibrated TROPO_IONO @ closest-to-target density** n_cal (you set --output-density)
-      on the chosen TROPO_IONO raster.
-      ->   cal_ti_d{D}_<DEMsel>_<PAIR>.tif              (D like 500p0 for 500.0)
-   4) **Calibrated TROPO_IONO @ single-gauge** (center-only) on the chosen TROPO_IONO raster.
-      ->   cal_ti_1g_<DEMsel>_<PAIR>.tif
-
-   Notes:
-   • If no TROPO_IONO raster exists for a pair, the 3 calibrated files are skipped.
-   • The **IDW Δh_vis** TIFF is still written; it uses the pair’s chosen grid
-     (prefers TROPO_IONO grid; else falls back to any raster for that pair).
+Per AREA and PAIR (replicate #1 plan):
+  <areas_root>/<AREA>/results/
+    idw60_<REF>_<SEC>.tif
+    cal_ti_60pct_<DEMsel>_<REF>_<SEC>.tif
+    cal_ti_d{D}_<DEMsel>_<REF>_<SEC>.tif   (D like 500p0 for 500.0 km²/gauge)
+    cal_ti_1g_<DEMsel>_<REF>_<SEC>.tif
 
 How to run
 ----------
@@ -78,22 +58,12 @@ python 5_accuracy_assessment.py \
   --reps 50 --seed 42 --idw-power 2.0 --output-density 500 \
   --dems SRTM 3DEP --corrs RAW TROPO IONO TROPO_IONO
 
-Inputs expected
----------------
-• Gauges (wide CSV per AREA):
-    <areas_root>/<AREA>/water_gauges/eden_gauges.csv
-  Columns: StationID, Lat, Lon, and date columns 'YYYY-MM-DD' for REF and SEC.
-
-• Interferograms (GeoTIFF, EPSG:4326, single-band float, nodata set/NaN):
-    <areas_root>/<AREA>/interferograms/<AREA>_vertical_cm_<REF>_<SEC>_<DEM>_<CORR>.tif
-
-Outputs produced
-----------------
-• <areas_root>/<AREA>/results/accuracy_metrics.csv          # rebuilt every run
-• <areas_root>/<AREA>/results/idw60_<PAIR>.tif
-• <areas_root>/<AREA>/results/cal_ti_60pct_<DEMsel>_<PAIR>.tif
-• <areas_root>/<AREA>/results/cal_ti_d{D}_<DEMsel>_<PAIR>.tif
-• <areas_root>/<AREA>/results/cal_ti_1g_<DEMsel>_<PAIR>.tif
+Notes
+-----
+- “Shared split” = same calibration/validation gauges used for **all** rasters
+  of the pair, ensuring fair comparisons.
+- Chosen TROPO_IONO raster for calibrated exports prefers SRTM, then 3DEP.
+- If no TROPO_IONO exists, calibrated exports are skipped; IDW export still written.
 """
 
 from __future__ import annotations
@@ -137,14 +107,45 @@ GEOD = Geod(ellps="WGS84")
 
 # ========================= Small utilities =========================
 def _pair_dates_from_tag(pair_tag: str) -> Tuple[str, str]:
-    """'YYYYMMDD_YYYYMMDD' → ('YYYY-MM-DD','YYYY-MM-DD')."""
+    """
+    Convert a pair tag 'YYYYMMDD_YYYYMMDD' to ISO dates ('YYYY-MM-DD', 'YYYY-MM-DD').
+
+    Parameters
+    ----------
+    pair_tag : str
+        Pair identifier in compact form.
+
+    Returns
+    -------
+    tuple[str, str]
+        (ref_iso, sec_iso).
+
+    Raises
+    ------
+    ValueError
+        If the tag format is invalid.
+    """
     if not re.fullmatch(r"\d{8}_\d{8}", pair_tag):
         raise ValueError(f"PAIR tag must be YYYYMMDD_YYYYMMDD, got: {pair_tag}")
     a, b = pair_tag.split("_")
     return f"{a[:4]}-{a[4:6]}-{a[6:]}", f"{b[:4]}-{b[4:6]}-{b[6:]}"
 
 def _find_all_pairs(area_dir: Path, area_name: str, dems: List[str], corrs: List[str]) -> List[str]:
-    """Find unique pair tags available for this area by scanning /interferograms for chosen DEM/CORR."""
+    """
+    Scan <AREA>/interferograms for available pair tags, restricted to selected DEM/CORR.
+
+    Parameters
+    ----------
+    area_dir : Path
+    area_name : str
+    dems : list[str]
+    corrs : list[str]
+
+    Returns
+    -------
+    list[str]
+        Sorted unique pair tags 'YYYYMMDD_YYYYMMDD' present for any of the DEM/CORR combinations.
+    """
     dem_pat = "|".join(map(re.escape, dems))
     corr_pat = "|".join(map(re.escape, corrs + ["TROPO", "IONO"]))  # tolerate extras present
     patt = re.compile(
@@ -162,12 +163,42 @@ def _find_all_pairs(area_dir: Path, area_name: str, dems: List[str], corrs: List
     return sorted(tags)
 
 def _find_raster(area_dir: Path, area_name: str, pair_tag: str, dem: str, corr: str) -> Optional[Path]:
-    """Return path to one per-area interferogram raster if it exists."""
+    """
+    Return the path to one per-area interferogram raster if present.
+
+    Parameters
+    ----------
+    area_dir : Path
+    area_name : str
+    pair_tag : str
+    dem : str
+    corr : str
+
+    Returns
+    -------
+    Path | None
+        The raster path or None if missing.
+    """
     cand = area_dir / "interferograms" / f"{area_name}_vertical_cm_{pair_tag}_{dem.upper()}_{corr.upper()}.tif"
     return cand if cand.exists() else None
 
 def _load_gauges_wide(csv_path: Path) -> pd.DataFrame:
-    """Read the gauge CSV and sanity-check required columns."""
+    """
+    Load an area's wide EDEN gauge CSV and validate required columns.
+
+    Requires
+    --------
+    Columns: 'StationID', 'Lat', 'Lon' plus date columns 'YYYY-MM-DD'.
+
+    Returns
+    -------
+    pandas.DataFrame
+
+    Raises
+    ------
+    ValueError
+        If required columns are missing.
+    """
     df = pd.read_csv(csv_path)
     for c in (ID_COL, LAT_COL, LON_COL):
         if c not in df.columns:
@@ -175,7 +206,9 @@ def _load_gauges_wide(csv_path: Path) -> pd.DataFrame:
     return df
 
 def _visible_surface_delta(ref_cm: np.ndarray, sec_cm: np.ndarray) -> np.ndarray:
-    """Δh_vis = max(sec, 0) − max(ref, 0) in centimeters."""
+    """
+    Compute Δh_vis (cm) = max(sec, 0) - max(ref, 0) element-wise for gauge levels.
+    """
     return np.maximum(sec_cm.astype(float), 0.0) - np.maximum(ref_cm.astype(float), 0.0)
 
 def _rowcol_from_xy(transform: Affine, x: float, y: float) -> Tuple[float, float]:
@@ -213,7 +246,23 @@ def _geod_area_of_geojson(geom) -> float:
     return 0.0
 
 def _valid_raster_area_km2(ds: rasterio.io.DatasetReader) -> float:
-    """Sum area for valid-data polygons from dataset_mask()==255 (expects EPSG:4326)."""
+    """
+    Compute valid-data surface area (km²) from dataset_mask()==255 polygons.
+
+    Assumes
+    -------
+    Raster is EPSG:4326.
+
+    Returns
+    -------
+    float
+        Total valid area in km².
+
+    Raises
+    ------
+    RuntimeError
+        If raster CRS is not EPSG:4326.
+    """
     if ds.crs is None or ds.crs.to_epsg() != 4326:
         raise RuntimeError("Expected EPSG:4326 raster.")
     mask = (ds.dataset_mask() == 255).astype(np.uint8)
@@ -224,7 +273,9 @@ def _valid_raster_area_km2(ds: rasterio.io.DatasetReader) -> float:
     return float(area)
 
 def _safe_corrcoef(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Robust correlation avoiding NaNs for zero-variance cases."""
+    """
+    Correlation coefficient robust to zero-variance cases (returns NaN if undefined).
+    """
     if len(y_true) < 2: return float("nan")
     yt = y_true - np.mean(y_true); yp = y_pred - np.mean(y_pred)
     vy = np.sum(yt*yt); vp = np.sum(yp*yp)
@@ -232,7 +283,18 @@ def _safe_corrcoef(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sum(yt*yp) / np.sqrt(vy*vp))
 
 def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    """RMSE/MAE/Bias/Correlation for predictions vs truth."""
+    """
+    Compute RMSE, MAE, Bias, and Pearson r between predictions and truth.
+
+    Parameters
+    ----------
+    y_true, y_pred : np.ndarray
+
+    Returns
+    -------
+    dict
+        {'rmse_cm','mae_cm','bias_cm','r'}
+    """
     err = y_pred - y_true
     return {
         "rmse_cm": float(np.sqrt(np.mean(err**2))),
@@ -243,9 +305,26 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]
 
 def _idw_predict_points(px, py, pz, qx, qy, power: float = 2.0) -> np.ndarray:
     """
-    Simple geographic IDW in lon/lat (weights ~ 1 / d^power), with a cosine adjustment
-    on Δlon to account for latitude. If a query lands exactly on a known point, we
-    snap to that value.
+    Inverse-distance weighting in lon/lat with cosine adjustment on Δlon.
+
+    Behavior
+    --------
+    - Weights ∝ 1 / distance^power.
+    - Snap exactly coincident query points to known values.
+
+    Parameters
+    ----------
+    px, py, pz : arrays
+        Known points (lon, lat, value).
+    qx, qy : arrays
+        Query (lon, lat).
+    power : float
+        IDW power (default 2.0).
+
+    Returns
+    -------
+    np.ndarray (float32)
+        Predicted values at query points.
     """
     px = np.asarray(px, dtype=np.float64)
     py = np.asarray(py, dtype=np.float64)
@@ -290,7 +369,18 @@ def _spread_selection(lon: np.ndarray, lat: np.ndarray, k: int, rng: np.random.G
 
 def _crowded_candidates(lon: np.ndarray, lat: np.ndarray, idx: np.ndarray,
                         keep_global: int, top_n: int = 4) -> np.ndarray:
-    """Indices (within idx) of the most crowded gauges, excluding 'keep_global'."""
+    """
+    Return indices (within `idx`) of most-crowded gauges based on smallest NN distance.
+
+    Parameters
+    ----------
+    lon, lat : np.ndarray
+    idx : np.ndarray[int]
+    keep_global : int
+        Index of a gauge to keep (excluded from candidates).
+    top_n : int
+        Max number of candidates to return.
+    """
     if len(idx) <= 1: return idx
     lon_s, lat_s = lon[idx], lat[idx]
     D = _haversine_matrix(lon_s, lat_s)
@@ -304,15 +394,32 @@ def _crowded_candidates(lon: np.ndarray, lat: np.ndarray, idx: np.ndarray,
 
 # ======================== Core evaluation logic ========================
 def _fit_affine(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
-    """Ordinary least squares y ≈ a·x + b (two-parameter fit)."""
+    """
+    Ordinary least squares fit for y ≈ a·x + b.
+
+    Returns
+    -------
+    (a, b) : tuple[float, float]
+    """
     A = np.c_[x, np.ones_like(x)]
     sol, *_ = np.linalg.lstsq(A, y, rcond=None)
     return float(sol[0]), float(sol[1])
 
 def _eval_ls_and_idw(pts: pd.DataFrame, cal_idx: np.ndarray, val_idx: np.ndarray, idw_power: float) -> Dict[str, Dict[str, float]]:
     """
-    Evaluate both LS (calibrate InSAR→Δh_vis) and IDW (interpolate Δh_vis) on validation gauges.
-    Returns a dict of metrics for both methods.
+    Evaluate least-squares calibration and IDW(interpolated Δh_vis) on validation gauges.
+
+    Parameters
+    ----------
+    pts : DataFrame
+        Columns: 'insar_cm', 'dh_cm', 'Lon', 'Lat', and StationID.
+    cal_idx, val_idx : np.ndarray[int]
+    idw_power : float
+
+    Returns
+    -------
+    dict[str, dict]
+        {'least_squares': metrics_with_a_b, 'idw_dhvis': metrics}
     """
     # Prepare arrays
     x_cal = pts["insar_cm"].values[cal_idx].astype(float)
@@ -353,7 +460,9 @@ def _eval_ls_and_idw(pts: pd.DataFrame, cal_idx: np.ndarray, val_idx: np.ndarray
 
 # ===================== Export helpers (GeoTIFF writing) =====================
 def _fit_ls_params(insar_vals: np.ndarray, dh_vals: np.ndarray) -> Tuple[float, float]:
-    """Fit y=a·x+b with fallback a=-1 for tiny sets."""
+    """
+    Fit y = a·x + b with fallback a = -1, b = mean(dh + insar) when n ≤ 2.
+    """
     n = insar_vals.size
     if n <= 2:
         a = -1.0
@@ -362,7 +471,20 @@ def _fit_ls_params(insar_vals: np.ndarray, dh_vals: np.ndarray) -> Tuple[float, 
     return _fit_affine(insar_vals, dh_vals)
 
 def _write_tif_like(src_tif: Path, out_tif: Path, array2d: np.ndarray, nodata_value: float = -9999.0):
-    """Write array2d to out_tif with src_tif's spatial metadata; compress and set nodata."""
+    """
+    Write a float32 GeoTIFF using the spatial profile of `src_tif`.
+
+    Parameters
+    ----------
+    src_tif : Path
+        Reference raster (for metadata).
+    out_tif : Path
+        Output filepath.
+    array2d : np.ndarray
+        Data to write; NaNs converted to nodata.
+    nodata_value : float
+        Value to store for nodata (default −9999).
+    """
     with rasterio.open(src_tif) as src:
         profile = src.profile.copy()
         profile.update(
@@ -382,8 +504,26 @@ def _write_tif_like(src_tif: Path, out_tif: Path, array2d: np.ndarray, nodata_va
 
 def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndarray:
     """
-    Compute IDW predictions on the pixel grid of ref_tif (EPSG:4326 expected).
-    Returns a (H, W) float array with NaN outside dataset_mask.
+    Generate an IDW(Δh_vis) surface on the pixel grid of `ref_tif` (EPSG:4326).
+
+    Parameters
+    ----------
+    px, py, pz : arrays
+        Calibration lon, lat, Δh_vis.
+    ref_tif : Path
+        Reference raster whose grid/extent/mask define the output.
+    power : float
+        IDW power.
+
+    Returns
+    -------
+    np.ndarray (H, W) float32
+        IDW predictions with NaN outside the dataset mask.
+
+    Raises
+    ------
+    RuntimeError
+        If ref_tif is not EPSG:4326.
     """
     with rasterio.open(ref_tif) as ds:
         H, W = ds.height, ds.width
@@ -429,7 +569,12 @@ def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndar
 
 def _apply_calibration_to_raster(src_tif: Path, a: float, b: float) -> np.ndarray:
     """
-    Apply y=a·x+b to an input raster (float cm). Returns array with NaN where invalid.
+    Apply affine calibration y = a·x + b to a raster, honoring dataset_mask and nodata.
+
+    Returns
+    -------
+    np.ndarray
+        Calibrated array with NaN outside valid data.
     """
     with rasterio.open(src_tif) as ds:
         arr = ds.read(1).astype("float32")
@@ -454,11 +599,45 @@ def _evaluate_pair_with_shared_split_and_exports(
     output_density_target: float,
 ) -> pd.DataFrame:
     """
-    Evaluate one (AREA, PAIR) across all available rasters using a *shared*
-    calibration/validation split (based on gauges valid in ALL rasters), and
-    write the 4 per-pair GeoTIFF exports (from replicate #1 plan).
+    Evaluate one (AREA, PAIR) using a *shared* cal/val split and write 4 per-pair exports.
 
-    Returns the dataframe of metric rows.
+    Steps
+    -----
+    1) Build the common gauge set present in **all** rasters for the pair.
+    2) Create replicate plans:
+    - initial ~60% calibration via farthest-point sampling (exclude center),
+    - fixed validation set (remaining gauges),
+    - iteratively drop crowded calibration gauges down to n_cal=2,
+    - final n_cal=1 is the center-only case.
+    3) Score methods at each n_cal:
+    - least_squares  (y = a·x + b; fix a =-1 when n_cal ≤ 2),
+    - idw_dhvis      (interpolate Δh_vis at validation gauges).
+    4) From replicate #1 plan, write:
+    - idw60_<PAIR>.tif,
+    - cal_ti_60pct_<DEMsel>_<PAIR>.tif,
+    - cal_ti_d{D}_<DEMsel>_<PAIR>.tif  (closest density to --output-density),
+    - cal_ti_1g_<DEMsel>_<PAIR>.tif.
+
+    Parameters
+    ----------
+    area_dir : Path
+    area_name : str
+    pair_tag : str                # 'YYYYMMDD_YYYYMMDD'
+    gauge_csv : Path              # <AREA>/water_gauges/eden_gauges.csv
+    rasters : dict[(str,str),Path]   # key=(DEM, CORR)
+    n_repl : int
+    seed : int
+    idw_power : float
+    output_density_target : float # km² per gauge
+
+    Returns
+    -------
+    pandas.DataFrame
+        Metric rows (one per replicate x n_cal x method x DEM/CORR).
+
+    Writes
+    ------
+    GeoTIFFs into <AREA>/results/ as described above (may skip calibrated if no TI raster).
     """
     results_dir = area_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -771,10 +950,20 @@ def _process_area(area_dir: Path, dems: List[str], corrs: List[str],
                   reps: int, seed: int, idw_power: float, output_density_target: float) -> None:
     """
     Process a single AREA:
-      • Discover pairs and rasters (restricted to DEMS/CORRS given).
-      • For each pair, evaluate with a shared cal/val split.
-      • Overwrite <area>/results/accuracy_metrics.csv with fresh results.
-      • Write 4 per-pair GeoTIFF exports.
+    - Discover pairs & rasters constrained by selected DEMS/CORRS.
+    - Evaluate each pair with the shared-split pipeline.
+    - Overwrite <AREA>/results/accuracy_metrics.csv with fresh results.
+    - Write the 4 per-pair GeoTIFF exports.
+
+    Parameters
+    ----------
+    area_dir : Path
+    dems : list[str]
+    corrs : list[str]
+    reps : int
+    seed : int
+    idw_power : float
+    output_density_target : float
     """
     area_name   = area_dir.name
     gauge_csv   = area_dir / "water_gauges" / "eden_gauges.csv"
@@ -837,6 +1026,24 @@ def _process_area(area_dir: Path, dems: List[str], corrs: List[str],
 
 # =================================== CLI ===================================
 def main():
+    """
+    CLI entry point.
+
+    Arguments
+    ---------
+    --areas-root : str (default: /mnt/DATA2/bakke326l/processing/areas)
+    --area : str            # process only this AREA
+    --reps : int            # replicates per pair (default 50)
+    --seed : int            # RNG seed (default 42)
+    --idw-power : float     # IDW power (default 2.0)
+    --output-density : float  # km²/gauge target for 'cal_ti_d*.tif' (default 500.0)
+    --dems : list[str]      # DEMs to include (default: SRTM 3DEP)
+    --corrs : list[str]     # CORRs to include (default: RAW TROPO IONO TROPO_IONO)
+
+    Behavior
+    --------
+    Iterates areas, runs evaluation & exports, and writes a fresh metrics CSV per area.
+    """
     ap = argparse.ArgumentParser(
         description="Compute accuracy metrics with a SHARED calibration/validation split per (AREA,PAIR) and write 4 per-pair GeoTIFFs."
     )

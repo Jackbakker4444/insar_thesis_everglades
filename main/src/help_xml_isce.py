@@ -1,6 +1,55 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# Build a minimal stripmapApp.xml that ISCE2 understands (ALOS / ALOS_SLC)
-# ──────────────────────────────────────────────────────────────────────────────
+#!/usr/bin/env python3
+"""
+help_xml_isce.py
+================
+
+Create a minimal but robust **stripmapApp.xml** for ISCE2 (ALOS stripmap).
+
+What this module provides
+-------------------------
+- `ceos_files(...)` — locate CEOS **LED-*** (leader) and **IMG-HH-*** (image) files
+  under a conventional raw directory layout: `<raw_dir>/path<PATH>/<DATE>/…`.
+- `detect_beam_mode(...)` — best-effort detection of **FBD** vs **FBS** beam mode
+  from a small metadata text file found in the acquisition folder (returns `"FBD"`,
+  `"FBS"`, or `None`).
+- `sensor_component(...)` — build the `<component name="Reference|Secondary">`
+  block, optionally adding `RESAMPLE_FLAG=dual2single` when beam mode is **FBD**
+  (dual-pol to single-pol resampling for Level-1.0 data).
+- `write_stripmap_xml(...)` — the main entry point: writes a complete
+  `stripmapApp.xml` for one (REF, SEC) pair, wiring all inputs (CEOS files,
+  DEM, multilooks, filtering, split-spectrum, etc.).
+
+Assumptions
+-----------
+- **ALOS** stripmap CEOS data laid out as: `<raw_dir>/path<PATH>/<YYYYMMDD>/…`
+- Only **HH** channel is processed (IMG-HH-* files).
+- ISCE2 will run `stripmapApp.py` against the XML this module writes.
+
+Typical usage
+-------------
+```python
+from pathlib import Path
+from help_xml_isce import write_stripmap_xml
+
+write_stripmap_xml(
+    xml_file=Path("/out/stripmapApp.xml"),
+    path="150",
+    ref_date="20071216",
+    sec_date="20080131",
+    raw_dir=Path("/mnt/DATA2/bakke326l/raw"),
+    work_dir=Path("/mnt/DATA2/bakke326l/processing/interferograms/path150_20071216_20080131_SRTM"),
+    dem_wgs84=Path("/home/bakke326l/InSAR/main/data/aux/dem/srtm_30m.dem.wgs84"),
+    range_looks=10, az_looks=16, filter_strength=0.6,
+)
+Notes
+---------
+The function writes a concise XML with sensible defaults that match the rest of
+this pipeline (split-spectrum enabled for ionosphere handling, 30 m posting,
+dense offsets on, two-stage unwrap enabled, Goldstein filter strength provided
+by caller, etc.). The regionOfInterest is kept as a fixed WGS-84 bbox in
+this helper—adjust as needed for other scenes.
+"""
+
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path

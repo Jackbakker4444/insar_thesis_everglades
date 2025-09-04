@@ -1,4 +1,51 @@
 #!/usr/bin/env python3
+"""
+help_atm_correction.py — Ionospheric & Tropospheric (GACOS) corrections for ISCE2 products
+
+Purpose
+-------
+Provide two high-level helpers used by the pipeline:
+
+1) do_iono_correction(...)
+   Subtracts the estimated **dispersive** ionospheric phase from an unwrapped
+   interferogram (optionally the TROPO-corrected one), applies a mask, and
+   writes both the corrected and a rewrapped product.
+
+2) do_tropo_correction(...)
+   Implements the GACOS-based **tropospheric** delay correction workflow:
+   converts *.rsc → ENVI headers, reprojects ZTD rasters to the IFG grid,
+   converts zenith → slant delay using incidence, computes differential delay
+   (ref - sec), and subtracts it from the unwrapped IFG.
+
+Inputs & assumptions
+--------------------
+- Folder structure: one `work_dir` per pair (…/pathXXX_YYYYMMDD_YYYYMMDD_{SRTM|3DEP}).
+- Unwrapped IFG exists at `work_dir/interferogram/filt_topophase.unw.geo[.vrt]`
+  (ISCE unw: band 1 = amplitude, band 2 = phase).
+- LOS incidence angle available at `work_dir/geometry/los.rdr.geo.vrt` (degrees).
+- GACOS ZTD files `<ref>.ztd` / `<sec>.ztd` and sidecar `<*.rsc>` live under `gacos_dir`.
+- All rasters are in geog/WGS84 (EPSG:4326). GACOS ZTD units are **meters**.
+- Dependencies: numpy, rasterio, GDAL (osgeo.gdal). GDAL on PATH with ENVI driver.
+
+Files produced
+--------------
+Ionosphere:
+  interferogram/filt_topophase{suffix}.unw.geo               # single-band float32 phase (rad), masked off-swath
+  interferogram/filt_topophase{suffix}_wrapped.unw.geo       # same phase wrapped to [-π, π]
+Troposphere (intermediates in `tropo_dir`):
+  {ref}.ztd.geo, {sec}.ztd.geo                                # ZTD resampled to IFG grid (ENVI float32)
+  {ref}.aps.geo, {sec}.aps.geo                                # slant phase delay from ZTD + incidence
+  {ref}_{sec}.aps.geo                                         # differential phase delay (ref − sec)
+Final TROPO-corrected IFG:
+  interferogram/filt_topophase_tropo.unw.geo                  # 2-band ENVI float32 (band1 amp, band2 phase)
+
+References
+----------
+- ISCE2 Atmosphere tutorials (UNAVCO 2020):
+  Ionosphere:  Notebooks/UNAVCO_2020/Atmosphere/Ionosphere/stripmapApp_ionosphere.ipynb
+  Troposphere: Notebooks/UNAVCO_2020/Atmosphere/Troposphere/Tropo.ipynb
+"""
+
 from __future__ import annotations
 
 import os
@@ -12,35 +59,47 @@ from osgeo import gdal, gdalconst
 
 def do_iono_correction(work_dir: Path, out_dir: Path, input_unw: Path, output_suffix: str = "_iono" ) -> Path:
     """
-    Perform ionospheric phase correction on a full-band unwrapped interferogram.
+    Perform ionospheric phase correction on an unwrapped interferogram.
 
-    This function subtracts the estimated dispersive phase (caused by ionospheric 
-    TEC variations) from the unwrapped interferometric phase. It also applies a 
-    mask and writes both the corrected and rewrapped (wrapped back into [-π, π]) 
-    interferograms as GeoTIFFs.
+    This subtracts the **dispersive** phase (estimated from your ionosphere workflow)
+    from the unwrapped interferogram phase, applies the ionosphere mask, and writes:
+    • filt_topophase{output_suffix}.unw.geo            (corrected, single-band phase in radians)
+    • filt_topophase{output_suffix}_wrapped.unw.geo    (same phase wrapped into [-π, π])
 
     Parameters
     ----------
     work_dir : Path
-        Pair directory (…/pathXXX_REF_SEC_SRTM or …_3DEP).
+        Pair directory (…/pathXXX_REF_SEC_{SRTM|3DEP}). Expects subfolders:
+        ionosphere/ (dispersive.bil.unwCor.filt.geo, mask.bil.geo),
+        interferogram/ (filt_topophase*.unw.geo).
     out_dir : Path
-        Output directory (usually work_dir / "interferogram").
+        Output directory for corrected products (usually work_dir / "interferogram").
+        If None-like, falls back to that.
     input_unw : Path
-        Unwrapped input to correct (e.g., filt_topophase.unw.geo or
-        filt_topophase_tropo.unw.geo).
-    output_suffix : str
-        Suffix in output filename: "_iono" (IONO-only) or "_tropo_iono" (TROPO+IONO).
+        Unwrapped interferogram to correct:
+        • filt_topophase.unw.geo            (IONO-only case), or
+        • filt_topophase_tropo.unw.geo      (TROPO+IONO case).
+    output_suffix : str, default "_iono"
+        Suffix in output filename: "_iono" for IONO-only, "_tropo_iono" when applied
+        on a TROPO-corrected input.
 
     Returns
     -------
-    Path to ionosphere-corrected unwrapped interferogram (.geo).
+    Path
+        Path to the corrected single-band GeoTIFF/ENVI file: filt_topophase{suffix}.unw.geo
 
-    References
-    ----------
-    - ISCE2 Ionosphere Tutorial (UNAVCO 2020):
-      https://github.com/isce-framework/isce2-docs/blob/master/Notebooks/UNAVCO_2020/Atmosphere/Ionosphere/stripmapApp_ionosphere.ipynb
-      Inspectable script with comments can be found at InSAR/main/src/show_ionospheric_correction.
+    Raises
+    ------
+    FileNotFoundError
+        If `input_unw`, `ionosphere/dispersive...geo`, or `ionosphere/mask...geo` is missing.
+
+    Notes
+    -----
+    - For classic ISCE unw, phase is typically **band 2**; the helper falls back to band 1
+    if the dataset is single-band.
+    - Pixels with mask == 0 are written as NaN in the corrected output.
     """
+
     iono_dir  = work_dir / "ionosphere"
     igram_dir = work_dir / "interferogram"
     out_dir = out_dir or igram_dir
@@ -115,26 +174,69 @@ def do_iono_correction(work_dir: Path, out_dir: Path, input_unw: Path, output_su
 
 def do_tropo_correction(wdir: Path, ref: int, sec: int, gacos_dir: Path, tropo_dir: Path):
     """
-    Runs the full GACOS tropospheric correction workflow for a given interferometric pair.
+    Run the full GACOS-based tropospheric correction for one pair.
 
-    This includes:
-      1. Converting GACOS .rsc metadata files into ENVI-compatible .hdr files
-      2. Reprojecting GACOS zenith delay maps to match the ISCE2 interferogram grid
-      3. Converting zenith delays to slant phase delays using LOS information
-      4. Computing the differential phase delay between reference and secondary acquisitions
-      5. Correcting the original unwrapped interferogram using this differential delay
+    Workflow
+    --------
+    1) Convert GACOS *.rsc metadata to ENVI *.hdr (no data copy).
+    2) Reproject ref/sec ZTD rasters to the IFG's grid/CRS (bilinear).
+    3) Convert zenith delays (meters) to **slant phase delay** (radians) using
+    LOS incidence (degrees) and λ(ALOS L-band)=0.2362 m:
+        phase_slant = -(4π / λ) * (ZTD / cos(inc))
+    4) Build differential APS phase: ΔAPS = APS_ref - APS_sec.
+    5) Subtract ΔAPS from the unwrapped IFG (band 2), preserving band 1 amplitude.
+    Output is 2-band ENVI: filt_topophase_tropo.unw.geo
 
-    Parameters:
-        wdir (Path): Path to the ISCE2 pair processing directory (e.g. /processing/pathXXX_YYYYMMDD_YYYYMMDD)
-        ref (int): Reference acquisition date (e.g. 20081104)
-        sec (int): Secondary acquisition date (e.g. 20081220)
-        gacos_dir (Path): Path to folder containing the .ztd and .rsc files from GACOS
-        tropo_dir (Path): Path to folder meant for intermediate troposheric files
+    Parameters
+    ----------
+    wdir : Path
+        Pair directory (…/pathXXX_REF_SEC_{SRTM|3DEP}); expects:
+        interferogram/filt_topophase.unw.geo[.vrt]
+        geometry/los.rdr.geo.vrt  (incidence in degrees)
+    ref : int
+        Reference acquisition date as yyyymmdd (e.g., 20081104).
+    sec : int
+        Secondary acquisition date as yyyymmdd (e.g., 20081220).
+    gacos_dir : Path
+        Directory containing `<ref>.ztd`, `<sec>.ztd` and their `.rsc`.
+    tropo_dir : Path
+        Directory for intermediate products (`*.ztd.geo`, `*.aps.geo`, `*_*.aps.geo`);
+        created if missing.
 
-    All corrected files and intermediate products will be saved inside `tropo_dir`.
-    Inspectable scripts with comments can be found at InSAR/main/src/show_tropospheric_correction.
+    Outputs
+    -------
+    - tropo_dir/<ref>.ztd.geo, tropo_dir/<sec>.ztd.geo           (ENVI float32, IFG grid)
+    - tropo_dir/<ref>.aps.geo, tropo_dir/<sec>.aps.geo           (slant phase, radians)
+    - tropo_dir/<ref>_<sec>.aps.geo                              (ΔAPS = ref - sec)
+    - interferogram/filt_topophase_tropo.unw.geo                 (2-band ENVI: amp, corrected phase)
+
+    Raises
+    ------
+    ValueError
+        If ENVI header conversion is called with an invalid filename (with .hdr/.rsc).
+    RuntimeError / GDAL errors
+        If reprojection or IO fails.
+
+    Assumptions
+    -----------
+    - IFG & LOS rasters are georeferenced and share EPSG:4326.
+    - GACOS ZTD is in **meters**; incidence in **degrees**.
+    - Uses GDAL ENVI driver and bilinear resampling.
     """
     def loadrsc(infile):
+        """
+        Parse a GACOS `.rsc` sidecar into a dict (strings) and normalize Y_STEP as positive.
+
+        Parameters
+        ----------
+        infile : str
+            Path to the base filename (without `.rsc` extension).
+
+        Returns
+        -------
+        dict
+            Keys include WIDTH, FILE_LENGTH, X_FIRST, Y_FIRST, X_STEP, Y_STEP, etc.
+        """
         with open(infile + '.rsc') as f:
             headers = {}
             for line in f:
@@ -146,6 +248,15 @@ def do_tropo_correction(wdir: Path, ref: int, sec: int, gacos_dir: Path, tropo_d
         return headers
 
     def writehdr(filename, headers):
+        """
+        Write an ENVI `.hdr` file next to the given base, using fields from `headers`.
+
+        Parameters
+        ----------
+        filename : str
+        headers : dict
+            Output of `loadrsc()`. `X/Y_*` in degrees (WGS84). Data type is float32, bsq.
+        """
         with open(filename + '.hdr', 'w') as fo:
             fo.write(
                 'ENVI\n'
@@ -165,13 +276,37 @@ def do_tropo_correction(wdir: Path, ref: int, sec: int, gacos_dir: Path, tropo_d
             )
 
     def GACOS_rsc2hdr(inputfile):
+        """
+        Create an ENVI header for a GACOS raster by reading `<file>.rsc`.
+
+        Parameters
+        ----------
+        inputfile : str
+            Path to the ENVI binary **without** `.hdr` or `.rsc` extension.
+
+        Raises
+        ------
+        ValueError
+            If `inputfile` mistakenly includes `.hdr` or `.rsc`.
+        """
         if os.path.splitext(inputfile)[1] in ('.hdr', '.rsc'):
             raise ValueError("Pass the ENVI binary (no .hdr/.rsc extension).")
         headers = loadrsc(inputfile)
         writehdr(inputfile, headers)
 
     def file_transform(match_raster, apsfile, apsfile_out):
-        """Reproject apsfile to match match_raster grid/CRS."""
+        """
+        Reproject `apsfile` to match the grid/CRS of `match_raster` (bilinear).
+
+        Parameters
+        ----------
+        match_raster : str
+            Target grid (e.g., filt_topophase.unw.geo).
+        apsfile : str
+            Source ENVI file to be reprojected (e.g., <ref>.ztd).
+        apsfile_out : str
+            Output ENVI filepath.
+        """
         apsfile     = os.path.abspath(apsfile)
         apsfile_out = os.path.abspath(apsfile_out)
 
@@ -193,7 +328,23 @@ def do_tropo_correction(wdir: Path, ref: int, sec: int, gacos_dir: Path, tropo_d
         dst = None; src = None; match_ds = None
 
     def zenith2slant(losfile, aps_zenith, aps_slant):
-        """Project zenith delay to slant phase delay using incidence angle."""
+        """
+        Convert zenith delay (meters) to **slant phase delay** (radians) using LOS incidence.
+
+        Formula
+        -------
+        phase = -(4π / λ) * (zenith / cos(inc)), with λ(ALOS L-band)=0.2362 m,
+        inc in **radians** (converted from degrees in the routine).
+
+        Parameters
+        ----------
+        losfile : str
+            Path to los.rdr.geo.vrt (incidence in degrees as band 1).
+        aps_zenith : str
+            Regridded zenith delay file (<date>.ztd.geo).
+        aps_slant : str
+            Output slant phase file (<date>.aps.geo).
+        """
         WAVELENGTH = 0.2362  # meters (ALOS L-band)
         ds = gdal.Open(aps_zenith, gdal.GA_ReadOnly)
         zenith = ds.GetRasterBand(1).ReadAsArray()
@@ -219,6 +370,15 @@ def do_tropo_correction(wdir: Path, ref: int, sec: int, gacos_dir: Path, tropo_d
         drv = None
 
     def differential_delay(ref_aps, sec_aps, outname):
+        """
+        Compute differential atmospheric phase delay: ΔAPS = APS_ref − APS_sec.
+
+        Parameters
+        ----------
+        ref_aps : str
+        sec_aps : str
+        outname : str
+        """
         ds = gdal.Open(ref_aps, gdal.GA_ReadOnly)
         ref = ds.GetRasterBand(1).ReadAsArray()
         proj = ds.GetProjection()
@@ -237,8 +397,18 @@ def do_tropo_correction(wdir: Path, ref: int, sec: int, gacos_dir: Path, tropo_d
 
     def IFG_correction(unw_path, aps_path, outname):
         """
-        Subtract differential APS (phase) from unwrapped IFG (band 2) and
-        write 2-band ENVI (band1=amplitude, band2=phase).
+        Subtract ΔAPS phase from an ISCE unwrapped interferogram.
+
+        Reads:
+        • IFG (band1 amplitude, band2 phase) — `unw_path`
+        • ΔAPS (single band) — `aps_path`
+
+        Writes:
+        • 2-band ENVI float32 (amp, corrected phase) to `outname`.
+
+        Notes
+        -----
+        - Pixels where input phase or ΔAPS is 0 are set to 0 to avoid propagating invalids.
         """
         ds = gdal.Open(unw_path, gdal.GA_ReadOnly)
         # ISCE unw: band1 amplitude, band2 phase

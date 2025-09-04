@@ -1,43 +1,88 @@
 #!/usr/bin/env python
 """
-Fill area folders with gauge tables + per-area vertical displacement clips (TIFF + PNG)
-======================================================================================
+4_organize_areas.py — Per-area gauge tables + coverage-aware vertical clips (TIFF + PNG)
 
-What it does
+Purpose
+-------
+1) Build **per-area EDEN gauge tables** (time series + metadata) and save them under
+   /mnt/DATA2/bakke326l/processing/areas/<AREA>/water_gauges/.
+2) Discover vertical-displacement rasters from the interferogram pipeline
+   (…/inspect/vertical_displacement_cm_<REF>_<SEC>_{RAW|TROPO|IONO|TROPO_IONO}.geo.tif),
+   and for each water area:
+   - clip by the raster **valid-data footprint ∩ area polygon**,
+   - write per-area **TIFF + PNG** if the polygon coverage threshold is met.
+3) Write a **coverage report** (one row per area x raster) to
+   /mnt/DATA2/bakke326l/processing/areas/_reports/coverage_report.csv.
+
+Needed data (inputs & assumptions)
+----------------------------------
+- EDEN water-level table (wide):  ~/InSAR/main/data/aux/gauges/eden_water_levels.csv
+  • Must contain 'StationID' and daily date columns ('YYYY-MM-DD').
+- Ground-elevation table (tab/CSV): ~/InSAR/main/data/aux/gauges/eden_ground_elevation.txt
+  • Columns: 'EDEN Station Name', 'Average Ground Elevation (ft NAVD88)'.
+  • Used to convert water levels → **water above ground (cm)**, producing a CSV
+    with the **same headers** as the source EDEN table.
+- Acquisition dates: ~/InSAR/main/data/aux/gauges/acquisition_dates.csv
+  • Column 'date' with 'YYYYMMDD' strings; converted to 'YYYY-MM-DD' to index EDEN columns.
+- Gauge locations: ~/InSAR/main/data/vector/gauge_locations.geojson  (WGS84)
+  • Must have 'StationID' (or 'EDEN Station Name' as fallback), Lat/Lon if geometry is missing.
+- Water areas:     ~/InSAR/main/data/vector/water_areas.geojson      (WGS84)
+  • Must contain an 'area' field. Geometries are repaired before use.
+- Vertical rasters to clip (search root):
+  /mnt/DATA2/bakke326l/processing/interferograms/**/inspect/vertical_displacement_cm_*.geo.tif
+  • Pair directory names encode DEM tag: …_{SRTM|3DEP}.
+
+Dependencies
 ------------
-1) Builds per-area EDEN gauge tables:
-   /mnt/DATA2/bakke326l/processing/areas/<AREA>/water_gauges/
-       eden_gauges.csv
-       eden_metadata.csv
+- Python: numpy, pandas, geopandas, rasterio, shapely, matplotlib
+- Works with rasterio.mask, rasterio.features, and basic matplotlib (no seaborn).
 
-2) Finds vertical displacement rasters produced by your pipeline:
-   <pair_dir>/inspect/vertical_displacement_cm_<REF>_<SEC>_{RAW|TROPO|IONO|TROPO_IONO}.geo.tif
+Outputs & directories
+---------------------
+Per area:
+  /mnt/DATA2/bakke326l/processing/areas/<AREA>/
+    water_gauges/
+      eden_gauges.csv          # EDEN water above ground (cm), dates = acquisition subset
+      eden_metadata.csv        # attributes for the same gauges
+    interferograms/
+      <AREA>_vertical_cm_<REF>_<SEC>_<DEM>_<CORR>.tif
+      <AREA>_vertical_cm_<REF>_<SEC>_<DEM>_<CORR>.png
+Global report:
+  /mnt/DATA2/bakke326l/processing/areas/_reports/coverage_report.csv
 
-   For each raster, clips it by each water area and writes (if coverage passes):
-   /mnt/DATA2/bakke326l/processing/areas/<AREA>/
-       <AREA>_vertical_cm_<REF_SEC>_<DEM>_<CORR>.tif
-       <AREA>_vertical_cm_<REF_SEC>_<DEM>_<CORR>.png
-   where <DEM> is parsed from the pair directory name suffix: _SRTM or _3DEP
-   and <CORR> is one of RAW, TROPO, IONO, TROPO_IONO.
-
-3) Writes a coverage report for everything processed:
-   /mnt/DATA2/bakke326l/processing/areas/_reports/coverage_report.csv
-
-Run examples
+How it works
 ------------
-# Global search (default VERT_ROOT) for */inspect/vertical_displacement_cm_*.geo.tif
+- Builds “water above ground (cm)” by joining EDEN with ground elevations (ft→cm) and
+  subtracting per station; preserves original EDEN schema.
+- Merges gauges with attributes & geometry; spatial-joins them into water areas;
+  optional type filter via TYPE_FLD (Marsh/Forest/River).
+- Collects vertical rasters (single file, single pair, or global search).
+- For each raster:
+  • computes the **valid-data footprint** from the dataset mask,
+  • reprojects each area polygon to the raster CRS and repairs geometry,
+  • uses robust intersection; computes coverage % over area polygon,
+  • clips by the intersection; writes outputs if coverage ≥ threshold and any finite pixels.
+
+How to run
+----------
+# Global search under VERT_ROOT (default):
 python 4_organize_areas.py
 
-# One file
-python 4_organize_areas.py \
-  --vertical-file /mnt/DATA2/bakke326l/processing/interferograms/path150_20071216_20080131_SRTM/inspect/vertical_displacement_cm_20071216_20080131_RAW.geo.tif
+# One specific raster:
+python 4_organize_areas.py --vertical-file /mnt/DATA2/.../inspect/vertical_displacement_cm_20071216_20080131_RAW.geo.tif
 
-# One pair directory (searches pair_dir/inspect/)
-python 4_organize_areas.py \
-  --pair-dir /mnt/DATA2/bakke326l/processing/interferograms/path150_20071216_20080131_SRTM
+# One pair directory (searches pair_dir/inspect/):
+python 4_organize_areas.py --pair-dir /mnt/DATA2/.../path150_20071216_20080131_SRTM
 
-# Tweak coverage threshold
+# Adjust coverage threshold (default 65.0 %):
 python 4_organize_areas.py --min-coverage-pct 50.0
+
+Notes
+-----
+- Coverage is computed as (area ∩ raster_footprint) / area.
+- DEM tag parsed from the parent pair directory (…_SRTM or …_3DEP).
+- CORR tag inferred from filename stem: RAW, TROPO, IONO, TROPO_IONO.
+- GeoTIFFs are float32, nodata=NaN, DEFLATE compressed; PNGs mask NaNs as transparent.
 """
 
 from __future__ import annotations
@@ -105,7 +150,24 @@ FT_TO_CM             = 30.48
 # Small helpers (simple & explicit)
 # -----------------------------------------------------------------------------
 def _save_png(png_path: Path, arr_cm: np.ndarray, title: str) -> None:
-    """Quick-look PNG"""
+    """
+    Write a compact quick-look PNG for a per-area vertical displacement array.
+
+    Behavior
+    --------
+    - Masks NaNs as transparent.
+    - Uses robust 2–98 % stretch and 'viridis' colormap.
+    - Adds a small colorbar labeled 'Vertical displacement [cm]'.
+
+    Parameters
+    ----------
+    png_path : Path
+        Output PNG path.
+    arr_cm : np.ndarray
+        2-D array of vertical displacement (cm) with NaNs outside the clip.
+    title : str
+        Title to place above the image.
+    """
     m = np.ma.masked_invalid(arr_cm)  # mask NaNs
     plt.figure(figsize=(7, 6), dpi=150)
     finite = m.compressed()
@@ -124,7 +186,25 @@ def _save_png(png_path: Path, arr_cm: np.ndarray, title: str) -> None:
 
 
 def _write_geotiff(path: Path, data: np.ndarray, ref_profile, transform) -> None:
-    """Write a single-band float32 GeoTIFF with nodata=NaN, DEFLATE compression."""
+    """
+    Write a single-band float32 GeoTIFF with nodata=NaN and DEFLATE compression.
+
+    Parameters
+    ----------
+    path : Path
+        Output GeoTIFF path.
+    data : np.ndarray
+        2-D (rows, cols) data or (1, rows, cols) band array.
+    ref_profile : dict
+        Rasterio profile from the source raster (used as template).
+    transform : affine.Affine
+        GeoTransform for the clipped data.
+
+    Notes
+    -----
+    - Sets predictor=3 and BIGTIFF=IF_SAFER.
+    - Skips empty arrays gracefully.
+    """
     if data is None:
         return
     if data.ndim == 3:
@@ -153,8 +233,17 @@ def _write_geotiff(path: Path, data: np.ndarray, ref_profile, transform) -> None
 
 def _raster_footprint(src: rasterio.DatasetReader):
     """
-    Polygonize the raster's valid-data mask (255 = valid). This ensures we only
-    claim coverage where the dataset actually has data (not just bbox overlap).
+    Derive the raster **valid-data footprint** as a polygon from the dataset mask.
+
+    Parameters
+    ----------
+    src : rasterio.DatasetReader
+        Open raster dataset.
+
+    Returns
+    -------
+    shapely.geometry.Polygon or MultiPolygon or None
+        Union of shapes where dataset_mask()==255; None if no valid data.
     """
     mask = src.dataset_mask()  # uint8, 255=valid, 0=nodata
     geoms = []
@@ -165,7 +254,14 @@ def _raster_footprint(src: rasterio.DatasetReader):
 
 
 def _poly_only(g):
-    """Return a valid Polygon/MultiPolygon (or None) from any input geometry."""
+    """
+    Coerce an input geometry to a valid Polygon/MultiPolygon or return None.
+
+    Behavior
+    --------
+    - Repairs invalid geometries (make_valid/zero-width buffer).
+    - Extracts only polygonal components from GeometryCollections.
+    """
     if g is None or g.is_empty:
         return None
     try:
@@ -185,7 +281,14 @@ def _poly_only(g):
 
 
 def _safe_intersection(a, b):
-    """Intersection that tries to repair inputs on topology errors."""
+    """
+    Robust polygon intersection that attempts geometry repair on GEOS errors.
+
+    Returns
+    -------
+    Polygon/MultiPolygon or None
+        Intersection result or None if inputs cannot be repaired.
+    """
     try:
         return a.intersection(b)
     except GEOSException:
@@ -202,7 +305,24 @@ def _safe_intersection(a, b):
 # Gauge processing and division
 # -----------------------------------------------------------------------------
 def _load_eden_csv(csv_path: Path) -> pd.DataFrame:
-    """Read the wide EDEN CSV and ensure 'StationID' is present and clean."""
+    """
+    Load the wide EDEN CSV and ensure a clean string 'StationID' column.
+
+    Parameters
+    ----------
+    csv_path : Path
+        Path to eden_water_levels.csv (wide table).
+
+    Returns
+    -------
+    pd.DataFrame
+        EDEN table with 'StationID' stripped/cast to string.
+
+    Exits
+    -----
+    sys.exit(1) if 'StationID' is missing.
+    """
+
     df = pd.read_csv(csv_path, dtype={'StationID': str})
     if 'StationID' not in df.columns:
         print("ERROR: 'StationID' column is required in EDEN CSV.", file=sys.stderr)
@@ -218,11 +338,35 @@ def _make_above_ground_csv_same_columns(
     name_col: str = "EDEN Station Name",
 ) -> Path:
     """
-    Build a corrected CSV with the *same columns* as the source EDEN CSV,
-    where every YYYY-MM-DD column is water level *above ground* (cm),
-    and keep **only** stations that appear in the ground-elevation file.
+    Create a **water-above-ground (cm)** CSV with the **same columns** as EDEN input.
 
-    Join key: StationID == 'EDEN Station Name'.
+    Process
+    -------
+    1) Read EDEN water levels (cm NAVD88) and ground elevations (ft NAVD88).
+    2) Convert ft→cm; inner-join on StationID (matches 'EDEN Station Name').
+    3) Subtract ground_cm from every date column 'YYYY-MM-DD'.
+    4) Drop helper cols and restore original column order; write CSV.
+
+    Parameters
+    ----------
+    eden_csv : Path
+        Source EDEN wide CSV (must contain 'StationID' and date columns).
+    ground_txt : Path
+        Ground-elevation table with 'EDEN Station Name' and 'Average Ground Elevation (ft NAVD88)'.
+    out_csv : Path
+        Destination CSV path to write.
+    ground_col_ft : str, default "Average Ground Elevation (ft NAVD88)"
+    name_col : str, default "EDEN Station Name"
+
+    Returns
+    -------
+    Path
+        Path to the written CSV.
+
+    Raises / Exits
+    --------------
+    SystemExit
+        If required columns are missing or no stations match.
     """
     
     # 1) Read source EDEN levels (wide; cm NAVD88)
@@ -294,8 +438,28 @@ def _make_above_ground_csv_same_columns(
 
 def _enrich_and_filter_gauges(eden_df: pd.DataFrame) -> gpd.GeoDataFrame:
     """
-    Merge EDEN rows with gauge attributes and geometry, spatial-join into water areas,
-    and (if available) filter by physical station type (Marsh/Forest/River).
+    Merge EDEN stations with attributes/geometry, spatial-join into areas, and filter types.
+
+    Inputs
+    ------
+    - gauge_locations.geojson (WGS84) with 'StationID' (or 'EDEN Station Name' fallback).
+    - water_areas.geojson (WGS84) with 'area' field.
+
+    Behavior
+    --------
+    - Attaches geometry from GeoJSON; falls back to Lat/Lon if needed.
+    - Repairs water-area polygons and explodes multiparts.
+    - Spatial join predicate='within'.
+    - If TYPE_FLD exists, keeps only VALID_TYPES (e.g., Marsh/Forest/River).
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Gauges with area membership and attributes; crs=EPSG:4326.
+
+    Exits
+    -----
+    sys.exit(1) if required fields are missing.
     """
     gauges = gpd.read_file(GAUGE_GEOJSON).to_crs(4326)
     if 'StationID' not in gauges.columns:
@@ -352,9 +516,24 @@ def _enrich_and_filter_gauges(eden_df: pd.DataFrame) -> gpd.GeoDataFrame:
 
 def _export_by_area_simple(gdf: gpd.GeoDataFrame, keep_dates_iso: list[str]) -> None:
     """
-    Write per-area CSVs (no subsets):
-      /mnt/DATA2/bakke326l/processing/areas/<AREA>/water_gauges/eden_gauges.csv
-      /mnt/DATA2/bakke326l/processing/areas/<AREA>/water_gauges/eden_metadata.csv
+    Write per-area EDEN gauge tables (time series + metadata).
+
+    Outputs
+    -------
+    /mnt/DATA2/bakke326l/processing/areas/<AREA>/water_gauges/
+    • eden_gauges.csv   (columns: StationID, Lat, Lon, and acquisition-date columns)
+    • eden_metadata.csv (all non-date attributes for the same gauges)
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Enriched gauges with 'area' and geometry.
+    keep_dates_iso : list[str]
+        Acquisition dates formatted 'YYYY-MM-DD' to include in the time-series table.
+
+    Exits
+    -----
+    sys.exit(1) if none of the requested dates exist in EDEN columns.
     """
     present_dates = [d for d in keep_dates_iso if d in gdf.columns]
     if not present_dates:
@@ -387,6 +566,45 @@ def _export_by_area_simple(gdf: gpd.GeoDataFrame, keep_dates_iso: list[str]) -> 
 # Main routine
 # -----------------------------------------------------------------------------
 def main() -> None:
+    """
+    CLI entry point: build per-area gauge tables and clip vertical rasters by area.
+
+    Usage
+    -----
+    # Global search (default VERT_ROOT) for */inspect/vertical_displacement_cm_*.geo.tif
+    python 4_organize_areas.py
+
+    # One file
+    python 4_organize_areas.py --vertical-file /path/to/vertical_displacement_cm_YYYYMMDD_YYYYMMDD_RAW.geo.tif
+
+    # One pair directory (searches pair_dir/inspect/)
+    python 4_organize_areas.py --pair-dir /mnt/DATA2/.../path150_20071216_20080131_SRTM
+
+    # Tweak coverage threshold (default 65.0)
+    python 4_organize_areas.py --min-coverage-pct 50.0
+
+    Arguments
+    ---------
+    --vertical-file : str, optional
+        Single vertical displacement GeoTIFF to process.
+    --pair-dir : str, optional
+        A single pair directory; the script searches its inspect/ subfolder.
+    --vertical-root : str, default=/mnt/DATA2/bakke326l/processing/interferograms
+        Root to recursively search for */inspect/vertical_displacement_cm_*.geo.tif.
+    --min-coverage-pct : float, default=65.0
+        Minimum polygon coverage (percent) to write outputs.
+
+    Outputs
+    -------
+    - Per-area gauge CSVs under <AREA>/water_gauges/.
+    - Per-area interferogram clips under <AREA>/interferograms/.
+    - Global CSV report at _reports/coverage_report.csv.
+
+    Behavior
+    --------
+    - Skips writing files when coverage < threshold or all clipped pixels are NaN.
+    - Logs one report row per (raster x area) with coverage, valid pixel count, and reason.
+    """
     parser = argparse.ArgumentParser(
         description="EDEN per-area exports + coverage-aware clipping of vertical displacement rasters (TIFF + PNG)."
     )

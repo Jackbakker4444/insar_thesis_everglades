@@ -1,36 +1,55 @@
 #!/usr/bin/env python3
 """
-=============================================================
-dsm_to_isce.py  –  Convert a GeoTIFF DSM/DEM into ISCE2 format
-=============================================================
+help_xml_dem.py
+================
 
-• Reprojects (if needed) to geographic WGS‑84 (EPSG:4326)
-• Writes binary DEM + GDAL VRT using the GDAL *ISCE* driver
-• Generates ISCE‑compatible XML metadata via gdal2isce_xml
+Convert a GeoTIFF DEM/DTM into an ISCE2-ready WGS-84 DEM bundle.
 
-Requires:
-    - GDAL >= 3.4 (conda‑forge gdal)
-    - isce2 installed in the active environment
+What it does
+------------
+- Ensures the input is **geographic WGS-84 (EPSG:4326)** with ellipsoidal heights
+  (unless `--keep-egm` is used).
+- Writes an **ISCE binary** (`*.dem.wgs84`) with a matching **GDAL VRT**
+  (`*.dem.wgs84.vrt`) via the GDAL *ISCE* driver.
+- Generates the **ISCE XML** sidecar (`*.dem.wgs84.xml`) using `gdal2isce_xml`.
+- Optionally emits a small **text report** (`*.dem.wgs84.txt`) with grid, bbox,
+  statistics—via `write_dem_report` (called by other scripts).
+
+Requirementss
+------------
+- GDAL ≥ 3.4 (conda-forge recommended)
+- ISCE2 installed and importable (for `applications.gdal2isce_xml`)
+- `gdalwarp` and `gdal_translate` available on `PATH`
 
 Usage
 -----
 ```bash
-python help_xml_dem.py  \
-       --input   /path/to/my_lidar_utm.tif \
-       --output  /path/to/dem/my_area.dem.wgs84
-```
+python help_xml_dem.py \
+  --input  /path/to/my_lidar_utm.tif \
+  --output /path/to/dem/my_area.dem.wgs84
+  
+Options
+------
+--keep-egm : keep geoid heights (skip geoid→ellipsoid conversion)
 
-Optional flags:
-    --keep_egm      keep geoid heights (skip EGM→WGS84 conversion)
-    --overwrite     overwrite existing output files
+--overwrite : overwrite existing outputs
 
-After running, you will have:
-    my_area.dem.wgs84          (binary float32, little‑endian)
-    my_area.dem.wgs84.vrt      (GDAL VRT)
-    my_area.dem.wgs84.xml      (ISCE metadata)
+--tmp-dir DIR : temporary directory for reprojection
 
-You can drop the *.wgs84* basename into stripmapApp / stackStripMap.
+Outputs (same basename)
+------
+my_area.dem.wgs84 — ISCE binary float32 (little-endian)
+
+my_area.dem.wgs84.vrt — GDAL VRT pointing to the binary
+
+my_area.dem.wgs84.xml — ISCE metadata
+
+my_area.dem.wgs84.txt — (optional) human-readable report
+
+Notes
+The *.dem.wgs84 basename is directly consumable by ISCE2 (stripmapApp, stackStripMap).
 """
+
 from __future__ import annotations
 
 import argparse
