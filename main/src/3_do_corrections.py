@@ -9,6 +9,9 @@ Post-process finished interferograms per pair directory by:
 2) Creating **IONO-only** corrected unwrapped, quicklooks, and vertical map.
 3) Creating **TROPO-only** corrected unwrapped, quicklooks, and vertical map.
 4) Creating **TROPO+IONO** corrected unwrapped, quicklooks, and vertical map.
+5) NEW: Export quicklook PNGs for:
+   • Tropospheric **differential delay** (ΔAPS = ref - sec).
+   • Ionospheric **dispersive phase** used for correction.
 All vertical products are masked to the SAR swath and written as GeoTIFFs
 (with PNG quicklooks saved both locally and to a global inspect folder).
 
@@ -48,6 +51,8 @@ Inside each pair directory:
     <above>.png quicklooks
     vertical_displacement_cm_<REF>_<SEC>_{RAW|IONO|TROPO|TROPO_IONO}.geo.tif
     vertical_displacement_cm_<REF>_<SEC>_{...}.png
+    tropo_differential_delay_<REF>_<SEC>.png
+    iono_dispersive_phase_<REF>_<SEC>.png
 Global PNG copies are also written to:
   ~/InSAR/main/processing/inspect/
 
@@ -85,6 +90,7 @@ from pathlib import Path
 
 # --- silence DEBUG spam ---
 import os, logging
+import shutil  # <-- added
 os.environ.setdefault("CPL_DEBUG", "OFF")
 os.environ.setdefault("CPL_LOG", "/dev/null")
 os.environ.setdefault("RIO_LOG_LEVEL", "CRITICAL")
@@ -345,27 +351,6 @@ def write_vertical_cm(unw_path: Path, los_path: Path, out_path: Path, label: str
     - If CRS/transform/shape differ from the unwrapped grid, reprojects incidence
     to match (bilinear).
     - Off-swath pixels (from swath mask) are kept as NaN.
-
-    Parameters
-    ----------
-    unw_path : Path
-        Path to unwrapped phase product (RAW or corrected).
-    los_path : Path
-        Path to los.rdr.geo(.vrt) for incidence angles (degrees in band 1).
-    out_path : Path
-        Output GeoTIFF path for vertical displacement (cm).
-    label : str, optional
-        Short tag for logging (e.g., "RAW", "IONO").
-
-    Outputs
-    -------
-    - GeoTIFF at `out_path` with float32 data, NaN nodata, DEFLATE compression.
-    - PNG quicklook next to the GeoTIFF and a copy in ~/InSAR/main/processing/inspect/.
-
-    Raises
-    ------
-    Exception
-        Propagates any raster I/O or reprojection errors encountered.
     """
     WAVELENGTH = 0.2362  # m
 
@@ -426,12 +411,11 @@ def write_vertical_cm(unw_path: Path, los_path: Path, out_path: Path, label: str
     with rasterio.open(out_path, "w", **prof) as dst:
         dst.write(d_vert_cm, 1)
 
-    # quicklook(s)
+    # quicklook (per-pair inspect only)
     try:
         png = out_path.with_suffix(".png")
         quicklook_png(out_path, png, band=1)
-        (HOME_PROC / "inspect").mkdir(parents=True, exist_ok=True)
-        quicklook_png(out_path, HOME_PROC / "inspect" / out_path.name.replace(".tif", ".png"), band=1)
+        # removed global HOME_PROC/inspect copy
     except Exception as e:
         print(f"⚠️  vertical PNG failed: {e}")
 
@@ -446,17 +430,6 @@ def readiness(pairdir: Path) -> tuple[bool, str | None, Path | None]:
     interferogram/filt_topophase.unw.geo(.vrt)
     - Line-of-sight file los.rdr.geo(.vrt) is optional; if missing, vertical
     exports will be skipped but corrections may still run.
-
-    Parameters
-    ----------
-    pairdir : Path
-        Pair directory (path<PATH>_<REF>_<SEC>_<DEM>).
-
-    Returns
-    -------
-    (ok, reason, los_path) : (bool, Optional[str], Optional[Path])
-        ok=True if base unwrapped exists; `reason` holds a message when ok=False;
-        `los_path` is the chosen LOS file or None if not found.
     """
     igram_dir = pairdir / "interferogram"
     geom_dir  = pairdir / "geometry"
@@ -485,26 +458,9 @@ def process_pair(pairdir: Path) -> bool:
     2) **IONO-only** correction → quicklooks → vertical (if LOS present).
     3) **TROPO-only** correction → quicklooks → vertical (if LOS present).
     4) **TROPO+IONO** (iono applied to tropo product) → quicklooks → vertical.
+    5) Quicklooks for ΔAPS (tropo) and dispersive phase (iono).
     All vertical GeoTIFFs are masked to the swath and compressed; PNG quicklooks
     are written locally and to the global inspect dir.
-
-    Parameters
-    ----------
-    pairdir : Path
-        A single pair directory (path<PATH>_<REF>_<SEC>_{SRTM|3DEP}).
-
-    Returns
-    -------
-    bool
-        True if pair processed (or partially processed) without fatal errors;
-        False if the pair was skipped due to missing base inputs.
-
-    Side effects
-    ------------
-    Creates/updates:
-    - interferogram/filt_topophase_{iono|tropo|tropo_iono}.unw.geo
-    - inspect/*.tif and *.png quicklooks for each corrected unwrapped
-    - inspect/vertical_displacement_cm_<REF>_<SEC>_{RAW|IONO|TROPO|TROPO_IONO}.geo.tif (+ PNGs)
     """
     try:
         path_no, ref, sec, dem = parse_pair_id(pairdir)
@@ -524,6 +480,10 @@ def process_pair(pairdir: Path) -> bool:
     tropo_dir.mkdir(exist_ok=True)
     inspect_dir.mkdir(exist_ok=True)
 
+    # NEW: central quicklook dir under interferograms/
+    quickroot = pairdir.parent / "quicklook"
+    quickroot.mkdir(exist_ok=True)
+
     # Base unwrapped (guaranteed by readiness)
     base_unw = find_base_unw(igram_dir)
 
@@ -533,6 +493,10 @@ def process_pair(pairdir: Path) -> bool:
         try:
             out_raw = inspect_dir / f"vertical_displacement_cm_{ref}_{sec}_RAW.geo.tif"
             write_vertical_cm(base_unw, los_path, out_raw, label="RAW")
+            # copy RAW PNG to central quicklook
+            raw_png = out_raw.with_suffix(".png")
+            if raw_png.exists():
+                shutil.copy2(raw_png, quickroot / f"{pairdir.name}__{raw_png.name}")
         except Exception as e:
             print(f"⚠️  RAW vertical export failed: {e}")
     else:
@@ -546,13 +510,26 @@ def process_pair(pairdir: Path) -> bool:
     except Exception as e:
         print(f"⚠️  iono-only correction failed: {e}")
 
+    # quicklook for the ionospheric **dispersive phase** used for correction
+    try:
+        iono_phase = pairdir / "ionosphere" / "dispersive.bil.unwCor.filt.geo"
+        if iono_phase.exists():
+            local_png  = inspect_dir / f"iono_dispersive_phase_{ref}_{sec}.png"
+            quicklook_png(iono_phase, local_png)
+            # removed global HOME_PROC/inspect copy
+            print(f"✓ iono dispersive quicklook → {local_png.name}")
+        else:
+            print("ℹ️  ionosphere/dispersive.bil.unwCor.filt.geo not found — skipping iono quicklook.")
+    except Exception as e:
+        print(f"⚠️  iono dispersive quicklook failed: {e}")
+
     iono_unw = igram_dir / "filt_topophase_iono.unw.geo"
     if iono_unw.exists():
-        # quicklooks for corrected unwrapped
+        # quicklooks for corrected unwrapped (per-pair inspect only)
         try:
             tif = inspect_dir / f"{iono_unw.stem}_{ref}_{sec}.tif"
             translate_to_tif(iono_unw, tif)
-            quicklook_png(iono_unw, HOME_PROC / "inspect" / f"{iono_unw.stem}_{ref}_{sec}.png")
+            quicklook_png(iono_unw, inspect_dir / f"{iono_unw.stem}_{ref}_{sec}.png")
         except Exception as e:
             print(f"⚠️  iono export failed: {e}")
 
@@ -576,13 +553,26 @@ def process_pair(pairdir: Path) -> bool:
     except Exception as e:
         print(f"⚠️  tropo correction failed for {pairdir.name}: {e}")
 
+    # quicklook for **ΔAPS (ref−sec)** difference map (per-pair inspect only)
+    try:
+        aps_diff = tropo_dir / f"{ref}_{sec}.aps.geo"
+        if aps_diff.exists():
+            local_png  = inspect_dir / f"tropo_differential_delay_{ref}_{sec}.png"
+            quicklook_png(aps_diff, local_png)
+            # removed global HOME_PROC/inspect copy
+            print(f"✓ tropo ΔAPS quicklook → {local_png.name}")
+        else:
+            print("ℹ️  ΔAPS file not found (tropo/<ref>_<sec>.aps.geo) — skipping TROPO diff quicklook.")
+    except Exception as e:
+        print(f"⚠️  TROPO ΔAPS quicklook failed: {e}")
+
     tropo_unw = igram_dir / "filt_topophase_tropo.unw.geo"
     if tropo_unw.exists():
-        # quicklooks for tropo-only unwrapped
+        # quicklooks for tropo-only unwrapped (per-pair inspect only)
         try:
             tif_tropo = inspect_dir / f"{tropo_unw.stem}_{ref}_{sec}.tif"
             translate_to_tif(tropo_unw, tif_tropo)
-            quicklook_png(tropo_unw, HOME_PROC / "inspect" / f"{tropo_unw.stem}_{ref}_{sec}.png")
+            quicklook_png(tropo_unw, inspect_dir / f"{tropo_unw.stem}_{ref}_{sec}.png")
         except Exception as e:
             print(f"⚠️  tropo export failed: {e}")
 
@@ -606,11 +596,11 @@ def process_pair(pairdir: Path) -> bool:
 
         tropo_iono_unw = igram_dir / "filt_topophase_tropo_iono.unw.geo"
         if tropo_iono_unw.exists():
-            # quicklooks
+            # quicklooks (per-pair inspect only)
             try:
                 tif_ti = inspect_dir / f"{tropo_iono_unw.stem}_{ref}_{sec}.tif"
                 translate_to_tif(tropo_iono_unw, tif_ti)
-                quicklook_png(tropo_iono_unw, HOME_PROC / "inspect" / f"{tropo_iono_unw.stem}_{ref}_{sec}.png")
+                quicklook_png(tropo_iono_unw, inspect_dir / f"{tropo_iono_unw.stem}_{ref}_{sec}.png")
             except Exception as e:
                 print(f"⚠️  tropo+iono export failed: {e}")
 
@@ -619,6 +609,10 @@ def process_pair(pairdir: Path) -> bool:
                 try:
                     out_ti = inspect_dir / f"vertical_displacement_cm_{ref}_{sec}_TROPO_IONO.geo.tif"
                     write_vertical_cm(tropo_iono_unw, los_path, out_ti, label="TROPO_IONO")
+                    # copy TROPO_IONO PNG to central quicklook
+                    ti_png = out_ti.with_suffix(".png")
+                    if ti_png.exists():
+                        shutil.copy2(ti_png, quickroot / f"{pairdir.name}__{ti_png.name}")
                 except Exception as e:
                     print(f"⚠️  TROPO+IONO vertical export failed: {e}")
             else:
@@ -674,7 +668,7 @@ def main() -> None:
     - Continues across pairs, reporting per-pair success/skip counts.
     """
     ap = argparse.ArgumentParser(
-        description="Apply ionosphere-only and tropospheric corrections to pair directories; export vertical displacement for RAW, TROPO, IONO, TROPO_IONO. All outputs are masked to the SAR swath."
+        description="Apply ionosphere-only and tropospheric corrections to pair directories; export vertical displacement for RAW, TROPO, IONO, TROPO_IONO, and quicklooks for ΔAPS + iono dispersive. All outputs are masked to the SAR swath."
     )
     ap.add_argument("pairdir", nargs="*", type=Path,
                     help="One or more individual pair directories (…/pathXXX_REF_SEC_SRTM or …_3DEP)")
