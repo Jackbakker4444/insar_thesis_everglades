@@ -77,6 +77,9 @@ python 4_organize_areas.py --pair-dir /mnt/DATA2/.../path150_20071216_20080131_S
 # Adjust coverage threshold (default 65.0 %):
 python 4_organize_areas.py --min-coverage-pct 50.0
 
+# (NEW) Tail-trim one-sided outlier pixels after clipping (masking):
+python 4_organize_areas.py --tail-z 4 --clip-k 4 --tail-frac 0.005 --tail-min-px 200
+
 Notes
 -----
 - Coverage is computed as (area ∩ raster_footprint) / area.
@@ -102,6 +105,7 @@ import re
 from pathlib import Path
 import sys
 import re
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -299,6 +303,111 @@ def _safe_intersection(a, b):
             return a2.intersection(b2)
         except GEOSException:
             return a2.buffer(0).intersection(b2.buffer(0))
+
+
+# --- NEW: robust one-sided tail masking --------------------------------------
+def _mask_tails_robust(
+    arr: np.ndarray,
+    z_tail: float = 4.0,
+    clip_k: float = 4.0,
+    tail_frac: float = 0.005,
+    tail_min_px: int = 200,
+) -> tuple[np.ndarray, dict]:
+    """
+    Mask (set to NaN) *one-sided* extreme tails in a per-area clipped array using robust stats.
+
+    Rationale
+    ---------
+    In many scenes the main signal is approximately normal but contaminated by a one-sided
+    tail (e.g., ocean bleed). We want to keep normally distributed data intact while
+    removing only the distant tail pixels.
+
+    Method
+    ------
+    - Compute robust center and scale on the **finite** pixels:
+        center = median(arr),  sigma = 1.4826 * MAD(arr - median).
+      If sigma is 0 or not finite, return the input as-is.
+    - Detect "far tails" via robust z-scores z = (x - center) / sigma:
+        Right tail fraction p_hi = fraction(z > z_tail)
+        Left  tail fraction p_lo = fraction(z < -z_tail)
+      A side is considered a problematic tail if its fraction >= tail_frac AND its count
+      >= tail_min_px. This prevents trimming due to tiny speckles.
+    - If a tail is flagged, compute bounds at center ± clip_k * sigma *only* on the flagged side(s):
+        bound_hi = center + clip_k*sigma if right tail flagged else +inf
+        bound_lo = center - clip_k*sigma if left  tail flagged else -inf
+      Any pixel beyond the active bound(s) is set to NaN.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        2-D array (float) with NaN for no-data.
+    z_tail : float, default 4.0
+        Z-score threshold to *detect* a far tail (robust units).
+    clip_k : float, default 4.0
+        Clipping multiple (robust σ) to define the mask bound(s) after detection.
+    tail_frac : float, default 0.005
+        Minimum fraction (of finite pixels) to consider a tail significant.
+    tail_min_px : int, default 200
+        Minimum absolute count of pixels to consider a tail significant.
+
+    Returns
+    -------
+    (trimmed, info) : (np.ndarray, dict)
+        trimmed : same shape as input; only distant tail pixels are set to NaN.
+        info    : small dict with diagnostics:
+                  {'center': float, 'sigma': float, 'p_hi': float, 'p_lo': float,
+                   'mask_hi': bool, 'mask_lo': bool, 'n_masked': int, 'bounds': (lo, hi)}
+
+    Notes
+    -----
+    - Offset-invariant: large constant offsets do not trigger trimming.
+    - Two-sided normal blobs pass untouched (both tails small).
+    - Only masks when a side has a *material* tail (fraction + count).
+    """
+    trimmed = arr.copy()
+    vals = trimmed[np.isfinite(trimmed)]
+    info = {
+        'center': np.nan, 'sigma': np.nan,
+        'p_hi': 0.0, 'p_lo': 0.0,
+        'mask_hi': False, 'mask_lo': False,
+        'n_masked': 0, 'bounds': (float("-inf"), float("inf")),
+    }
+    if vals.size < max(50, tail_min_px):  # too few pixels to estimate robustly
+        return trimmed, info
+
+    med = float(np.nanmedian(vals))
+    mad = float(np.nanmedian(np.abs(vals - med)))
+    sig = 1.4826 * mad if mad > 0 else np.nan
+    info['center'] = med
+    info['sigma'] = sig
+
+    if not np.isfinite(sig) or sig < 1e-6:
+        return trimmed, info  # no scale → no trimming
+
+    z = (vals - med) / sig
+    p_hi = float((z > z_tail).mean())
+    p_lo = float((z < -z_tail).mean())
+    n_hi = int((z > z_tail).sum())
+    n_lo = int((z < -z_tail).sum())
+    info['p_hi'] = p_hi
+    info['p_lo'] = p_lo
+
+    do_hi = (p_hi >= float(tail_frac)) and (n_hi >= int(tail_min_px))
+    do_lo = (p_lo >= float(tail_frac)) and (n_lo >= int(tail_min_px))
+    info['mask_hi'] = bool(do_hi)
+    info['mask_lo'] = bool(do_lo)
+
+    bound_lo = med - clip_k * sig if do_lo else float("-inf")
+    bound_hi = med + clip_k * sig if do_hi else float("inf")
+    info['bounds'] = (bound_lo, bound_hi)
+
+    if do_hi or do_lo:
+        mask_bad = (trimmed < bound_lo) | (trimmed > bound_hi)
+        n_masked = int(np.count_nonzero(mask_bad & np.isfinite(trimmed)))
+        trimmed[mask_bad] = np.nan
+        info['n_masked'] = n_masked
+
+    return trimmed, info
 
 
 # -----------------------------------------------------------------------------
@@ -591,7 +700,7 @@ def main() -> None:
         A single pair directory; the script searches its inspect/ subfolder.
     --vertical-root : str, default=/mnt/DATA2/bakke326l/processing/interferograms
         Root to recursively search for */inspect/vertical_displacement_cm_*.geo.tif.
-    --min-coverage-pct : float, default=65.0
+    --min-coverage-pct : float, default=70.0
         Minimum polygon coverage (percent) to write outputs.
 
     Outputs
@@ -616,6 +725,18 @@ def main() -> None:
                         help='Root to search recursively for */inspect/vertical_displacement_cm_*.geo.tif (default: global search).')
     parser.add_argument('--min-coverage-pct', type=float, default=65.0,
                         help='Minimum polygon coverage (percent) to write outputs. Default: 50.0')
+    # NEW: tail-trimming parameters (masking)
+    parser.add_argument('--tail-z', type=float, default=5.0,
+                        help='Robust z-score to detect a far tail (default 4.0).\
+                              Lower → more sensitive (flags tails more often). Higher → more conservative.')
+    parser.add_argument('--clip-k', type=float, default=4.0,
+                        help='Clipping multiple (robust sigma) applied to flagged side(s) (default 4.0).\
+                              Lower → trims closer to the median (more aggressive), higher → trims only the farthest tail.')
+    parser.add_argument('--tail-frac', type=float, default=0.005,
+                        help='Minimum fraction of finite pixels for a side to count as a tail (default 0.005).\
+                              Increase this if tiny tails shouldnt trigger trimming; decrease if small tails should be trimmed.')
+    parser.add_argument('--tail-min-px', type=int, default=200,
+                        help='Minimum pixel count for a side to count as a tail (default 200).')
     args = parser.parse_args()
 
     # ---- Gauges: read, join, export per area ----
@@ -783,10 +904,24 @@ def main() -> None:
                 if clipped.ndim == 1:
                     clipped = clipped.reshape(1, -1)
 
-                # Count finite pixels only (for reporting; not used for threshold)
+                # --- NEW: mask one-sided far tails BEFORE coverage/valid-pixel checks ---
+                clipped, tinfo = _mask_tails_robust(
+                    clipped,
+                    z_tail=args.tail_z,
+                    clip_k=args.clip_k,
+                    tail_frac=args.tail_frac,
+                    tail_min_px=args.tail_min_px,
+                )
+                if tinfo.get('mask_hi') or tinfo.get('mask_lo'):
+                    print(f"✂️  Tail trim {area} • {vpath.name}: "
+                          f"masked={tinfo['n_masked']}, "
+                          f"p_hi={tinfo['p_hi']:.4f}, p_lo={tinfo['p_lo']:.4f}, "
+                          f"bounds=({tinfo['bounds'][0]:.2f}, {tinfo['bounds'][1]:.2f})")
+
+                # Count finite pixels only (for reporting; used *after* trimming)
                 valid_pixels = int(np.count_nonzero(np.isfinite(clipped)))
 
-                # Threshold test: ONLY coverage % (still skip if all-NaN)
+                # Threshold tests: all-NaN / coverage
                 if valid_pixels == 0:
                     wrote = False; reason = 'all_nan'
                 elif coverage_pct < float(args.min_coverage_pct):
