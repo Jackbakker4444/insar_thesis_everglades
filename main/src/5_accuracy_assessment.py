@@ -247,7 +247,7 @@ def _geod_area_of_geojson(geom) -> float:
 
 def _valid_raster_area_km2(ds: rasterio.io.DatasetReader) -> float:
     """
-    Compute valid-data surface area (km²) from dataset_mask()==255 polygons.
+    Compute valid-data surface area (km²) from **finite (non-NaN) pixel** polygons.
 
     Assumes
     -------
@@ -265,7 +265,11 @@ def _valid_raster_area_km2(ds: rasterio.io.DatasetReader) -> float:
     """
     if ds.crs is None or ds.crs.to_epsg() != 4326:
         raise RuntimeError("Expected EPSG:4326 raster.")
-    mask = (ds.dataset_mask() == 255).astype(np.uint8)
+    # CHANGED: use the raster's finite pixels (after honoring nodata) as the validity mask
+    arr = ds.read(1).astype("float32")
+    if ds.nodata is not None and not np.isnan(ds.nodata):
+        arr[arr == ds.nodata] = np.nan
+    mask = np.isfinite(arr).astype(np.uint8)
     area = 0.0
     for geom, val in shapes(mask, transform=ds.transform):
         if val == 1:
@@ -284,7 +288,7 @@ def _safe_corrcoef(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     """
-    Compute RMSE, MAE, Bias, and Pearson r between predictions and truth.
+    Compute RMSE, MAE, Bias, Random error, and Pearson r between predictions and truth.
 
     Parameters
     ----------
@@ -293,14 +297,21 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]
     Returns
     -------
     dict
-        {'rmse_cm','mae_cm','bias_cm','r'}
+        {'rmse_cm','mae_cm','bias_cm', sigma_e_cm,'r'}
     """
     err = y_pred - y_true
+    
+    bias = float(np.mean(err))
+    rmse = float(np.sqrt(np.mean(err**2)))
+    mae  = float(np.mean(np.abs(err)))
+    sigma_e = float(np.sqrt(np.mean((err - bias)**2)))
+    
     return {
-        "rmse_cm": float(np.sqrt(np.mean(err**2))),
-        "mae_cm":  float(np.mean(np.abs(err))),
-        "bias_cm": float(np.mean(err)),
-        "r":       _safe_corrcoef(y_true, y_pred),
+        "rmse_cm"       :rmse,
+        "mae_cm"        :mae,
+        "bias_cm"       :bias,
+        "sigma_e_cm"    :sigma_e,
+        "r"             :_safe_corrcoef(y_true, y_pred),
     }
 
 def _idw_predict_points(px, py, pz, qx, qy, power: float = 2.0) -> np.ndarray:
@@ -443,7 +454,7 @@ def _eval_ls_and_idw(pts: pd.DataFrame, cal_idx: np.ndarray, val_idx: np.ndarray
         m_ls = _compute_metrics(y_true=y_val, y_pred=y_pred_ls)
         m_ls.update({"a_gain": float(a), "b_offset_cm": float(b)})
     else:
-        m_ls = {"rmse_cm": np.nan, "mae_cm": np.nan, "bias_cm": np.nan, "r": np.nan,
+        m_ls = {"rmse_cm": np.nan, "mae_cm": np.nan, "bias_cm": np.nan, "sigma_e":np.nan ,"r": np.nan,
                 "a_gain": np.nan, "b_offset_cm": np.nan}
 
     # Predict & score IDW (gauges → Δh_vis at validation gauges)
@@ -518,7 +529,7 @@ def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndar
     Returns
     -------
     np.ndarray (H, W) float32
-        IDW predictions with NaN outside the dataset mask.
+        IDW predictions with NaN outside the raster's **finite-pixel** mask.
 
     Raises
     ------
@@ -531,6 +542,11 @@ def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndar
         crs = ds.crs
         if crs is None or crs.to_epsg() != 4326:
             raise RuntimeError(f"Expected EPSG:4326 grid for IDW export: {ref_tif}")
+
+        # derive validity from the raster values (finite after honoring nodata)
+        base = ds.read(1).astype("float32")
+        if ds.nodata is not None and not np.isnan(ds.nodata):
+            base[base == ds.nodata] = np.nan
 
         # Precompute lon/lat for each column and row at pixel centers
         cols = np.arange(W, dtype=np.float64) + 0.5
@@ -563,13 +579,14 @@ def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndar
                 pred[hits] = pz[imin[hits]]
             out[r, :] = pred.astype("float32")
 
-        valid_mask = (ds.dataset_mask() == 255)
+        # mask by finite pixels of the reference raster (after trimming)
+        valid_mask = np.isfinite(base)
         out = np.where(valid_mask, out, np.nan)
         return out
 
 def _apply_calibration_to_raster(src_tif: Path, a: float, b: float) -> np.ndarray:
     """
-    Apply affine calibration y = a·x + b to a raster, honoring dataset_mask and nodata.
+    Apply affine calibration y = a·x + b to a raster, honoring NaN/nodata (finite-pixel mask).
 
     Returns
     -------
@@ -580,7 +597,8 @@ def _apply_calibration_to_raster(src_tif: Path, a: float, b: float) -> np.ndarra
         arr = ds.read(1).astype("float32")
         if ds.nodata is not None and not np.isnan(ds.nodata):
             arr = np.where(arr == ds.nodata, np.nan, arr)
-        valid_mask = (ds.dataset_mask() == 255) & np.isfinite(arr)
+        # CHANGED: validity is defined by finite values (includes any tail-trimmed NaNs)
+        valid_mask = np.isfinite(arr)
         out = np.full_like(arr, np.nan, dtype="float32")
         out[valid_mask] = a * arr[valid_mask] + b
         return out
@@ -1110,3 +1128,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
