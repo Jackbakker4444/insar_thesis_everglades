@@ -19,17 +19,15 @@ Design assumptions
 ------------------
 - For a given pair and DEM, your accuracy script already ensures:
   - Same gauge set and same cal/val plan across corrections.
-  - Identical densities across corrections within that DEM (we rely on that).
-- For DEM comparisons at the chosen correction, densities are equalized across DEMs
-  by your updated accuracy script (shared DEM-pair area at that correction).
+  - Identical densities across corrections within that DEM.
+- For DEM comparisons at the chosen correction, densities are equalized across DEMs.
 
 Inputs
 ------
 Per AREA:
   <areas_root>/<AREA>/results/accuracy_metrics.csv
-  (Produced by 5_accuracy_assessment.py with fields incl.:
-   area, pair_ref, pair_sec, dem, corr, method, replicate, n_cal, rmse_cm, log_rmse_cm,
-   valid_area_km2, area_per_gauge_km2, ...)
+  (Columns include: area, pair_ref, pair_sec, dem, corr, method, replicate, n_cal,
+   rmse_cm, log_rmse_cm, valid_area_km2, area_per_gauge_km2, ...)
 
 Outputs
 -------
@@ -48,7 +46,7 @@ Across ALL AREAS into <areas_root>/results/:
 
 How to run
 ----------
-# All areas under root, default metric rmse_cm and DEM-correction = TROPO_IONO
+# All areas, default metric rmse_cm and DEM-correction = TROPO_IONO
 python 6_inferential_tests.py
 
 # Single area
@@ -71,6 +69,7 @@ from scipy import stats
 try:
     import statsmodels.api as sm  # noqa: F401
     from statsmodels.stats.anova import AnovaRM
+    from statsmodels.stats.multitest import multipletests
 except Exception:
     raise SystemExit("This script requires statsmodels. Install with: pip install statsmodels")
 
@@ -82,7 +81,30 @@ CORR_LEVELS = ["RAW", "IONO", "TROPO", "TROPO_IONO"]
 ALL_VARIANTS = CORR_LEVELS + ["IDW"]
 DEM_CORR_CHOICES = set(CORR_LEVELS)  # correction used for DEM comparisons (IDW not applicable)
 
-# ------------------------------ Helpers --------------------------------
+# ------------------------------ Safe stats helpers --------------------------------
+
+def ttest_rel_safe(a, b, eps: float = 1e-12):
+    """
+    Paired t-test that avoids SciPy precision-loss warnings when data are (near) identical.
+    - Drops NaNs pairwise.
+    - If std(diff) < eps, returns t=0, p=1, n=len(diff).
+    - Else returns scipy.stats.ttest_rel(a, b).
+    """
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    mask = np.isfinite(a) & np.isfinite(b)
+    a = a[mask]; b = b[mask]
+    n = a.size
+    if n < 2:
+        return np.nan, np.nan, int(n)
+    d = a - b
+    # ddof=1 for sample std; guard small n
+    if n > 1 and np.nanstd(d, ddof=1) < eps:
+        return 0.0, 1.0, int(n)
+    t, p = stats.ttest_rel(a, b)
+    return float(t), float(p), int(n)
+
+# ------------------------------ Utility helpers --------------------------------
 
 def _pair_tag(ref: str, sec: str) -> str:
     """Build a compact pair tag from ISO dates."""
@@ -125,7 +147,7 @@ def _build_blocks_for_pair(df_pair: pd.DataFrame, dem_sel: str, metric_col: str)
     cat["block_id"] = cat.apply(lambda r: f"rep{int(r['replicate'])}_n{int(r['n_cal'])}", axis=1)
     cat["variant"] = cat["corr"].astype(str)
 
-    grp = cat.groupby(["pair","block_id"])
+    grp = cat.groupby(["pair","block_id"], observed=False)
     ok_blocks = grp["variant"].apply(lambda s: set(ALL_VARIANTS).issubset(set(s))).reset_index()
     ok_blocks = ok_blocks[ok_blocks["variant"] == True][["pair","block_id"]]  # noqa: E712
 
@@ -136,7 +158,9 @@ def _build_blocks_for_pair(df_pair: pd.DataFrame, dem_sel: str, metric_col: str)
 
 def _anova_rm_oneway(df_long: pd.DataFrame, dv: str, subject: str, within: str):
     """Run one-way repeated-measures ANOVA with statsmodels AnovaRM."""
-    if df_long[[subject, within]].drop_duplicates().groupby(subject).size().min() < 2:
+    # Need ≥2 levels within each subject
+    check = df_long[[subject, within]].drop_duplicates().groupby(subject, observed=False).size()
+    if check.min() < 2:
         return None
     try:
         aov = AnovaRM(df_long, depvar=dv, subject=subject, within=[within]).fit()
@@ -149,24 +173,21 @@ def _pairwise_within_block_ttests(df_long: pd.DataFrame, subject: str, within: s
     Paired t-tests for all pairs of levels in 'within', aligned by 'subject'.
     Holm-adjust p-values. Returns DataFrame of comparisons.
     """
-    wide = df_long.pivot_table(index=subject, columns=within, values=dv, aggfunc="mean").dropna(axis=0, how="any")
+    wide = df_long.pivot_table(index=subject, columns=within, values=dv, aggfunc="mean", observed=False)
+    wide = wide.dropna(axis=0, how="any")
     levels = [c for c in wide.columns if c in ALL_VARIANTS]
     pairs = [(a, b) for i, a in enumerate(levels) for b in levels[i+1:]]
     rows, pvals = [], []
     for a, b in pairs:
-        t, p = stats.ttest_rel(wide[a], wide[b])
-        diff = float((wide[a] - wide[b]).mean())
-        rows.append({"level_a":a, "level_b":b, "t":float(t), "p_raw":float(p), "mean_diff":diff, "n":int(wide.shape[0])})
+        t, p, n = ttest_rel_safe(wide[a], wide[b])
+        diff = float((wide[a] - wide[b]).mean()) if n >= 1 else np.nan
+        rows.append({"level_a":a, "level_b":b, "t":t, "p_raw":p, "mean_diff":diff, "n":n})
         pvals.append(p)
-    # Holm step-down
     if rows:
-        order = np.argsort(pvals)
-        m = len(pvals)
-        p_sorted = np.array(pvals)[order]
-        adj_sorted = np.maximum.accumulate((m - np.arange(m)) * p_sorted)
-        adj_vals = np.clip(adj_sorted[np.argsort(order)], 0, 1.0)
-        for i, val in enumerate(adj_vals):
-            rows[i]["p_holm"] = float(min(1.0, val))
+        # Holm step-down via statsmodels
+        _, p_holm, _, _ = multipletests(pvals, method="holm")
+        for i, r in enumerate(rows):
+            r["p_holm"] = float(p_holm[i])
     return pd.DataFrame(rows)
 
 def _summarize_variant_means(df_long: pd.DataFrame) -> pd.DataFrame:
@@ -174,7 +195,7 @@ def _summarize_variant_means(df_long: pd.DataFrame) -> pd.DataFrame:
     def iqr(x):
         q = np.nanpercentile(x, [25, 75])
         return float(q[1]-q[0])
-    g = df_long.groupby("variant")["value"]
+    g = df_long.groupby("variant", observed=False)["value"]
     out = pd.DataFrame({
         "mean": g.mean(),
         "sd": g.std(),
@@ -187,7 +208,7 @@ def _summarize_variant_means(df_long: pd.DataFrame) -> pd.DataFrame:
 
 def _area_level_long_from_pair_means(df_perpair_long: pd.DataFrame) -> pd.DataFrame:
     """Collapse blocks to per-pair means, keep (area, pair, variant, value)."""
-    return df_perpair_long.groupby(["area","pair","variant"])["value"].mean().reset_index()
+    return df_perpair_long.groupby(["area","pair","variant"], observed=False)["value"].mean().reset_index()
 
 # ------------------------------ Main per-area runner --------------------------------
 
@@ -224,7 +245,8 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm", dem_corr: str = "T
         if aov is None:
             continue
         pw = _pairwise_within_block_ttests(long, subject="block_id", within="variant", dv="value")
-        means = long.groupby("variant")["value"].mean().sort_values()
+
+        means = long.groupby("variant", observed=False)["value"].mean().sort_values()
         best_variant = str(means.index[0])
         sig_vs_others = []
         for other in [v for v in ALL_VARIANTS if v != best_variant]:
@@ -232,7 +254,7 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm", dem_corr: str = "T
                      ((pw["level_b"]==best_variant)&(pw["level_a"]==other))]
             if not row.empty:
                 sig_vs_others.append(bool(row["p_holm"].iloc[0] < alpha))
-        best_significant_all = all(sig_vs_others) if sig_vs_others else False
+        best_significant_all = all(sig_vs_others) if sig_vs_others else False  # kept if you want to display later
 
         long = long.assign(area=area_name)  # ensure area tag
         area_perpair_long.append(long)
@@ -256,7 +278,6 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm", dem_corr: str = "T
 
         pw_all.append(pw.assign(area=area_name, pair=p, dem_used=dem_sel, metric=metric_col))
 
-    # Write per-pair ANOVA summary for corrections
     corr_perpair_csv = res_dir / "corrections_per_pair_anova.csv"
     if perpair_rows:
         pd.DataFrame(perpair_rows).to_csv(corr_perpair_csv, index=False)
@@ -266,7 +287,6 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm", dem_corr: str = "T
     else:
         print(f"ℹ️  No per-pair corrections ANOVA results for {area_name} (insufficient data).")
 
-    # Area-level ANOVA (subject = pair), using per-pair means
     corr_area_csv = res_dir / "corrections_area_overall_anova.csv"
     corr_area_tbl = res_dir / "corrections_area_summary_table.csv"
     if area_perpair_long:
@@ -296,16 +316,17 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm", dem_corr: str = "T
         if sub.empty:
             continue
         sub["block_id"] = sub.apply(lambda r: f"rep{int(r['replicate'])}_n{int(r['n_cal'])}", axis=1)
-        have_both = sub.groupby("block_id")["dem"].apply(lambda s: set(s)>= {"SRTM","3DEP"})
+        have_both = sub.groupby("block_id", observed=False)["dem"].apply(lambda s: set(s) >= {"SRTM","3DEP"})
         ok_blocks = have_both[have_both].index.tolist()
         sub_ok = sub[sub["block_id"].isin(ok_blocks)].copy()
         if sub_ok.empty:
             continue
-        wide = sub_ok.pivot_table(index="block_id", columns="dem", values=metric_col, aggfunc="mean").dropna(subset=["SRTM","3DEP"])
+        wide = sub_ok.pivot_table(index="block_id", columns="dem", values=metric_col, aggfunc="mean", observed=False) \
+                    .dropna(subset=["SRTM","3DEP"])
         if wide.shape[0] < 2:
             continue
-        t, pval = stats.ttest_rel(wide["3DEP"], wide["SRTM"])
-        diff = float((wide["3DEP"] - wide["SRTM"]).mean())
+        t, pval, n = ttest_rel_safe(wide["3DEP"], wide["SRTM"])
+        diff = float((wide["3DEP"] - wide["SRTM"]).mean()) if n >= 1 else np.nan
         dem_perpair_rows.append({
             "area": area_name,
             "pair": dfp["pair"].iloc[0] if not dfp.empty else p,
@@ -314,7 +335,7 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm", dem_corr: str = "T
             "n_blocks": int(wide.shape[0]),
             "mean_diff_3DEP_minus_SRTM": diff,
             "t": float(t), "p": float(pval),
-            "best_dem": "3DEP" if diff < 0 else "SRTM",
+            "best_dem": "3DEP" if (diff < 0) else "SRTM",
             "mean_SRTM": float(wide["SRTM"].mean()),
             "mean_3DEP": float(wide["3DEP"].mean()),
         })
@@ -339,9 +360,10 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm", dem_corr: str = "T
     dem_area_tbl = res_dir / f"dem_area_summary_table{suffix}.csv"
     if dem_pairs_long:
         long_dem = pd.concat(dem_pairs_long, ignore_index=True)
-        wide_pairs = long_dem.pivot_table(index="pair", columns="dem", values="value", aggfunc="mean").dropna(subset=["SRTM","3DEP"])
+        wide_pairs = long_dem.pivot_table(index="pair", columns="dem", values="value", aggfunc="mean", observed=False) \
+                             .dropna(subset=["SRTM","3DEP"])
         if wide_pairs.shape[0] >= 2:
-            t_area, p_area = stats.ttest_rel(wide_pairs["3DEP"], wide_pairs["SRTM"])
+            t_area, p_area, _ = ttest_rel_safe(wide_pairs["3DEP"], wide_pairs["SRTM"])
             pd.DataFrame([{
                 "area": area_name,
                 "metric": metric_col,
@@ -372,7 +394,7 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm", dem_corr: str = "T
         corr_for_global = _area_level_long_from_pair_means(pd.concat(area_perpair_long, ignore_index=True)).assign(area=area_name)
     dem_for_global = None
     if dem_pairs_long:
-        dem_for_global = pd.concat(dem_pairs_long, ignore_index=True).groupby(["area","pair","dem","corr_used"])["value"].mean().reset_index()
+        dem_for_global = pd.concat(dem_pairs_long, ignore_index=True).groupby(["area","pair","dem","corr_used"], observed=False)["value"].mean().reset_index()
     return corr_for_global, dem_for_global
 
 # ------------------------------ CLI / Global aggregation --------------------------------
@@ -424,10 +446,10 @@ def main():
         dem_all = pd.concat(all_dem, ignore_index=True)
         corr_used = str(args.dem_corr).upper()
         wide_all = dem_all[dem_all["corr_used"]==corr_used] \
-            .pivot_table(index=["area","pair"], columns="dem", values="value", aggfunc="mean") \
+            .pivot_table(index=["area","pair"], columns="dem", values="value", aggfunc="mean", observed=False) \
             .dropna(subset=["SRTM","3DEP"])
         if wide_all.shape[0] >= 2:
-            t_all, p_all = stats.ttest_rel(wide_all["3DEP"], wide_all["SRTM"])
+            t_all, p_all, _ = ttest_rel_safe(wide_all["3DEP"], wide_all["SRTM"])
             pd.DataFrame([{
                 "corr_used": corr_used,
                 "n_pairs": int(wide_all.shape[0]),
