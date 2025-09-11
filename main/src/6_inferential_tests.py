@@ -9,6 +9,7 @@ Given per-area metrics created by 5_accuracy_assessment.py, perform:
      - Per-pair repeated-measures ANOVA (subject = replicate × n_cal "block").
      - Area-level repeated-measures ANOVA (subject = pair; uses per-pair means).
      - All-areas repeated-measures ANOVA (subject = area:pair).
+     - NEW: Best & second-best correction with adjusted p-values (area-level and all-areas).
 
   B) DEMs (SRTM vs 3DEP), correction FIXED but SWITCHABLE (default TROPO_IONO):
      - Per-pair paired t-test (across blocks).
@@ -36,12 +37,16 @@ Per AREA into <areas_root>/<AREA>/results/:
   corrections_per_pair_pairwise.csv
   corrections_area_overall_anova.csv
   corrections_area_summary_table.csv
+  NEW: corrections_area_ranking.csv
+  NEW: corrections_area_best_second.csv
   dem_per_pair_ttest__<CORR>.csv
   dem_area_overall_ttest__<CORR>.csv
   dem_area_summary_table__<CORR>.csv
 
 Across ALL AREAS into <areas_root>/results/:
   corrections_all_areas_anova.csv
+  NEW: corrections_all_areas_ranking.csv
+  NEW: corrections_all_areas_best_second.csv
   dem_all_areas_ttest__<CORR>.csv
 
 How to run
@@ -98,7 +103,6 @@ def ttest_rel_safe(a, b, eps: float = 1e-12):
     if n < 2:
         return np.nan, np.nan, int(n)
     d = a - b
-    # ddof=1 for sample std; guard small n
     if n > 1 and np.nanstd(d, ddof=1) < eps:
         return 0.0, 1.0, int(n)
     t, p = stats.ttest_rel(a, b)
@@ -135,8 +139,7 @@ def _build_blocks_for_pair(df_pair: pd.DataFrame, dem_sel: str, metric_col: str)
     is_idw = (df["method"] == METHOD_IDW)
 
     ls_needed = df[is_ls & df["corr"].isin(CORR_LEVELS)].copy()
-    idw_needed = df[is_idw].copy()
-    idw_needed = idw_needed.assign(corr="IDW")
+    idw_needed = df[is_idw].copy().assign(corr="IDW")
 
     use_cols = ["area","pair_ref","pair_sec","replicate","n_cal","corr",metric_col]
     ls_needed = ls_needed[use_cols].rename(columns={metric_col:"value"})
@@ -158,7 +161,6 @@ def _build_blocks_for_pair(df_pair: pd.DataFrame, dem_sel: str, metric_col: str)
 
 def _anova_rm_oneway(df_long: pd.DataFrame, dv: str, subject: str, within: str):
     """Run one-way repeated-measures ANOVA with statsmodels AnovaRM."""
-    # Need ≥2 levels within each subject
     check = df_long[[subject, within]].drop_duplicates().groupby(subject, observed=False).size()
     if check.min() < 2:
         return None
@@ -168,7 +170,7 @@ def _anova_rm_oneway(df_long: pd.DataFrame, dv: str, subject: str, within: str):
     except Exception:
         return None
 
-def _pairwise_within_block_ttests(df_long: pd.DataFrame, subject: str, within: str, dv: str):
+def _pairwise_within_subject_ttests(df_long: pd.DataFrame, subject: str, within: str, dv: str):
     """
     Paired t-tests for all pairs of levels in 'within', aligned by 'subject'.
     Holm-adjust p-values. Returns DataFrame of comparisons.
@@ -184,31 +186,98 @@ def _pairwise_within_block_ttests(df_long: pd.DataFrame, subject: str, within: s
         rows.append({"level_a":a, "level_b":b, "t":t, "p_raw":p, "mean_diff":diff, "n":n})
         pvals.append(p)
     if rows:
-        # Holm step-down via statsmodels
         _, p_holm, _, _ = multipletests(pvals, method="holm")
         for i, r in enumerate(rows):
             r["p_holm"] = float(p_holm[i])
     return pd.DataFrame(rows)
 
-def _summarize_variant_means(df_long: pd.DataFrame) -> pd.DataFrame:
-    """Mean/SD/median/IQR per variant for a human-readable table."""
+def _summarize_variant_means(df_long: pd.DataFrame, subject_col: str) -> pd.DataFrame:
+    """Mean/SD/median/IQR per variant across subjects for a readable table."""
     def iqr(x):
         q = np.nanpercentile(x, [25, 75])
         return float(q[1]-q[0])
-    g = df_long.groupby("variant", observed=False)["value"]
+    # Compute per-subject means first so each subject has equal weight
+    subj_mean = df_long.pivot_table(index=subject_col, columns="variant", values="value", aggfunc="mean", observed=False)
+    # Longify
+    long = subj_mean.reset_index().melt(id_vars=[subject_col], var_name="variant", value_name="value")
+    g = long.groupby("variant", observed=False)["value"]
     out = pd.DataFrame({
         "mean": g.mean(),
         "sd": g.std(),
         "median": g.median(),
         "iqr": g.apply(iqr),
-        "n_subjects": df_long["pair"].nunique()
+        "n_subjects": long[subject_col].nunique()
     }).reset_index()
     out["variant"] = out["variant"].astype(str)
+    # Add rank (lower is better)
+    out = out.sort_values("mean", ascending=True).reset_index(drop=True)
+    out["rank"] = np.arange(1, len(out)+1)
     return out
 
-def _area_level_long_from_pair_means(df_perpair_long: pd.DataFrame) -> pd.DataFrame:
-    """Collapse blocks to per-pair means, keep (area, pair, variant, value)."""
-    return df_perpair_long.groupby(["area","pair","variant"], observed=False)["value"].mean().reset_index()
+def _extract_adj_p(pw_df: pd.DataFrame, a: str, b: str) -> float:
+    """Fetch Holm-adjusted p for a vs b from pairwise table (order agnostic)."""
+    if pw_df is None or pw_df.empty:
+        return np.nan
+    row = pw_df[((pw_df["level_a"]==a) & (pw_df["level_b"]==b)) |
+                ((pw_df["level_a"]==b) & (pw_df["level_b"]==a))]
+    return float(row["p_holm"].iloc[0]) if not row.empty else np.nan
+
+def _best_second_summary(df_long: pd.DataFrame, subject_col: str):
+    """
+    Build ranking + summary for best and second-best with adjusted p-values.
+    Returns (ranking_df, best_second_row_dict)
+    """
+    if df_long.empty:
+        return pd.DataFrame(), {}
+
+    # Ranking table
+    rank_tbl = _summarize_variant_means(df_long, subject_col=subject_col)
+    if rank_tbl.empty:
+        return pd.DataFrame(), {}
+
+    # Pairwise tests across subjects
+    pw = _pairwise_within_subject_ttests(df_long, subject=subject_col, within="variant", dv="value")
+
+    # Identify best & second-best
+    best = rank_tbl.iloc[0]["variant"]
+    best_mean = float(rank_tbl.iloc[0]["mean"])
+    if len(rank_tbl) >= 2:
+        second = rank_tbl.iloc[1]["variant"]
+        second_mean = float(rank_tbl.iloc[1]["mean"])
+        p_best_vs_second = _extract_adj_p(pw, str(best), str(second))
+        # Second vs everyone else excluding best
+        others = [str(v) for v in rank_tbl["variant"].tolist() if v not in {best, second}]
+        p_second_vs_rest = []
+        p_second_vs_third = np.nan
+        if others:
+            for o in others:
+                p_second_vs_rest.append(_extract_adj_p(pw, str(second), o))
+            # If there is a third, report that too
+            if len(rank_tbl) >= 3:
+                third = rank_tbl.iloc[2]["variant"]
+                p_second_vs_third = _extract_adj_p(pw, str(second), str(third))
+            p_second_vs_rest_min = float(np.nanmin(p_second_vs_rest)) if len(p_second_vs_rest) else np.nan
+        else:
+            p_second_vs_rest_min = np.nan
+            p_second_vs_third = np.nan
+    else:
+        second = None
+        second_mean = np.nan
+        p_best_vs_second = np.nan
+        p_second_vs_rest_min = np.nan
+        p_second_vs_third = np.nan
+
+    summary = {
+        "best_variant": str(best),
+        "best_mean": best_mean,
+        "second_variant": (str(second) if second is not None else ""),
+        "second_mean": second_mean,
+        "p_best_vs_second_adj": float(p_best_vs_second),
+        "p_second_vs_rest_min_adj": float(p_second_vs_rest_min),
+        "p_second_vs_third_adj": float(p_second_vs_third),
+        "n_subjects": int(df_long[subject_col].nunique()),
+    }
+    return rank_tbl, summary
 
 # ------------------------------ Main per-area runner --------------------------------
 
@@ -244,19 +313,12 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm", dem_corr: str = "T
         aov = _anova_rm_oneway(long, dv="value", subject="block_id", within="variant")
         if aov is None:
             continue
-        pw = _pairwise_within_block_ttests(long, subject="block_id", within="variant", dv="value")
+        pw = _pairwise_within_subject_ttests(long, subject="block_id", within="variant", dv="value")
 
         means = long.groupby("variant", observed=False)["value"].mean().sort_values()
         best_variant = str(means.index[0])
-        sig_vs_others = []
-        for other in [v for v in ALL_VARIANTS if v != best_variant]:
-            row = pw[((pw["level_a"]==best_variant)&(pw["level_b"]==other)) |
-                     ((pw["level_b"]==best_variant)&(pw["level_a"]==other))]
-            if not row.empty:
-                sig_vs_others.append(bool(row["p_holm"].iloc[0] < alpha))
-        best_significant_all = all(sig_vs_others) if sig_vs_others else False  # kept if you want to display later
 
-        long = long.assign(area=area_name)  # ensure area tag
+        long = long.assign(area=area_name)
         area_perpair_long.append(long)
 
         row = {
@@ -287,19 +349,39 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm", dem_corr: str = "T
     else:
         print(f"ℹ️  No per-pair corrections ANOVA results for {area_name} (insufficient data).")
 
+    # Area-level ANOVA (subject = pair), using per-pair means
     corr_area_csv = res_dir / "corrections_area_overall_anova.csv"
     corr_area_tbl = res_dir / "corrections_area_summary_table.csv"
+    corr_area_rank_csv = res_dir / "corrections_area_ranking.csv"          # NEW
+    corr_area_best2_csv = res_dir / "corrections_area_best_second.csv"     # NEW
     if area_perpair_long:
         long_all = pd.concat(area_perpair_long, ignore_index=True)
-        area_long = _area_level_long_from_pair_means(long_all)
+        # Collapse to per-pair means (subject = pair)
+        area_long = long_all.groupby(["area","pair","variant"], observed=False)["value"].mean().reset_index()
         aov_area = _anova_rm_oneway(area_long.rename(columns={"pair":"subject"}),
                                     dv="value", subject="subject", within="variant")
         if aov_area is not None:
             aov_area.anova_table.reset_index(drop=True).to_csv(corr_area_csv, index=False)
-        _summarize_variant_means(area_long)[["variant","mean","sd","median","iqr","n_subjects"]] \
+        # Human-readable per-variant stats across pairs
+        _summarize_variant_means(area_long.rename(columns={"pair":"subject"}), subject_col="subject") \
+            [["rank","variant","mean","sd","median","iqr","n_subjects"]] \
             .to_csv(corr_area_tbl, index=False)
         print(f"✅  Corrections area-level ANOVA written: {corr_area_csv}")
         print(f"✅  Corrections area summary table written: {corr_area_tbl}")
+
+        # NEW: Ranking & best/second with p-values (paired across pairs)
+        rank_tbl, best2 = _best_second_summary(area_long.rename(columns={"pair":"subject"}),
+                                               subject_col="subject")
+        if not rank_tbl.empty:
+            rank_tbl[["rank","variant","mean","sd","median","iqr","n_subjects"]] \
+                .to_csv(corr_area_rank_csv, index=False)
+        if best2:
+            pd.DataFrame([{
+                "area": area_name,
+                **best2
+            }]).to_csv(corr_area_best2_csv, index=False)
+        print(f"✅  Corrections area ranking written: {corr_area_rank_csv}")
+        print(f"✅  Corrections area best/second with p-values written: {corr_area_best2_csv}")
     else:
         print(f"ℹ️  No area-level corrections data for {area_name}.")
 
@@ -391,7 +473,8 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm", dem_corr: str = "T
     # Return items for global aggregation
     corr_for_global = None
     if area_perpair_long:
-        corr_for_global = _area_level_long_from_pair_means(pd.concat(area_perpair_long, ignore_index=True)).assign(area=area_name)
+        # Per-pair means for corrections
+        corr_for_global = long_all.groupby(["area","pair","variant"], observed=False)["value"].mean().reset_index()
     dem_for_global = None
     if dem_pairs_long:
         dem_for_global = pd.concat(dem_pairs_long, ignore_index=True).groupby(["area","pair","dem","corr_used"], observed=False)["value"].mean().reset_index()
@@ -427,10 +510,12 @@ def main():
     out_root = root / "results"
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # Across ALL AREAS — Corrections ANOVA
+    # Across ALL AREAS — Corrections ANOVA + Ranking + Best/Second
     if all_corr:
         corr_all = pd.concat(all_corr, ignore_index=True)
+        # Global subject = area::pair
         corr_all["pair_global"] = corr_all.apply(lambda r: f"{r['area']}::{r['pair']}", axis=1)
+        # ANOVA
         aov_all = _anova_rm_oneway(corr_all.rename(columns={"pair_global":"subject"}),
                                    dv="value", subject="subject", within="variant")
         if aov_all is not None:
@@ -438,6 +523,15 @@ def main():
             print(f"✅  All-areas corrections ANOVA written: {out_root/'corrections_all_areas_anova.csv'}")
         else:
             print("ℹ️  All-areas corrections ANOVA could not be computed (insufficient data).")
+        # Ranking & best/second with p-values
+        rank_tbl, best2 = _best_second_summary(corr_all.rename(columns={"pair_global":"subject"}), subject_col="subject")
+        if not rank_tbl.empty:
+            rank_tbl[["rank","variant","mean","sd","median","iqr","n_subjects"]] \
+                .to_csv(out_root / "corrections_all_areas_ranking.csv", index=False)
+        if best2:
+            pd.DataFrame([best2]).to_csv(out_root / "corrections_all_areas_best_second.csv", index=False)
+        print(f"✅  All-areas corrections ranking written: {out_root/'corrections_all_areas_ranking.csv'}")
+        print(f"✅  All-areas corrections best/second with p-values written: {out_root/'corrections_all_areas_best_second.csv'}")
     else:
         print("ℹ️  No corrections data accumulated across areas.")
 
