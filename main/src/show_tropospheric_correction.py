@@ -31,13 +31,14 @@ GACOS_DIR = BASE / "data" / "aux" / "tropo"
 
 ABS_BASE        = Path(__file__).resolve().parents[5]
 DATA_BASE       = ABS_BASE / "mnt" / "DATA2" / "bakke326l"
-PROC_DIR        = DATA_BASE / "processing"
+PROC_DIR        = DATA_BASE / "processing" / "interferograms"
 
 path = 150
 ref = 20101108
 sec = 20101224
+dem = "SRTM"
 
-pair_id = f"path{path}_{ref}_{sec}"
+pair_id = f"path{path}_{ref}_{sec}_{dem}"
 wdir    = PROC_DIR / pair_id
 os.chdir(wdir)
 #________________________________________________________________________________________________________
@@ -289,3 +290,38 @@ plotdata2(str(igram_dir / "filt_topophase.unw.geo"), str(igram_dir / "filt_topop
           title=["UNW before [rad]", "UNW after APS correction [rad]"],
           colormap='hsv')#, datamin=-50, datamax=50)
 
+def plotdata3(file1, file2, band=1, colormap='jet', datamin=None, datamax=None):
+    ds1 = gdal.Open(file1, gdal.GA_ReadOnly)
+    data1 = ds1.GetRasterBand(band).ReadAsArray()
+    data1_mask = np.ma.masked_where(data1 == 0, data1)
+    ds1 = None
+
+    ds2 = gdal.Open(file2, gdal.GA_ReadOnly)
+    data2 = ds2.GetRasterBand(band).ReadAsArray()
+    data2_mask = np.ma.masked_where(data2 == 0, data2)
+    ds2 = None
+    
+    diff = data1_mask - data2_mask 
+    
+    # Build a copy of the requested colormap with a transparent "bad" colour
+    cmap_obj = plt.get_cmap(colormap).copy()
+    cmap_obj.set_bad(alpha=0)  # masked values → transparent
+
+    # Autoscale separately unless datamin/datamax are provided
+    def _scale(data):
+        return (data.min(), data.max()) if datamin is None else (datamin, datamax)
+    
+    vmin_diff, vmax_diff= _scale(diff)
+
+    fig = plt.figure(figsize=(14, 6))
+
+    ax = fig.add_subplot(1, 1, 1)
+    ax.imshow(diff, cmap=cmap_obj, vmin=vmin_diff, vmax=vmax_diff)
+    ax.set_title("Difference in delay")
+    ax.set_axis_off()
+
+
+    plt.tight_layout()
+    plt.show()
+
+plotdata3(f"{sec}.aps.geo", f"{ref}.aps.geo", 1, colormap='hsv')#, datamin=-725, datamax=-525)
