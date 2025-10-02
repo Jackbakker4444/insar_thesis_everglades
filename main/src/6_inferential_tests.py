@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# =============================================================================
+# Dependencies (Python libraries)
+# =============================================================================
+# • Standard library: pathlib, argparse
+# • Third-party: numpy, pandas, scipy (stats), statsmodels (AnovaRM, multitest)
+#
+# Recommended install (conda-forge):
+#   conda install -c conda-forge numpy pandas scipy statsmodels
+
+
 """
 6_inferential_tests.py — Per-pair & area/all-areas ANOVA/t-tests for corrections and DEMs
 (multi-density blocks: 60%, 45%, 30%, 15%; corrections forced to SRTM)
@@ -12,7 +22,7 @@ A) Corrections (two parallel assessments):
    2) NO  IDW:  RAW, IONO, TROPO, TROPO_IONO
 
    For EACH of the two sets, we compute:
-     - Per-pair repeated-measures ANOVA (subject = block = replicate×n_cal),
+     - Per-pair repeated-measures ANOVA (subject = block = replicatexn_cal),
        using **all densities present** (e.g., 60%, 45%, 30%, 15%).
      - Per-pair pairwise paired t-tests (Holm adjusted).
      - Area-level repeated-measures ANOVA (subject = pair; uses per-pair means).
@@ -24,7 +34,7 @@ A) Corrections (two parallel assessments):
    - **Corrections analyses use DEM=SRTM only** for LS variants. Pairs without SRTM for
      the four LS corrections are skipped. IDW rows are included for the "with_idw" set.
 
-B) DEMs (SRTM vs 3DEP), correction FIXED but SWITCHABLE (default TROPO):
+B) DEMs (SRTM vs 3DEP), correction FIXED but SWITCHABLE (default RAW):
    - Per-pair paired t-test (subject = block).
    - Area-level paired t-test (subject = pair; per-pair means).
    - All-areas paired t-test (subject = area::pair).
@@ -72,7 +82,7 @@ Across ALL AREAS (into <areas_root>/results/):
 
 How to run
 ----------
-# All areas, default metric rmse_cm and DEM correction = TROPO
+# All areas, default metric rmse_cm and DEM correction = RAW
 python 6_inferential_tests.py
 
 # Single area
@@ -81,7 +91,7 @@ python 6_inferential_tests.py --area ENP
 # Use log-RMSE instead of RMSE
 python 6_inferential_tests.py --metric log_rmse_cm
 
-# DEM comparison using IONO instead of TROPO
+# DEM comparison using IONO instead of RAW
 python 6_inferential_tests.py --dem-corr IONO
 """
 
@@ -123,7 +133,22 @@ DEM_CORR_CHOICES = set(CORR_LEVELS)  # correction used for DEM comparisons (IDW 
 # ------------------------------ Safe stats helpers --------------------------------
 
 def ttest_rel_safe(a, b, eps: float = 1e-12):
-    """Paired t-test with stability guard; returns (t, p, n)."""
+    """Paired t-test with a stability guard; returns ``(t, p, n)``.
+
+    Parameters
+    ----------
+    a, b : array-like
+        Two matched samples. Non-finite pairs are dropped prior to testing.
+    eps : float, default 1e-12
+        Threshold for deeming the difference vector nearly constant; in that
+        case the function returns ``t=0, p=1`` to avoid numerical issues.
+
+    Returns
+    -------
+    tuple[float, float, int]
+        ``t`` value, two-sided ``p`` value, and effective sample size ``n`` after
+        filtering.
+    """
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     mask = np.isfinite(a) & np.isfinite(b)
@@ -138,9 +163,24 @@ def ttest_rel_safe(a, b, eps: float = 1e-12):
     return float(t), float(p), int(n)
 
 def one_sided_from_two_sided(t_val: float, p_two: float, n: int, alternative: str = "less") -> float:
-    """
-    Convert two-sided p to one-sided p using the t-statistic sign and df=n-1.
-    alternative="less" tests H1: mean(diff) < 0 (e.g., variant < RAW).
+    """Convert a two-sided p-value to a one-sided p-value using the t-statistic sign.
+
+    Parameters
+    ----------
+    t_val : float
+        Observed t-statistic (paired design).
+    p_two : float
+        Reported two-sided p-value for the same test.
+    n : int
+        Sample size (paired). Degrees of freedom are ``df = n − 1``.
+    alternative : {"less", "greater"}, default "less"
+        Direction of the one-sided alternative. For corrections we use
+        ``"less"`` to test H1: variant < RAW (i.e., better if lower metric).
+
+    Returns
+    -------
+    float
+        One-sided p-value, or NaN if inputs are invalid.
     """
     if not np.isfinite(t_val) or n < 2 or not np.isfinite(p_two):
         return np.nan
@@ -154,26 +194,51 @@ def one_sided_from_two_sided(t_val: float, p_two: float, n: int, alternative: st
 # ------------------------------ Utility helpers --------------------------------
 
 def _pair_tag(ref: str, sec: str) -> str:
-    """Build a compact pair tag from ISO dates."""
+    """Build a compact pair tag ``YYYYMMDD_YYYYMMDD`` from ISO dates.
+
+    Examples
+    --------
+    ``_pair_tag("2010-03-23", "2010-05-08") -> "20100323_20100508"``
+    """
     return f"{ref.replace('-','')}_{sec.replace('-','')}"
 
 def _choose_dem_for_corrections(df_pair: pd.DataFrame) -> str | None:
-    """Enforce DEM=SRTM for corrections comparisons. Return None if SRTM not present."""
+    """Enforce DEM=SRTM for corrections comparisons.
+
+    Returns ``"SRTM"`` if present in ``df_pair['dem']``; otherwise ``None`` to
+    signal that this pair should be skipped in corrections analyses.
+    """
     dems_present = set(df_pair["dem"].dropna().astype(str).unique().tolist())
     return "SRTM" if "SRTM" in dems_present else None
 
 def _build_blocks_for_pair(df_pair: pd.DataFrame, dem_sel: str, metric_col: str,
                            variant_list: list[str]) -> pd.DataFrame:
-    """
-    Construct long-format data for per-pair corrections ANOVA for a given variant_list,
-    using **all blocks** (replicate×n_cal) available for the pair.
+    """Construct long-format data for per-pair corrections ANOVA.
 
-    Keep only blocks where ALL variants in variant_list exist.
-    Returns columns: ['area','pair','block_id','variant','value']
+    Uses **all blocks** (``replicate x n_cal``) available for the pair, but keeps
+    only those blocks where **all** requested variants exist.
 
-    NOTE:
-    - LS rows are filtered to dem==dem_sel (SRTM enforced upstream).
-    - IDW rows are not DEM-filtered (dem='N/A').
+    Parameters
+    ----------
+    df_pair : pandas.DataFrame
+        Subset of the metrics table for a single pair.
+    dem_sel : str
+        The enforced DEM to use for LS variants (typically ``"SRTM"``).
+    metric_col : str
+        Name of the metric column to analyze (e.g., ``"rmse_cm"``).
+    variant_list : list[str]
+        Ordered list of variants to include (e.g., ``["RAW","IONO","TROPO","TROPO_IONO","IDW"]``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Long table with columns ``['area','pair','block_id','variant','value']``.
+
+    Notes
+    -----
+    • LS rows are filtered to ``dem == dem_sel``;
+    • IDW rows are not DEM-filtered (their ``dem`` is ``"N/A"``).
+    • ``block_id`` uniquely identifies a calibration density within a replicate.
     """
     df = df_pair.copy()
     frames = []
@@ -207,7 +272,7 @@ def _build_blocks_for_pair(df_pair: pd.DataFrame, dem_sel: str, metric_col: str,
     cat["pair"] = cat.apply(lambda r: _pair_tag(r["pair_ref"], r["pair_sec"]), axis=1)
     cat["variant"] = cat["corr"].astype(str)
 
-    # Subject ID = replicate × n_cal
+    # Subject ID = replicate x n_cal
     cat["block_id"] = cat.apply(lambda r: f"rep{int(r['replicate'])}_n{int(r['n_cal'])}", axis=1)
 
     # Keep only complete blocks that have all requested variants
@@ -222,7 +287,11 @@ def _build_blocks_for_pair(df_pair: pd.DataFrame, dem_sel: str, metric_col: str,
 
 
 def _anova_rm_oneway(df_long: pd.DataFrame, dv: str, subject: str, within: str):
-    """Run one-way repeated-measures ANOVA with statsmodels AnovaRM."""
+    """Run one-way repeated-measures ANOVA via ``statsmodels.AnovaRM``.
+
+    Returns the fitted object or ``None`` if there are not enough observations
+    or the model fails to fit.
+    """
     if df_long.empty:
         return None
     check = df_long[[subject, within]].drop_duplicates().groupby(subject, observed=False).size()
@@ -236,7 +305,11 @@ def _anova_rm_oneway(df_long: pd.DataFrame, dv: str, subject: str, within: str):
 
 def _pairwise_within_subject_ttests(df_long: pd.DataFrame, subject: str, within: str,
                                     dv: str, variant_list: list[str]) -> pd.DataFrame:
-    """Paired t-tests (Holm adjusted) across levels of 'within', aligned by 'subject'."""
+    """Paired t-tests across levels of ``within``, aligned by ``subject``.
+
+    Produces a table with columns: ``level_a, level_b, t, p_raw, p_holm_two_sided,
+    mean_diff, n``. Holm correction is applied over the tested pairs.
+    """
     wide = df_long.pivot_table(index=subject, columns=within, values=dv,
                                aggfunc="mean", observed=False)
     keep_cols = [c for c in variant_list if c in wide.columns]
@@ -257,7 +330,11 @@ def _pairwise_within_subject_ttests(df_long: pd.DataFrame, subject: str, within:
 
 def _summarize_variant_means(df_long: pd.DataFrame, subject_col: str,
                              variant_list: list[str]) -> pd.DataFrame:
-    """Mean/SD/median/IQR per variant across subjects (ranked), restricted to variant_list."""
+    """Compute mean/SD/median/IQR per variant across subjects and rank them.
+
+    Returns a table with columns: ``variant, mean, sd, median, iqr, n_subjects, rank``
+    (lower metric values rank better).
+    """
     def iqr(x):
         q = np.nanpercentile(x, [25, 75])
         return float(q[1]-q[0])
@@ -280,7 +357,10 @@ def _summarize_variant_means(df_long: pd.DataFrame, subject_col: str,
     return out
 
 def _extract_adj_p(pw_df: pd.DataFrame, a: str, b: str) -> float:
-    """Fetch Holm-adjusted two-sided p for a vs b from pairwise table (order agnostic)."""
+    """Fetch Holm-adjusted two-sided p-value for ``a`` vs ``b`` from a pairwise table.
+
+    The input table must have columns ``level_a``, ``level_b``, ``p_holm_two_sided``.
+    """
     if pw_df is None or pw_df.empty:
         return np.nan
     row = pw_df[((pw_df["level_a"]==a) & (pw_df["level_b"]==b)) |
@@ -289,7 +369,15 @@ def _extract_adj_p(pw_df: pd.DataFrame, a: str, b: str) -> float:
 
 def _best_second_summary(df_long: pd.DataFrame, subject_col: str,
                          variant_list: list[str]):
-    """Build ranking + summary for best and second-best (two-sided Holm p-values)."""
+    """Produce ranking + summary dict for the best and second-best variants.
+
+    Returns
+    -------
+    (rank_table, summary_dict)
+        ``rank_table`` is the full ranking; ``summary_dict`` includes keys like
+        ``best_variant``, ``best_mean``, ``second_variant``, and adjusted p-values
+        comparing the top entries.
+    """
     if df_long.empty:
         return pd.DataFrame(), {}
     rank_tbl = _summarize_variant_means(df_long, subject_col=subject_col, variant_list=variant_list)
@@ -340,11 +428,13 @@ def _best_second_summary(df_long: pd.DataFrame, subject_col: str,
 
 def _vs_raw_table(df_long: pd.DataFrame, subject_col: str,
                   variant_list: list[str]) -> pd.DataFrame:
-    """
-    Build a table of p-values for each correction vs RAW across subjects.
-    Reports:
-      - mean_variant, mean_raw, mean_diff = variant - RAW  (negative means better than RAW)
-      - t, p_two_sided, p_one_sided_improve (H1: variant < RAW), Holm-adjusted one-sided p
+    """Build a p-value table for each correction vs RAW across subjects.
+
+    Reports per variant (excluding RAW):
+      • ``n_subjects`` used,
+      • ``mean_variant``, ``mean_raw``, and ``mean_diff_variant_minus_raw`` (negative → better than RAW),
+      • paired-t ``t`` and two-sided ``p`` values,
+      • one-sided p for improvement (H1: variant < RAW), plus Holm-adjusted one-sided p.
     """
     if df_long.empty or "RAW" not in variant_list:
         return pd.DataFrame()
@@ -452,10 +542,16 @@ def _enriched_ranking(df_long: pd.DataFrame, subject_col: str,
 def _process_corrections_for_variantset(area_name: str, df_area: pd.DataFrame,
                                         metric_col: str, variant_set_name: str,
                                         variant_list: list[str], res_dir: Path):
-    """
-    Run the complete corrections analysis for ONE variant set (with or without IDW),
-    using **all blocks (replicate×n_cal)** and **SRTM** for LS corrections.
-    Returns per-pair-means long (for global aggregation).
+    """Run the corrections analysis for ONE variant set (with or without IDW).
+
+    Uses **all blocks** (replicatexn_cal) and **SRTM** for LS corrections. Writes
+    per-pair outputs and returns an area-level long table of per-pair means for
+    downstream global aggregation.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Area-level long table (columns: area, pair, variant, value).
     """
     perpair_rows = []
     area_perpair_long = []
@@ -562,11 +658,24 @@ def _process_corrections_for_variantset(area_name: str, df_area: pd.DataFrame,
 
 def process_area(area_dir: Path, metric_col: str = "rmse_cm",
                  dem_corr: str = DEM_CORR_DEFAULT, alpha: float = 0.05):
-    """
-    Run all requested tests for a single AREA and write outputs (all densities).
-    Returns:
-      corr_for_global_by_set: dict[variant_set_name] -> DataFrame (area-long per-pair means)
-      dem_for_global: DataFrame for DEM global aggregation
+    """Run all requested tests for a single AREA and write outputs (all densities).
+
+    Parameters
+    ----------
+    area_dir : pathlib.Path
+        Path to the area directory containing ``results/accuracy_metrics.csv``.
+    metric_col : str, default "rmse_cm"
+        Metric to analyze (lower is better), e.g., ``"rmse_cm"`` or ``"log_rmse_cm"``.
+    dem_corr : str, default DEM_CORR_DEFAULT
+        Correction level to use for DEM (SRTM vs 3DEP) comparisons.
+    alpha : float, default 0.05
+        Reserved for future use (e.g., significance flagging in outputs).
+
+    Returns
+    -------
+    tuple[dict[str, pd.DataFrame], pd.DataFrame | None]
+        ``corr_for_global_by_set``: mapping variant-set → long table for global aggregation;
+        ``dem_for_global``: long table for DEM tests (or ``None`` if not available).
     """
     area_name = area_dir.name
     res_dir = area_dir / "results"
@@ -686,6 +795,21 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm",
 # ------------------------------ CLI / Global aggregation --------------------------------
 
 def main():
+    """CLI entry point for running per-pair and area/all-areas analyses.
+
+    Arguments
+    ---------
+    --areas-root : str, default "/mnt/DATA2/bakke326l/processing/areas"
+        Root with per-area subfolders.
+    --area : str, optional
+        If provided, only process this AREA (subfolder name).
+    --metric : str, default "rmse_cm"
+        Metric column to analyze (e.g., "rmse_cm", "log_rmse_cm").
+    --dem-corr : str, default DEM_CORR_DEFAULT ("RAW")
+        Correction used for DEM comparisons (IDW not applicable here).
+    --alpha : float, default 0.05
+        Reserved for future use.
+    """
     ap = argparse.ArgumentParser(description="Run per-pair and area/all-areas ANOVA/t-tests for corrections (with & without IDW) and DEMs, using all densities.")
     ap.add_argument("--areas-root", type=str, default="/mnt/DATA2/bakke326l/processing/areas",
                     help="Root containing per-area subfolders.")

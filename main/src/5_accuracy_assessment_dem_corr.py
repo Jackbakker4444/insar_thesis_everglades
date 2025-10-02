@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# =============================================================================
+# Dependencies (Python libraries)
+# =============================================================================
+# • Standard library: pathlib, re, os, shutil, logging, argparse, json, typing
+# • Third-party: numpy, pandas, rasterio, pyproj
+#
+# Recommended install (conda-forge):
+#   conda install -c conda-forge numpy pandas rasterio pyproj
+
 """
 5_accuracy_assessment_dem_corr.py — Spread-out (stochastic farthest-point) 60/45/30/15% split metrics
 + 60% calibrated GeoTIFFs + 60/40 split GeoJSON (from replicate #1)
@@ -38,6 +47,16 @@ Choose DEMs/CORRs, reps, etc.:
     python 5_accuracy_assessment_dem_corr.py \
       --reps 200 --seed 42 --idw-power 2.0 \
       --dems SRTM 3DEP --corrs RAW TROPO IONO TROPO_IONO
+
+Overview
+--------
+This script evaluates InSAR vertical-displacement rasters (cm) against EDEN water-level gauges
+using shared calibration/validation splits across multiple densities per replicate. For each
+(AREA, PAIR) and for every available (DEM, CORR) variant, it computes accuracy metrics
+(RMSE, MAE, bias, sigma_e, r) for Least-Squares (calibrating InSAR → Δh_vis) alongside an IDW baseline
+that interpolates Δh_vis from calibration gauges. From replicate #1 at 60% calibration density,
+it exports (i) an IDW(Δh_vis) raster, (ii) calibrated GeoTIFFs for each (DEM, CORR), and (iii) a
+GeoJSON of the 60/40 split for visualization/QA.
 """
 
 from __future__ import annotations
@@ -84,7 +103,20 @@ GEOD = Geod(ellps="WGS84")
 
 # ===================== Upfront cleanup helpers (results folders) =====================
 def _clean_all_results_dirs(areas_root: Path) -> None:
-    """Remove all contents inside every '<AREA>/results' under `areas_root`."""
+    """Remove all contents inside every ``<AREA>/results`` under ``areas_root``.
+
+    Parameters
+    ----------
+    areas_root : pathlib.Path
+        Root directory containing per-area subfolders. Each area is expected to
+        have a ``results`` subfolder that will be cleared or created if absent.
+
+    Notes
+    -----
+    • Only files and directories **inside** ``results`` are removed; the area
+      folder and its ``results`` directory remain.
+    • Any failure to clean a specific area is reported but does not abort the run.
+    """
     if not areas_root.exists():
         return
     for d in sorted(p for p in areas_root.iterdir() if p.is_dir()):
@@ -103,18 +135,51 @@ def _clean_all_results_dirs(areas_root: Path) -> None:
 
 # ========================= Small utilities =========================
 def _pair_dates_from_tag(pair_tag: str) -> Tuple[str, str]:
-    """Convert 'YYYYMMDD_YYYYMMDD' → ('YYYY-MM-DD','YYYY-MM-DD')."""
+    """Convert a pair tag ``YYYYMMDD_YYYYMMDD`` → (``YYYY-MM-DD``, ``YYYY-MM-DD``).
+
+    Parameters
+    ----------
+    pair_tag : str
+        Pair identifier of the form ``YYYYMMDD_YYYYMMDD``.
+
+    Returns
+    -------
+    tuple[str, str]
+        ISO-8601 formatted reference and secondary dates.
+
+    Raises
+    ------
+    ValueError
+        If the input does not match the expected ``YYYYMMDD_YYYYMMDD`` pattern.
+    """
     if not re.fullmatch(r"\d{8}_\d{8}", pair_tag):
         raise ValueError(f"PAIR tag must be YYYYMMDD_YYYYMMDD, got: {pair_tag}")
     a, b = pair_tag.split("_")
     return f"{a[:4]}-{a[4:6]}-{a[6:]}", f"{b[:4]}-{b[4:6]}-{b[6:]}"
 
 def _find_all_pairs(area_dir: Path, area_name: str, dems: List[str], corrs: List[str]) -> List[str]:
-    """Scan <AREA>/interferograms for available pair tags restricted to selected DEM/CORR."""
+    """Scan ``<AREA>/interferograms`` for available pair tags matching DEM/CORR filters.
+
+    Parameters
+    ----------
+    area_dir : pathlib.Path
+        Path to the area folder.
+    area_name : str
+        Area short name (prefix in raster filenames).
+    dems : list[str]
+        Allowed DEM names.
+    corrs : list[str]
+        Allowed correction names.
+
+    Returns
+    -------
+    list[str]
+        Sorted unique pair tags present for the selected DEM/CORR combinations.
+    """
     dem_pat = "|".join(map(re.escape, dems))
     corr_pat = "|".join(map(re.escape, corrs))
     patt = re.compile(
-        rf"^{re.escape(area_name)}_vertical_cm_(\d{{8}}_\d{{8}})_({dem_pat})_({corr_pat})\.tif$",
+        rf"^{re.escape(area_name)}_vertical_cm_(\d{{8}}_\d{{8}})_({dem_pat})_({corr_pat})\\.tif$",
         re.I,
     )
     folder = area_dir / "interferograms"
@@ -128,12 +193,26 @@ def _find_all_pairs(area_dir: Path, area_name: str, dems: List[str], corrs: List
     return sorted(tags)
 
 def _find_raster(area_dir: Path, area_name: str, pair_tag: str, dem: str, corr: str) -> Optional[Path]:
-    """Return the path to an interferogram raster if present, else None."""
+    """Return the path to a specific interferogram raster if present, else ``None``.
+
+    This follows the naming convention ``<AREA>_vertical_cm_<PAIR>_<DEM>_<CORR>.tif``.
+    """
     cand = area_dir / "interferograms" / f"{area_name}_vertical_cm_{pair_tag}_{dem.upper()}_{corr.upper()}.tif"
     return cand if cand.exists() else None
 
 def _load_gauges_wide(csv_path: Path) -> pd.DataFrame:
-    """Load an area's wide EDEN gauge CSV and validate required columns."""
+    """Load an area-level EDEN gauge CSV and validate required columns.
+
+    Parameters
+    ----------
+    csv_path : pathlib.Path
+        Path to ``eden_gauges.csv`` in *wide* format (StationID, Lat, Lon, dates...).
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame as loaded; raises on missing required columns.
+    """
     df = pd.read_csv(csv_path)
     for c in (ID_COL, LAT_COL, LON_COL):
         if c not in df.columns:
@@ -141,23 +220,50 @@ def _load_gauges_wide(csv_path: Path) -> pd.DataFrame:
     return df
 
 def _visible_surface_delta(ref_cm: np.ndarray, sec_cm: np.ndarray) -> np.ndarray:
-    """Δh_vis (cm) = max(sec, 0) − max(ref, 0)."""
+    """Compute visible-surface water-level change Δh_vis in centimeters.
+
+    Definition
+    ----------
+    ``Δh_vis = max(sec, 0) - max(ref, 0)`` applied element-wise. Negative water
+    levels (dry pixels) are clamped to 0 to mimic “visible water surface”.
+    """
     return np.maximum(sec_cm.astype(float), 0.0) - np.maximum(ref_cm.astype(float), 0.0)
 
 def _rowcol_from_xy(transform: Affine, x: float, y: float) -> Tuple[float, float]:
-    """Map world coordinates (lon,lat) to fractional raster (row,col)."""
+    """Map world coordinates (lon, lat) to **fractional** raster (row, col).
+
+    Notes
+    -----
+    The result is not rounded. Rounding/nearest-neighbor selection is deferred to
+    the caller because some sampling windows (e.g., 3x3 mean) benefit from
+    explicit integer casting at the last moment.
+    """
     col, row = ~transform * (x, y)
     return float(row), float(col)
 
 def _inside_image(h: int, w: int, row: float, col: float) -> bool:
-    """Check if (row,col) is inside the image bounds."""
+    """Return ``True`` if (row, col) lies inside image bounds ``[0,h)x[0,w)``."""
     return (row >= 0) and (col >= 0) and (row < h) and (col < w)
 
 def _read_mean_3x3(ds: rasterio.io.DatasetReader, row: int, col: int) -> Optional[float]:
-    """Read a 3×3 window around (row,col) and return the NaN-mean (None if all nodata)."""
+    """Read a 3x3 window centered on (row, col) and return the mean, ignoring NaNs.
+
+    Parameters
+    ----------
+    ds : rasterio.io.DatasetReader
+        Open raster dataset (single band assumed).
+    row, col : int
+        Integer pixel indices for the window center.
+
+    Returns
+    -------
+    float or None
+        NaN-aware mean over the window; ``None`` if all are nodata.
+    """
     r0 = max(0, row - 1); r1 = min(ds.height - 1, row + 1)
     c0 = max(0, col - 1); c1 = min(ds.width  - 1, col + 1)
     arr = ds.read(1, window=Window.from_slices((r0, r1 + 1), (c0, c1 + 1))).astype("float32")
+    # Convert explicit nodata codes to NaN so statistics can ignore them
     if ds.nodata is not None and not np.isnan(ds.nodata):
         arr[arr == ds.nodata] = np.nan
     if not np.isfinite(arr).any():
@@ -165,7 +271,11 @@ def _read_mean_3x3(ds: rasterio.io.DatasetReader, row: int, col: int) -> Optiona
     return float(np.nanmean(arr))
 
 def _safe_corrcoef(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Pearson r (returns NaN when undefined)."""
+    """Compute Pearson correlation ``r`` safely; return NaN if undefined.
+
+    Handles edge cases where either vector has near-zero variance or fewer than
+    two samples.
+    """
     if len(y_true) < 2: return float("nan")
     yt = y_true - np.mean(y_true); yp = y_pred - np.mean(y_pred)
     vy = np.sum(yt*yt); vp = np.sum(yp*yp)
@@ -173,7 +283,16 @@ def _safe_corrcoef(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sum(yt*yp) / np.sqrt(vy*vp))
 
 def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    """Compute bias, RMSE, MAE, σ_e, r."""
+    """Compute base accuracy metrics between truth and predictions.
+
+    Metrics
+    -------
+    • ``rmse_cm``: Root Mean Square Error (cm)
+    • ``mae_cm``:  Mean Absolute Error (cm)
+    • ``bias_cm``: Mean signed error (cm)
+    • ``sigma_e_cm``: Error STD about the **bias** (cm)
+    • ``r``: Pearson correlation coefficient
+    """
     err = y_pred - y_true
     bias = float(np.mean(err))
     rmse = float(np.sqrt(np.mean(err**2)))
@@ -182,7 +301,13 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]
     return {"rmse_cm": rmse, "mae_cm": mae, "bias_cm": bias, "sigma_e_cm": sigma_e, "r": _safe_corrcoef(y_true, y_pred)}
 
 def _val_spread(y_val: np.ndarray) -> Tuple[float, float]:
-    """Return (IQR_cm, SD_cm) of validation Δh_vis."""
+    """Return validation spread measures: (IQR_cm, SD_cm).
+
+    Returns
+    -------
+    tuple[float, float]
+        Interquartile range (Q75-Q25) and standard deviation of ``y_val``.
+    """
     yv = np.asarray(y_val, dtype=float)
     if yv.size == 0 or not np.isfinite(yv).any():
         return float("nan"), float("nan")
@@ -192,7 +317,16 @@ def _val_spread(y_val: np.ndarray) -> Tuple[float, float]:
     return iqr, sd
 
 def _augment_metrics(m: Dict[str, float], y_val: np.ndarray) -> Dict[str, float]:
-    """Append normalization & transforms: NRMSEs, log_rmse_cm, fisher_z, etc."""
+    """Augment base metrics with normalized variants and transforms.
+
+    Adds
+    ----
+    • ``val_dh_iqr_cm``, ``val_dh_sd_cm``
+    • ``nrmse_iqr``: RMSE normalized by IQR
+    • ``nrmse_sd``:  RMSE normalized by SD
+    • ``log_rmse_cm``: natural log of RMSE
+    • ``fisher_z``: Fisher z-transform of correlation
+    """
     iqr, sd = _val_spread(y_val)
     rmse = m.get("rmse_cm", np.nan); r = m.get("r", np.nan)
     m.update({
@@ -206,7 +340,30 @@ def _augment_metrics(m: Dict[str, float], y_val: np.ndarray) -> Dict[str, float]
 
 # ======================= IDW & helpers =======================
 def _idw_predict_points(px, py, pz, qx, qy, power: float = 2.0) -> np.ndarray:
-    """Inverse-distance weighting in lon/lat with cosine adjustment on Δlon."""
+    """Inverse-distance weighting (IDW) interpolation on lon/lat.
+
+    Parameters
+    ----------
+    px, py : array-like
+        Longitudes and latitudes of **known** points (calibration gauges).
+    pz : array-like
+        Known values (Δh_vis at calibration gauges).
+    qx, qy : array-like
+        Longitudes and latitudes of **query** points (validation gauges).
+    power : float, default 2.0
+        IDW power exponent. Larger values emphasize nearby points.
+
+    Returns
+    -------
+    numpy.ndarray
+        Predicted values for each query point. Exact hits (zero distance) get
+        the corresponding observed value.
+
+    Notes
+    -----
+    A cosine factor is applied to longitudinal differences to approximate
+    distance distortion with latitude in geographic coordinates (EPSG:4326).
+    """
     px = np.asarray(px, dtype=np.float64); py = np.asarray(py, dtype=np.float64)
     pz = np.asarray(pz, dtype=np.float64); qx = np.asarray(qx, dtype=np.float64)
     qy = np.asarray(qy, dtype=np.float64)
@@ -223,7 +380,14 @@ def _idw_predict_points(px, py, pz, qx, qy, power: float = 2.0) -> np.ndarray:
     return pred.astype("float32")
 
 def _haversine_matrix(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
-    """Great-circle distance matrix (meters) for lon/lat arrays (symmetric NxN)."""
+    """Compute a symmetric great-circle distance matrix (meters) for lon/lat arrays.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``NxN`` matrix where entry ``(i,j)`` is the arc distance between points
+        ``i`` and ``j`` on a sphere (R≈6371 km).
+    """
     lon = np.deg2rad(lon.astype("float64")); lat = np.deg2rad(lat.astype("float64"))
     dlon = lon[:, None] - lon[None, :]
     a = np.clip(np.sin(lat)[:,None]*np.sin(lat)[None,:] + np.cos(lat)[:,None]*np.cos(lat)[None,:]*np.cos(dlon), -1.0, 1.0)
@@ -231,16 +395,36 @@ def _haversine_matrix(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
 
 def _spread_selection_stochastic(lon: np.ndarray, lat: np.ndarray, k: int,
                                  rng: np.random.Generator, top_m: int = SPREAD_TOP_M_DEFAULT) -> np.ndarray:
-    """
-    Stochastic farthest-point sampling to select k well-spread indices.
-    - Start at a random seed point; iteratively add one point picked at random
-      among the top-M farthest from the current set (by nearest-neighbor distance).
+    """Stochastic farthest-point sampling to select ``k`` well-spread indices.
+
+    Algorithm
+    ---------
+    1) Seed with a random point.
+    2) At each step, compute nearest-neighbor distance to current set and pick
+       **one** index *uniformly at random* among the ``top_m`` farthest points.
+
+    Parameters
+    ----------
+    lon, lat : numpy.ndarray
+        Candidate longitudes/latitudes.
+    k : int
+        Desired number of selected points (clamped to available size).
+    rng : numpy.random.Generator
+        RNG used for stochastic choices (ensures replicability from seed).
+    top_m : int, default ``SPREAD_TOP_M_DEFAULT``
+        How many of the farthest candidates to randomize over per step.
+
+    Returns
+    -------
+    numpy.ndarray
+        Sorted array of selected indices into the input arrays.
     """
     n = len(lon)
     if k >= n: return np.arange(n, dtype=int)
     D = _haversine_matrix(lon, lat)
     cur = [int(rng.integers(0, n))]
     remaining = set(range(n)) - set(cur)
+    # Track each point's distance to the current set (nearest member)
     min_d = D[:, cur].min(axis=1)
     while len(cur) < k:
         order = np.argsort(-min_d)  # descending by min-distance
@@ -256,7 +440,11 @@ def _spread_selection_stochastic(lon: np.ndarray, lat: np.ndarray, k: int,
 
 # ===================== Export helpers (GeoTIFF & GeoJSON) =====================
 def _fit_ls_params(insar_vals: np.ndarray, dh_vals: np.ndarray) -> Tuple[float, float]:
-    """Fit y = a·x + b with fallback when n ≤ 2: a=-1, b=mean(dh + insar)."""
+    """Fit parameters ``(a, b)`` for ``y = a·x + b`` with a small-n fallback.
+
+    For ``n≤2``, it uses ``a=-1`` and ``b=mean(dh + insar)`` to stabilize the
+    calibration in extremely sparse cases (empirically reasonable in wetlands).
+    """
     n = insar_vals.size
     if n <= 2:
         a = -1.0
@@ -267,7 +455,19 @@ def _fit_ls_params(insar_vals: np.ndarray, dh_vals: np.ndarray) -> Tuple[float, 
     return float(sol[0]), float(sol[1])
 
 def _write_tif_like(src_tif: Path, out_tif: Path, array2d: np.ndarray, nodata_value: float = -9999.0):
-    """Write a float32 GeoTIFF using the spatial profile of `src_tif`."""
+    """Write a float32 GeoTIFF using the spatial profile of ``src_tif``.
+
+    Parameters
+    ----------
+    src_tif : pathlib.Path
+        Reference raster whose georeferencing/profile is copied.
+    out_tif : pathlib.Path
+        Destination path for the new GeoTIFF.
+    array2d : numpy.ndarray
+        Array to write (NaNs are converted to ``nodata_value``).
+    nodata_value : float, default -9999.0
+        Stored nodata sentinel in the output raster.
+    """
     with rasterio.open(src_tif) as src:
         profile = src.profile.copy()
         profile.update(driver="GTiff", dtype="float32", count=1, nodata=nodata_value,
@@ -278,7 +478,27 @@ def _write_tif_like(src_tif: Path, out_tif: Path, array2d: np.ndarray, nodata_va
             dst.write(data_out, 1)
 
 def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndarray:
-    """Generate an IDW(Δh_vis) surface on the pixel grid of `ref_tif` (EPSG:4326)."""
+    """Generate an IDW(Δh_vis) surface on the pixel grid of ``ref_tif`` (EPSG:4326).
+
+    Parameters
+    ----------
+    px, py, pz : array-like
+        Calibration longitudes, latitudes, and Δh_vis values.
+    ref_tif : pathlib.Path
+        Raster defining target grid, resolution, and spatial extent.
+    power : float
+        IDW power exponent (passed to :func:`_idw_predict_points`).
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 raster array aligned to ``ref_tif``; NaN outside valid mask.
+
+    Raises
+    ------
+    RuntimeError
+        If ``ref_tif`` is not EPSG:4326 (geographic).
+    """
     with rasterio.open(ref_tif) as ds:
         H, W = ds.height, ds.width
         transform = ds.transform
@@ -288,6 +508,7 @@ def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndar
         if ds.nodata is not None and not np.isnan(ds.nodata):
             base[base == ds.nodata] = np.nan
 
+        # Precompute center coordinates of columns/rows
         cols = np.arange(W, dtype=np.float64) + 0.5
         rows = np.arange(H, dtype=np.float64) + 0.5
         a,b,c,d,e,f = transform.a, transform.b, transform.c, transform.d, transform.e, transform.f
@@ -297,6 +518,7 @@ def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndar
         out = np.full((H, W), np.nan, dtype="float32")
         cx = np.cos(np.deg2rad(np.nanmean(py) if len(py) else 0.0))
 
+        # Row-wise evaluation to bound memory usage
         for r in range(H):
             qy = np.full(W, ys_rows[r], dtype=np.float64)
             qx = xs_cols.astype(np.float64)
@@ -311,12 +533,26 @@ def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndar
                 pred[hits] = pz[imin[hits]]
             out[r, :] = pred.astype("float32")
 
+        # Respect valid mask of reference raster (e.g., coastline)
         valid_mask = np.isfinite(base)
         out = np.where(valid_mask, out, np.nan)
         return out
 
 def _apply_calibration_to_raster(src_tif: Path, a: float, b: float) -> np.ndarray:
-    """Apply y = a·x + b to a raster, honoring NaN/nodata."""
+    """Apply linear calibration ``y = a·x + b`` to a raster, honoring nodata/NaN.
+
+    Parameters
+    ----------
+    src_tif : pathlib.Path
+        Source raster to transform.
+    a, b : float
+        Gain and offset estimated from calibration gauges.
+
+    Returns
+    -------
+    numpy.ndarray
+        Calibrated array (float32) with NaNs carried through.
+    """
     with rasterio.open(src_tif) as ds:
         arr = ds.read(1).astype("float32")
         if ds.nodata is not None and not np.isnan(ds.nodata):
@@ -331,7 +567,11 @@ def _write_split_geojson(out_path: Path,
                          cal_idx: np.ndarray, val_idx: np.ndarray,
                          area: str, pair_tag: str, ref_iso: str, sec_iso: str,
                          replicate: int = 1) -> None:
-    """Write one GeoJSON FeatureCollection with {split: cal|val} for gauges (replicate #1 only)."""
+    """Write a single GeoJSON with gauge features labeled ``cal``/``val``.
+
+    Intended for quick QA/visualization of the 60/40 split from replicate #1.
+    Excluded gauges are omitted to reduce clutter in map viewers.
+    """
     cal_set = set(int(i) for i in cal_idx.tolist())
     val_set = set(int(i) for i in val_idx.tolist())
     feats = []
@@ -358,7 +598,30 @@ def _write_split_geojson(out_path: Path,
 
 # =========================== Core evaluation logic (multi-density) ===========================
 def _eval_ls_and_idw_for_split(pts: pd.DataFrame, cal_idx: np.ndarray, val_idx: np.ndarray, idw_power: float):
-    """Evaluate least-squares (for supplied insar) and IDW baseline on the given cal/val split."""
+    """Evaluate LS calibration and IDW baseline on a given cal/val split.
+
+    Parameters
+    ----------
+    pts : pandas.DataFrame
+        Must contain columns ``['insar_cm','dh_cm', LON_COL, LAT_COL]`` for the
+        union of calibration and validation gauges *in that order* (cal then val)
+        when indices are provided as ``np.arange`` slices below.
+    cal_idx, val_idx : numpy.ndarray
+        Integer indices selecting calibration and validation subsets.
+    idw_power : float
+        Power exponent for IDW baseline evaluation.
+
+    Returns
+    -------
+    tuple[dict, dict]
+        (metrics_ls, metrics_idw), both augmented with normalized metrics.
+
+    Notes
+    -----
+    For LS:
+        If the calibration set has at most two points, a robust fallback
+        ``a=-1`` and ``b=mean(dh + insar)`` is used to avoid unstable fits.
+    """
     x_cal = pts["insar_cm"].values[cal_idx].astype(float)
     y_cal = pts["dh_cm"].values[cal_idx].astype(float)
     x_val = pts["insar_cm"].values[val_idx].astype(float)
@@ -399,13 +662,22 @@ def _evaluate_pair_spread_multidensity_and_exports(
     top_m: int = SPREAD_TOP_M_DEFAULT,
     cal_fracs: List[float] = CAL_FRACS_DEFAULT,
 ) -> pd.DataFrame:
-    """
-    Evaluate one (AREA, PAIR) using a SHARED multi-density cal/val plan (per replicate):
-      CAL fractions: e.g., [0.60, 0.45, 0.30, 0.15]   (VAL = remainder)
-    Exports (replicate #1 @ 60%):
-      • idw60_<PAIR>.tif
-      • cal_60pct_<DEM>_<CORR>_<PAIR>.tif
-      • split_60_40_<PAIR>.geojson
+    """Evaluate one (AREA, PAIR) with shared multi-density cal/val splits and do exports.
+
+    Workflow per pair
+    -----------------
+    1) Load EDEN gauges and compute Δh_vis for (REF, SEC).
+    2) Sample every available (DEM, CORR) raster at the same **usable** gauges.
+    3) Build shared calibration/validation plans for multiple densities per replicate
+       using stochastic farthest-point selection (spread-out but randomized).
+    4) Compute IDW baseline metrics and LS metrics per (DEM, CORR) for each density.
+    5) From replicate #1 at 60%: export IDW grid, calibrated rasters, and split GeoJSON.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Long table of metrics for all densities x replicates and methods.
+        Empty DataFrame if not enough common gauges (<3) or sampling fails.
     """
     results_dir = area_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -469,6 +741,7 @@ def _evaluate_pair_spread_multidensity_and_exports(
     lat_all = meta[LAT_COL].to_numpy(dtype=float)
     ids_all = [str(i) for i in common_ids_sorted]
 
+    # Stack per-raster InSAR samples in a dict keyed by (DEM, CORR)
     insar_by_key: Dict[tuple, np.ndarray] = {}
     for key, df in pts_by_raster.items():
         insar_by_key[key] = (df.set_index(ID_COL)
@@ -487,8 +760,10 @@ def _evaluate_pair_spread_multidensity_and_exports(
     export_plan_60 = None  # store replicate #1 plan for the 60% export
 
     for rep in range(1, n_repl + 1):
+        # Derive a fresh RNG per replicate for reproducibility without correlation
         rng = np.random.default_rng(rng_master.integers(0, 2**31-1))
         all_idx = np.arange(N, dtype=int)
+        # Exclude center point from selection set to avoid degenerate splits
         available_idx = np.setdiff1d(all_idx, np.array([center_idx_global]), assume_unique=False)
         n_avail = len(available_idx)
 
@@ -602,12 +877,25 @@ def _evaluate_pair_spread_multidensity_and_exports(
 # =============================== Driver (AREA) ===============================
 def _process_area(area_dir: Path, dems: List[str], corrs: List[str],
                   reps: int, seed: int, idw_power: float) -> None:
-    """
-    Process a single AREA:
-    - Discover pairs & rasters constrained by selected DEMS/CORRS.
-    - Evaluate each pair with SHARED multi-density (60/45/30/15%) spread-out splits per replicate.
-    - Overwrite <AREA>/results/accuracy_metrics.csv with fresh results.
-    - Write (rep#1 @ 60%): idw60_<PAIR>.tif, cal_60pct_<DEM>_<CORR>_<PAIR>.tif, split_60_40_<PAIR>.geojson.
+    """Process a single area end-to-end and write a fresh metrics CSV.
+
+    Parameters
+    ----------
+    area_dir : pathlib.Path
+        Path to the area folder under ``--areas-root``.
+    dems, corrs : list[str]
+        DEM and correction names to consider.
+    reps : int
+        Number of replicates per pair.
+    seed : int
+        RNG seed for reproducibility of split plans.
+    idw_power : float
+        Power exponent for IDW baseline.
+
+    Side Effects
+    ------------
+    Writes ``accuracy_metrics.csv`` under ``<AREA>/results`` and exports rasters
+    and GeoJSON for replicate #1 @ 60%.
     """
     area_name   = area_dir.name
     gauge_csv   = area_dir / "water_gauges" / "eden_gauges.csv"
@@ -667,8 +955,7 @@ def _process_area(area_dir: Path, dems: List[str], corrs: List[str],
 
 # =================================== CLI ===================================
 def main():
-    """
-    CLI entry point.
+    """CLI entry point to run accuracy assessment and exports.
 
     Arguments
     ---------
@@ -683,7 +970,8 @@ def main():
     Behavior
     --------
     1) Cleans all <AREA>/results folders under --areas-root.
-    2) Iterates areas, runs multi-density (60/45/30/15%) spread-out evaluation & exports, then writes a fresh metrics CSV per area.
+    2) Iterates areas, runs multi-density (60/45/30/15%) spread-out evaluation & exports,
+       then writes a fresh metrics CSV per area.
     """
     ap = argparse.ArgumentParser(
         description="Compute accuracy metrics with SHARED spread-out 60/45/30/15% calibration splits per (AREA,PAIR); export 60% IDW + calibrated GeoTIFFs and a 60/40 split GeoJSON from replicate #1."

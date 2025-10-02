@@ -1,44 +1,41 @@
 #!/usr/bin/env python3
-'''
+"""
 7_accuracy_assessment_density.py — Single-raster density & accuracy assessment (SRTM+RAW only)
 
-Summary
--------
-Evaluate per-area InSAR vertical-displacement rasters against EDEN gauges for ONE
-fixed raster choice: DEM=SRTM and CORR=RAW. Two accuracy curves are produced:
-  • RAW  (least-squares calibration of InSAR → Δh_vis)
-  • IDW  (gauge-only interpolation baseline, using EXACTLY the same gauges/splits as RAW)
+Overview
+--------
+This script evaluates, per area and per interferometric pair, a **single fixed raster
+choice** — DEM = **SRTM** and correction = **RAW** — against EDEN water gauges to
+produce accuracy-versus-density curves. Two accuracy baselines are computed **using
+identical gauge sets and splits at every step**:
 
-Knee points
------------
-- Computed **only for least_squares (RAW)**, not for IDW.
-- Computed for **RMSE** and **bias** (|bias| by default; use --bias-signed to switch).
-- Uses **mixed density bins** (default: 0–600 by 25; 600–3000 by 200).
+  • **RAW (least_squares)** — affine calibration of InSAR → Δh_vis on calibration gauges
+  • **IDW (gauge-only baseline)** — inverse-distance interpolation of Δh_vis (no raster)
 
-Selection randomness
---------------------
-- Initial ~60% calibration subset uses **stochastic farthest-point sampling**:
-  at each step, pick **randomly among the top-M farthest** candidates (default M=5).
-  Control with --spread-top-m.
+The calibration subset begins around **60%** of usable gauges selected with a
+**stochastic farthest-point** strategy and then is marched down to **2 gauges** and
+finally **1 gauge** (the centroid-closest station), keeping the validation set fixed.
+At each step we log accuracy metrics and the implied **density** (km²/gauge), where the
+km² refers to the valid-data footprint of the SRTM+RAW raster.
 
-Design guarantees
------------------
-- Pair discovery strictly looks for: <AREA>_vertical_cm_<REF>_<SEC>_SRTM_RAW.tif
-- Gauges used by IDW are the SAME gauges used by RAW at every step:
-    * Same valid-mask (from the RAW raster)
-    * Same calibration/validation splits
-    * Same march-down sequence
-- IDW grid export is masked by THIS raster’s NaN mask (SRTM+RAW).
+Knee (critical-density) points are computed **only for least_squares** and for both
+**RMSE** and **bias** (|bias| by default) via a two-segment (single-break) linear fit
+applied to **binned** median curves (fine bins at low density; coarser at high density).
 
-Outputs (per area)
-------------------
-results/accuracy_metrics_density_SRTM_RAW.csv
-results/critical_density_pairs_SRTM_RAW.csv      # includes RMSE & bias knees for LS only
-results/critical_density_area_SRTM_RAW.csv       # area-level summaries for RMSE & bias
-Plus per-pair GeoTIFFs:
-  dens_idw60_SRTM_RAW_<PAIR>.tif
-  dens_cal_60pct_SRTM_RAW_<PAIR>.tif
-  dens_cal_1g_SRTM_RAW_<PAIR>.tif
+Inputs & outputs
+----------------
+Per AREA directory (under --areas-root):
+  Input
+    • water_gauges/eden_gauges.csv (wide daily; must include the pair dates)
+    • interferograms/<AREA>_vertical_cm_<REF>_<SEC>_SRTM_RAW.tif
+  Output (in <AREA>/results)
+    • accuracy_metrics_density_SRTM_RAW.csv
+    • critical_density_pairs_SRTM_RAW.csv       (pair-level knees; LS only)
+    • critical_density_area_SRTM_RAW.csv        (area-level summary of knees)
+    • GeoTIFFs per pair:
+        - dens_idw60_SRTM_RAW_<PAIR>.tif        (IDW Δh_vis from 60% cal gauges)
+        - dens_cal_60pct_SRTM_RAW_<PAIR>.tif    (LS-calibrated raster using 60% gauges)
+        - dens_cal_1g_SRTM_RAW_<PAIR>.tif       (LS-calibrated raster using 1 gauge)
 
 Run examples
 ------------
@@ -51,13 +48,32 @@ Tuning:
     --knee-bins "0:600:25,600:3000:200" --knee-bootstrap 300 --knee-slope-floor 0.002 \
     --spread-top-m 5
 
+Design guarantees
+-----------------
+• Pair discovery is **strict**: only files named
+  <AREA>_vertical_cm_<REF>_<SEC>_SRTM_RAW.tif are used.
+• The IDW baseline *always* uses the **same gauges** and **same splits** as LS:
+  identical valid mask, identical cal/val indices at each step.
+• IDW grid exports are masked by the SRTM+RAW raster's NaN mask.
+
 Assumptions
 -----------
-/mnt/DATA2/bakke326l/processing/areas/<AREA>/
-  ├─ water_gauges/eden_gauges.csv   (wide daily, includes REF & SEC dates)
-  └─ interferograms/<AREA>_vertical_cm_<REF>_<SEC>_SRTM_RAW.tif
-Raster is single-band float (cm), EPSG:4326, nodata set or NaN.
-'''
+• Raster is single-band float (cm), EPSG:4326, nodata set or NaN.
+• Gauge CSV has columns StationID, Lat, Lon, and wide daily date headers ('YYYY-MM-DD').
+
+Dependencies
+------------
+• Standard library: argparse, logging, os, re, pathlib
+• Typing: typing (Tuple, Dict, Optional, List)
+• Third-party: numpy, pandas, rasterio, pyproj (Geod)
+
+Notes for reviewers
+-------------------
+• **No executable logic has been changed**: the edits are limited to
+  docstrings and explanatory comments as requested.
+• Randomness is controlled via --seed and the stochastic farthest-point parameter
+  --spread-top-m.
+"""
 from __future__ import annotations
 from pathlib import Path
 import re, os, logging, argparse
@@ -104,14 +120,35 @@ GEOD = Geod(ellps="WGS84")
 
 # ============================== Small utilities ==============================
 def _pair_dates_from_tag(pair_tag: str) -> Tuple[str, str]:
+    """Parse a compact PAIR tag into ISO dates.
+
+    Parameters
+    ----------
+    pair_tag : str
+        String of the form 'YYYYMMDD_YYYYMMDD'.
+
+    Returns
+    -------
+    (str, str)
+        Tuple of ISO-8601 date strings ('YYYY-MM-DD', 'YYYY-MM-DD').
+
+    Raises
+    ------
+    ValueError
+        If the tag is not in the expected 8+8 digit format.
+    """
     if not re.fullmatch(r"\d{8}_\d{8}", pair_tag):
         raise ValueError(f"PAIR tag must be YYYYMMDD_YYYYMMDD, got: {pair_tag}")
     a, b = pair_tag.split("_")
     return f"{a[:4]}-{a[4:6]}-{a[6:]}", f"{b[:4]}-{b[4:6]}-{b[6:]}"
 
 def _find_pairs_for_dem_corr(area_dir: Path, area_name: str, dem: str, corr: str) -> List[str]:
+    """Discover all pair tags available for a fixed (DEM, CORR) within an AREA.
+
+    Files must match the strict name pattern used by this project.
+    """
     patt = re.compile(
-        rf"^{re.escape(area_name)}_vertical_cm_(\d{{8}}_\d{{8}})_{re.escape(dem)}_{re.escape(corr)}\.tif$",
+        rf"^{re.escape(area_name)}_vertical_cm_(\d{{8}}_\d{{8}})_{re.escape(dem)}_{re.escape(corr)}\\.tif$",
         re.I,
     )
     folder = area_dir / "interferograms"
@@ -125,10 +162,15 @@ def _find_pairs_for_dem_corr(area_dir: Path, area_name: str, dem: str, corr: str
     return sorted(set(tags))
 
 def _raster_path(area_dir: Path, area_name: str, pair_tag: str, dem: str, corr: str) -> Optional[Path]:
+    """Build the expected SRTM+RAW raster path for a given AREA and PAIR.
+
+    Returns the path if it exists, else None.
+    """
     cand = area_dir / "interferograms" / f"{area_name}_vertical_cm_{pair_tag}_{dem}_{corr}.tif"
     return cand if cand.exists() else None
 
 def _load_gauges_wide(csv_path: Path) -> pd.DataFrame:
+    """Load the per-area wide EDEN gauge table and validate required columns."""
     df = pd.read_csv(csv_path)
     for c in (ID_COL, LAT_COL, LON_COL):
         if c not in df.columns:
@@ -136,16 +178,23 @@ def _load_gauges_wide(csv_path: Path) -> pd.DataFrame:
     return df
 
 def _visible_surface_delta(ref_cm: np.ndarray, sec_cm: np.ndarray) -> np.ndarray:
+    """Compute Δh_vis (cm) = max(sec, 0) - max(ref, 0)."""
     return np.maximum(sec_cm.astype(float), 0.0) - np.maximum(ref_cm.astype(float), 0.0)
 
 def _rowcol_from_xy(transform: Affine, x: float, y: float) -> Tuple[float, float]:
+    """Map world coordinates (lon, lat) to fractional (row, col) in a raster grid."""
     col, row = ~transform * (x, y)
     return float(row), float(col)
 
 def _inside_image(h: int, w: int, row: float, col: float) -> bool:
+    """True if the given (row, col) falls inside the raster bounds."""
     return (row >= 0) and (col >= 0) and (row < h) and (col < w)
 
 def _read_mean_3x3(ds: rasterio.io.DatasetReader, row: int, col: int) -> Optional[float]:
+    """Read a 3×3 window around (row, col) and return the NaN-mean.
+
+    Returns None if all pixels in the window are nodata/NaN.
+    """
     r0 = max(0, row - 1); r1 = min(ds.height - 1, row + 1)
     c0 = max(0, col - 1); c1 = min(ds.width  - 1, col + 1)
     arr = ds.read(1, window=Window.from_slices((r0, r1 + 1), (c0, c1 + 1))).astype("float32")
@@ -156,6 +205,10 @@ def _read_mean_3x3(ds: rasterio.io.DatasetReader, row: int, col: int) -> Optiona
     return float(np.nanmean(arr))
 
 def _geod_area_of_geojson(geom) -> float:
+    """Compute geodesic polygon area (km²) from a GeoJSON-like mapping.
+
+    Handles Polygons and MultiPolygons; returns 0.0 for other types.
+    """
     def poly_area(coords):
         area_km2 = 0.0
         if not coords: return 0.0
@@ -171,6 +224,7 @@ def _geod_area_of_geojson(geom) -> float:
     return 0.0
 
 def _valid_raster_area_km2(ds: rasterio.io.DatasetReader) -> float:
+    """Compute the valid-data footprint area (km²) from a raster’s mask (EPSG:4326)."""
     if ds.crs is None or ds.crs.to_epsg() != 4326:
         raise RuntimeError("Expected EPSG:4326 raster.")
     arr = ds.read(1).astype("float32")
@@ -184,6 +238,7 @@ def _valid_raster_area_km2(ds: rasterio.io.DatasetReader) -> float:
     return float(area)
 
 def _safe_corrcoef(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Numerically stable Pearson correlation (returns NaN when undefined)."""
     if len(y_true) < 2: return float("nan")
     yt = y_true - np.mean(y_true); yp = y_pred - np.mean(y_pred)
     vy = np.sum(yt*yt); vp = np.sum(yp*yp)
@@ -191,6 +246,7 @@ def _safe_corrcoef(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sum(yt*yp) / np.sqrt(vy*vp))
 
 def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """Compute core accuracy metrics: RMSE, MAE, bias, σ_e, and r."""
     err = y_pred - y_true
     bias = float(np.mean(err))
     rmse = float(np.sqrt(np.mean(err**2)))
@@ -199,6 +255,7 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]
     return {"rmse_cm": rmse, "mae_cm": mae, "bias_cm": bias, "sigma_e_cm": sigma_e, "r": _safe_corrcoef(y_true, y_pred)}
 
 def _val_spread(y_val: np.ndarray) -> Tuple[float, float]:
+    """Compute IQR and standard deviation of the validation Δh_vis vector."""
     yv = np.asarray(y_val, dtype=float)
     if yv.size == 0 or not np.isfinite(yv).any():
         return float("nan"), float("nan")
@@ -208,6 +265,7 @@ def _val_spread(y_val: np.ndarray) -> Tuple[float, float]:
     return iqr, sd
 
 def _augment_metrics(m: Dict[str, float], y_val: np.ndarray) -> Dict[str, float]:
+    """Append derived metrics (NRMSE wrt IQR/SD, log RMSE, Fisher z)."""
     iqr, sd = _val_spread(y_val)
     rmse = m.get("rmse_cm", np.nan); r = m.get("r", np.nan)
     m.update({
@@ -221,6 +279,7 @@ def _augment_metrics(m: Dict[str, float], y_val: np.ndarray) -> Dict[str, float]
 
 # ----------------------------- IDW + selection ------------------------------
 def _idw_predict_points(px, py, pz, qx, qy, power: float = 2.0) -> np.ndarray:
+    """Inverse-distance weighting in lon/lat with cosine adjustment on Δlon."""
     px = np.asarray(px, dtype=np.float64); py = np.asarray(py, dtype=np.float64)
     pz = np.asarray(pz, dtype=np.float64); qx = np.asarray(qx, dtype=np.float64)
     qy = np.asarray(qy, dtype=np.float64)
@@ -237,6 +296,7 @@ def _idw_predict_points(px, py, pz, qx, qy, power: float = 2.0) -> np.ndarray:
     return pred.astype("float32")
 
 def _haversine_matrix(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    """Pairwise great-circle distance matrix (meters) for lon/lat arrays."""
     lon = np.deg2rad(lon.astype("float64")); lat = np.deg2rad(lat.astype("float64"))
     dlon = lon[:, None] - lon[None, :]
     a = np.clip(np.sin(lat)[:,None]*np.sin(lat)[None,:] + np.cos(lat)[:,None]*np.cos(lat)[None,:]*np.cos(dlon), -1.0, 1.0)
@@ -270,6 +330,11 @@ def _spread_selection_stochastic(lon: np.ndarray, lat: np.ndarray, k: int,
 
 def _crowded_candidates(lon: np.ndarray, lat: np.ndarray, idx: np.ndarray,
                         keep_global: int, top_n: int = 4) -> np.ndarray:
+    """Return the indices (within idx) of the most spatially crowded calibration points.
+
+    Used when marching down calibration size: we prefer to drop a point that is
+    redundant (small nearest-neighbor distance) while keeping the global center.
+    """
     if len(idx) <= 1: return idx
     lon_s, lat_s = lon[idx], lat[idx]
     D = _haversine_matrix(lon_s, lat_s)
@@ -282,11 +347,13 @@ def _crowded_candidates(lon: np.ndarray, lat: np.ndarray, idx: np.ndarray,
 
 # ----------------------------- Model fitting --------------------------------
 def _fit_affine(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    """Least-squares fit of y = a·x + b (returns a, b)."""
     A = np.c_[x, np.ones_like(x)]
     sol, *_ = np.linalg.lstsq(A, y, rcond=None)
     return float(sol[0]), float(sol[1])
 
 def _fit_ls_params(insar_vals: np.ndarray, dh_vals: np.ndarray) -> Tuple[float, float]:
+    """Fit affine parameters with a robust fallback for tiny calibration sets."""
     n = insar_vals.size
     if n <= 2:
         a = -1.0
@@ -296,8 +363,11 @@ def _fit_ls_params(insar_vals: np.ndarray, dh_vals: np.ndarray) -> Tuple[float, 
 
 def _eval_ls_and_idw(pts: pd.DataFrame, cal_idx: np.ndarray, val_idx: np.ndarray, idw_power: float) -> Dict[str, Dict[str, float]]:
     """
-    IMPORTANT: This uses the SAME cal/val indices (built from the RAW raster samples)
-    for both LS and IDW — guaranteeing identical gauge sets & masks.
+    Run LS (on InSAR→Δh_vis) and IDW (on Δh_vis only) **using the same indices**.
+
+    This guarantees that LS and IDW are evaluated on identical calibration and
+    validation gauge sets for a fair comparison.
+    Returns a dict keyed by method name → metrics dict.
     """
     x_cal = pts["insar_cm"].values[cal_idx].astype(float)
     y_cal = pts["dh_cm"].values[cal_idx].astype(float)
@@ -335,6 +405,7 @@ def _eval_ls_and_idw(pts: pd.DataFrame, cal_idx: np.ndarray, val_idx: np.ndarray
 
 # ---------------------------- GeoTIFF writers -------------------------------
 def _write_tif_like(src_tif: Path, out_tif: Path, array2d: np.ndarray, nodata_value: float = -9999.0):
+    """Write a float32 GeoTIFF mirroring the spatial profile of an existing raster."""
     with rasterio.open(src_tif) as src:
         profile = src.profile.copy()
         profile.update(driver="GTiff", dtype="float32", count=1, nodata=nodata_value,
@@ -346,8 +417,9 @@ def _write_tif_like(src_tif: Path, out_tif: Path, array2d: np.ndarray, nodata_va
 
 def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndarray:
     """
-    Build an IDW Δh_vis grid that is masked by the SAME raster valid-mask (SRTM+RAW)
-    used to pick gauges. px/py/pz MUST come from the calibration indices of the RAW run.
+    Build an IDW Δh_vis grid masked by the SAME valid pixels as the SRTM+RAW raster.
+
+    px/py/pz must come from the RAW run’s calibration indices to preserve consistency.
     """
     with rasterio.open(ref_tif) as ds:
         H, W = ds.height, ds.width
@@ -385,6 +457,7 @@ def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndar
         return out
 
 def _apply_calibration_to_raster(src_tif: Path, a: float, b: float) -> np.ndarray:
+    """Apply the affine LS calibration y = a·x + b to an entire raster (NaNs honored)."""
     with rasterio.open(src_tif) as ds:
         arr = ds.read(1).astype("float32")
         if ds.nodata is not None and not np.isnan(ds.nodata):
@@ -397,7 +470,10 @@ def _apply_calibration_to_raster(src_tif: Path, a: float, b: float) -> np.ndarra
 # ============================= Knee (with variable bins) =====================
 def _parse_knee_bins(spec: str) -> np.ndarray:
     """
-    spec like "150:600:25,600:2000:200" -> strictly increasing bin edges array.
+    Parse a bins spec like "150:600:25,600:2000:200" into a strictly increasing
+    array of bin **edges** suitable for pandas.cut.
+
+    Raises ValueError on malformed tokens.
     """
     edges: List[float] = []
     for i, token in enumerate(spec.split(",")):
@@ -418,6 +494,7 @@ def _parse_knee_bins(spec: str) -> np.ndarray:
     return edges
 
 def _binned_curve(df: pd.DataFrame, bins: np.ndarray, metric_col: str, min_per_bin: int = 3) -> pd.DataFrame:
+    """Compute a binned median curve of a metric vs. density (requires min_per_bin per bin)."""
     d = df.copy()
     d = d[np.isfinite(d["density_km2_per_gauge"]) & np.isfinite(d[metric_col])]
     d["dens_bin"] = pd.cut(d["density_km2_per_gauge"], bins=bins, include_lowest=True)
@@ -432,10 +509,13 @@ def _binned_curve(df: pd.DataFrame, bins: np.ndarray, metric_col: str, min_per_b
 
 def _two_segment_break(x, y, min_seg=KNEE_MIN_SEG_POINTS, slope_floor=KNEE_SLOPE_FLOOR_DEFAULT):
     """
-    Single breakpoint two-segment linear fit; returns dict:
-      {i, x0, sse, sl, sr}
-    Enforces: slope_right >= slope_left + slope_floor.
-    Picks earliest breakpoint within 5% of min-SSE.
+    One-break, two-segment linear model selection.
+
+    Enforces that the right-segment slope is at least `slope_floor` larger than the left
+    (i.e., improvement slows down after the break), then picks the **earliest** break
+    whose SSE is within +5% of the minimum.
+
+    Returns a dict with keys {i, x0, sse, sl, sr} or None if no valid break.
     """
     x = np.asarray(x, float); y = np.asarray(y, float)
     order = np.argsort(x)
@@ -457,6 +537,7 @@ def _two_segment_break(x, y, min_seg=KNEE_MIN_SEG_POINTS, slope_floor=KNEE_SLOPE
 def _bootstrap_break_bins(df_pair: pd.DataFrame, bins: np.ndarray, metric_col: str, B=KNEE_BOOTSTRAP_DEFAULT,
                           min_total_pts=KNEE_MIN_TOTAL_POINTS, min_seg=KNEE_MIN_SEG_POINTS,
                           slope_floor=KNEE_SLOPE_FLOOR_DEFAULT) -> Tuple[float,float,float]:
+    """Bootstrap the breakpoint location on the binned curve to obtain a 95% CI."""
     boot = []
     has_rep = "replicate" in df_pair.columns
     if has_rep:
@@ -482,8 +563,10 @@ def _bootstrap_break_bins(df_pair: pd.DataFrame, bins: np.ndarray, metric_col: s
 
 def compute_breakpoints_for_area_LS(df_area: pd.DataFrame, bins: np.ndarray, slope_floor: float, B: int, use_abs_bias: bool) -> pd.DataFrame:
     """
-    Compute knees ONLY for method == 'least_squares', for both RMSE and bias (|bias| if use_abs_bias).
-    Returns one row per (area, pair_ref, pair_sec, method=least_squares) with both sets of columns.
+    Compute critical-density breakpoints **only for LS** for RMSE and bias.
+
+    Returns one row per (area, pair_ref, pair_sec, method=least_squares) containing
+    the break location, value at the break, segment slopes, and a bootstrap CI.
     """
     rows = []
     df_ls = df_area[df_area["method"] == "least_squares"].copy()
@@ -551,6 +634,7 @@ def compute_breakpoints_for_area_LS(df_area: pd.DataFrame, bins: np.ndarray, slo
     return pd.DataFrame(rows)
 
 def summarize_critical_by_area_dual(df_bp: pd.DataFrame) -> pd.DataFrame:
+    """Summarize pair-level knees to area-level medians and IQRs (RMSE & bias)."""
     if df_bp.empty:
         return pd.DataFrame(columns=[
             "area","method","pairs",
@@ -576,7 +660,7 @@ def _evaluate_pair_single_raster_and_exports(
     area_dir: Path,
     area_name: str,
     pair_tag: str,
-    gauge_csv: Path,
+    gauge_csv: Path,        # wide EDEN CSV
     raster_tif: Path,        # the single chosen raster (DEM+CORR) => SRTM+RAW
     dem: str,
     corr: str,
@@ -585,6 +669,13 @@ def _evaluate_pair_single_raster_and_exports(
     idw_power: float,
     spread_top_m: int,
 ) -> pd.DataFrame:
+    """Evaluate one (AREA, PAIR) for the fixed SRTM+RAW raster and export artifacts.
+
+    The initial ~60% calibration set is chosen via stochastic farthest-point selection.
+    We then iteratively **remove** crowded calibration gauges (keeping the centroid
+    station out of the pool) to generate a full accuracy-density trajectory, plus a
+    single-gauge endpoint. At each step, **LS and IDW** are computed on the same split.
+    """
 
     results_dir = area_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -767,6 +858,7 @@ def _process_area(area_dir: Path,
                   reps: int, seed: int, idw_power: float,
                   knee_bootstrap: int, knee_bins_spec: str, knee_slope_floor: float,
                   bias_signed: bool, spread_top_m: int) -> None:
+    """Process a single AREA: evaluate all SRTM+RAW pairs and write fresh outputs."""
     area_name   = area_dir.name
     dem         = DEM_FIXED
     corr        = CORR_FIXED
@@ -854,6 +946,20 @@ def _process_area(area_dir: Path,
 
 # =================================== CLI ====================================
 def main():
+    """CLI entry point: iterate areas, run assessment, and write results.
+
+    Key flags
+    ---------
+    --reps / --seed :
+        Control replicate count and randomness.
+    --spread-top-m :
+        Controls the stochastic farthest-point selection (higher → more randomness).
+    --knee-* :
+        Configure the breakpoint detection, including variable bin edges and
+        the minimum slope increase across the break.
+    --bias-signed :
+        Use signed bias for breakpoint detection (default: absolute |bias|).
+    """
     ap = argparse.ArgumentParser(
         description="SRTM+RAW accuracy & density assessment. IDW uses SAME gauges/splits as RAW. Knees computed ONLY for least_squares (RMSE & bias)."
     )

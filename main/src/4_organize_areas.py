@@ -1,4 +1,18 @@
 #!/usr/bin/env python
+# =============================================================================
+# Dependencies (Python libraries)
+# =============================================================================
+# • Standard library: os, logging, argparse, re, sys, shutil, pathlib.Path
+# • Third‑party: numpy, pandas, geopandas, shapely, rasterio, matplotlib
+#   - rasterio.mask, rasterio.features
+#   - shapely (geometry ops, make_valid, GEOSException)
+#   - matplotlib (pyplot, colormaps)
+#
+# Suggested install (conda‑forge):
+#   conda install -c conda-forge numpy pandas geopandas shapely rasterio matplotlib
+#
+
+
 """
 4_organize_areas.py — Per-area gauge tables + coverage-aware vertical clips (TIFF + PNG)
 
@@ -93,6 +107,7 @@ from __future__ import annotations
 # --- silence DEBUG spam ---
 import os, logging
 os.environ.setdefault("CPL_DEBUG", "OFF")
+# (Rasterio/GDAL logging noise reduced; logs still printed for our script itself.)
 os.environ.setdefault("CPL_LOG", "/dev/null")
 os.environ.setdefault("RIO_LOG_LEVEL", "CRITICAL")
 logging.basicConfig(level=logging.INFO, force=True)
@@ -145,7 +160,7 @@ TYPE_FLD    = 'Type of Station (Physical Location)'
 EDEN_FLD    = 'EDEN Station Name'   # used as StationID fallback if needed
 VALID_TYPES = {'marsh', 'forest', 'river'}
 
-# Varibales for correction the water level to water elevation 
+# Variables for correcting the water level to water elevation (metadata only; logic unchanged)
 EDEN_GROUND_TXT      = BASE_DIR / 'data/aux/gauges/eden_ground_elevation.txt'
 EDEN_WATER_ELEV_CSV  = BASE_DIR / 'data/aux/gauges/eden_water_elevation.csv'
 FT_TO_CM             = 30.48
@@ -174,6 +189,7 @@ def _save_png(png_path: Path, arr_cm: np.ndarray, title: str) -> None:
     """
     m = np.ma.masked_invalid(arr_cm)  # mask NaNs
     plt.figure(figsize=(7, 6), dpi=150)
+    # Use only finite pixels for contrast limits, with a safe fallback
     finite = m.compressed()
     vmin, vmax = (0.0, 1.0) if finite.size == 0 else (float(np.nanpercentile(finite, 2)),
                                                       float(np.nanpercentile(finite, 98)))
@@ -251,6 +267,7 @@ def _raster_footprint(src: rasterio.DatasetReader):
     """
     mask = src.dataset_mask()  # uint8, 255=valid, 0=nodata
     geoms = []
+    # Convert contiguous valid mask regions to polygons in the raster CRS
     for geom, val in rio_features.shapes(mask, transform=src.transform):
         if val == 255:
             geoms.append(shp_shape(geom))
@@ -702,6 +719,7 @@ def main() -> None:
         Root to recursively search for */inspect/vertical_displacement_cm_*.geo.tif.
     --min-coverage-pct : float, default=70.0
         Minimum polygon coverage (percent) to write outputs.
+        # NOTE: argparse default and help string differ upstream; logic unchanged.
 
     Outputs
     -------
@@ -818,7 +836,7 @@ def main() -> None:
         m_dem = re.search(r'_(SRTM|3DEP)\b', pair_dir.name, flags=re.IGNORECASE)
         dem_tag = m_dem.group(1).upper() if m_dem else 'DEM'
         
-        # Identify which correction this raster came from
+        # Identify which correction this raster came from (robust to suffix positions)
         stem = vpath.stem.upper()
         if "TROPO_IONO" in stem:
             corr_tag = "TROPO_IONO"
