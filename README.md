@@ -1,475 +1,349 @@
-# InSAR ALOS Stripmap Processing Pipeline — README
+# InSAR Thesis — Everglades Water-Level Monitoring (ALOS PALSAR)
 
-This repository contains a **fully scripted pipeline** for building ALOS stripmap interferograms with ISCE2, applying ionospheric & tropospheric corrections, clipping per-area products, assessing accuracy against EDEN water‐level gauges, and generating publication-ready figures.
+> End-to-end pipeline for downloading SAR data, generating interferograms with ISCE2, applying iono/tropo corrections, clipping to water areas, benchmarking against EDEN gauges, and producing figures & stats for the thesis.
 
-It’s organized as a set of Python entrypoints (2\_\* through 6\_\*) with a few helper modules. Everything is file-system driven and designed to be robust for large batch runs.
+---
+
+## TL;DR (What this repo does)
+
+1. **Fetch & stage SAR** from ASF/Vertex.
+2. **Batch-run ISCE2** interferograms (each pair twice: **3DEP** and **SRTM**).
+3. **Post-process**: RAW vertical maps + **IONO**, **TROPO**, **TROPO+IONO** variants.
+4. **Organize per-area assets** (gauges, clips, coverage).
+5. **Evaluate accuracy** across DEM/correction combos and across **density** (gauge sparsity).
+6. **Inferential tests** (ANOVA/t-tests) for corrections and DEM choice.
+7. **Visualize**: correction maps, DEM boxplots, density curves.
 
 ---
 
 ## Table of Contents
 
-* [Overview](#overview)
-* [Prerequisites](#prerequisites)
-* [Directory Layout & Key Paths](#directory-layout--key-paths)
-* [Data & Inputs](#data--inputs)
-* [Quick Start](#quick-start)
-* [Pipeline Stages](#pipeline-stages)
+* [Repository Layout](#repository-layout)
+* [Environment & Dependencies](#environment--dependencies)
+* [Data Prerequisites](#data-prerequisites)
+* [Pipeline Overview (Scripts 1–8)](#pipeline-overview-scripts-1–8)
 
-  * [2\_run\_pair\_conda.py — Build interferograms](#2_run_pair_condapy--build-interferograms)
-  * [3\_do\_corrections.py — Apply IONO/TROPO & export vertical displacement](#3_do_correctionspy--apply-ionotropo--export-vertical-displacement)
-  * [4\_organize\_areas.py — Per-area clipping & gauge tables](#4_organize_areaspy--per-area-clipping--gauge-tables)
-  * [5\_accuracy\_assessment.py — Shared-split metrics + per-pair TIFFs](#5_accuracy_assessmentpy--shared-split-metrics--per-pair-tiffs)
-  * [6\_visualization.py — Figures (accuracy vs density, period plots)](#6_visualizationpy--figures-accuracy-vs-density-period-plots)
-* [Helper Modules](#helper-modules)
-* [Outputs & Naming Conventions](#outputs--naming-conventions)
-* [Configuration Notes & Tips](#configuration-notes--tips)
+  * [1) Obtain SAR data](#1-obtain-sar-data)
+  * [2) Batch-run ISCE2 (3DEP & SRTM)](#2-batch-run-isce2-3dep--srtm)
+  * [3) Corrections + Vertical Exports](#3-corrections--vertical-exports)
+  * [4) Per-area Gauges & Clips](#4-per-area-gauges--clips)
+  * [5) Accuracy (DEM × Corr) at Multiple Densities](#5-accuracy-dem--corr-at-multiple-densities)
+  * [6) Inferential Tests (Corrections & DEMs)](#6-inferential-tests-corrections--dems)
+  * [7) Density Study (SRTM+RAW)](#7-density-study-srtmraw)
+  * [8) Visualizations](#8-visualizations)
+* [Naming Conventions](#naming-conventions)
+* [Reproducibility & Logging](#reproducibility--logging)
 * [Troubleshooting](#troubleshooting)
-* [Reproducibility](#reproducibility)
-* [License / Acknowledgements](#license--acknowledgements)
+* [Quickstart](#quickstart)
+* [Acknowledgements](#acknowledgements)
+* [License & Citation](#license--citation)
 
 ---
 
-## Overview
-
-**Goal:** From raw ALOS CEOS data and DEMs, produce corrected interferograms, vertical displacement (cm) rasters, per-area subsets, metrics vs. gauge records, and figures.
-
-**Highlights:**
-
-* Dual DEM support (**SRTM** 30 m, **3DEP** 10 m).
-* **Two DEM runs per pair** (SRTM and 3DEP).
-* Ionospheric correction (split-spectrum) and **GACOS troposphere correction**.
-* Vertical displacement exports in **centimeters**, swath-masked, **LOS-median zeroed** before vertical projection.
-* Per-area clipping with coverage accounting + **gauge tables**.
-* Accuracy analysis with **shared calibration/validation split** across all DEM/CORR variants and **replicates**.
-* Figures with **clipped 5–95% uncertainty bands** and per-pair map panels.
-
----
-
-## Prerequisites
-
-* **Python 3.9+**
-* **ISCE2** installed and on PATH (`ISCE_HOME` set). The pipeline calls `stripmapApp.py`.
-* **snaphu** available (used by ISCE2 for unwrapping).
-* **GDAL** (>= 3.4, with command-line tools in PATH: `gdal_translate`, `gdalwarp`).
-* **conda-forge** stack recommended.
-
-### Python packages
-
-Install via conda/mamba (recommended):
-
-```bash
-mamba install -c conda-forge gdal rasterio numpy scipy pandas matplotlib pyproj shapely fiona geopandas
-```
-
----
-
-## Directory Layout & Key Paths
-
-These defaults are hard-coded in the scripts; adjust if your system differs.
+## Repository Layout
 
 ```
-~/InSAR/main/                      # BASE
+~/InSAR/main/                      # Code & helpers
 ├─ data/
 │  ├─ aux/
-│  │  ├─ dem/
-│  │  │  ├─ srtm_30m.tif
-│  │  │  └─ 3dep_10m.tif
-│  │  └─ tropo/                    # GACOS .ztd + .rsc files
-│  ├─ vector/
-│  │  ├─ gauge_locations.geojson
-│  │  └─ water_areas.geojson
-│  └─ aux/gauges/
-│     ├─ eden_water_levels.csv
-│     ├─ eden_ground_elevation.txt
-│     ├─ eden_water_elevation.csv  # (auto-made: above-ground cm, same schema)
-│     └─ acquisition_dates.csv     # date column 'YYYYMMDD'
-├─ processing/
-│  ├─ inspect/                     # global quicklook PNG copies
-│  └─ areas/
-│     ├─ <AREA>/
-│     │  ├─ interferograms/        # per-area clipped products
-│     │  ├─ water_gauges/          # per-area EDEN tables
-│     │  └─ results/               # metrics + figures
-│     └─ _reports/coverage_report.csv
-└─ src/ (your scripts)
-```
-
-Raw ALOS and heavy outputs live on a fast disk (adjust to taste):
-
-```
-/mnt/DATA2/bakke326l/
-├─ raw/                               # CEOS files: path<PATH>/<YYYYMMDD>/
+│  │  ├─ dem/                      # SRTM & 3DEP TIFFs (+ ISCE .wgs84 binaries written alongside)
+│  │  └─ gauges/                   # EDEN tables, ground elevations, acquisition dates
+│  └─ vector/                      # gauge_locations.geojson, water_areas.geojson
 └─ processing/
-   └─ interferograms/
-      └─ path<PATH>_<REF>_<SEC>_<DEM>/
-         ├─ stripmapApp.xml
-         ├─ interferogram/
-         ├─ geometry/
-         ├─ ionosphere/
-         ├─ troposphere/
-         └─ inspect/
+   ├─ interferograms/              # path<PATH>_<REF>_<SEC>_{SRTM|3DEP}/…
+   ├─ areas/                       # <AREA>/water_gauges, <AREA>/interferograms, results/
+   └─ inspect/                     # global quicklook PNGs
+/mnt/DATA2/bakke326l/raw/          # ASF archives organized per path/date
+```
+
+> A fuller filesystem snapshot exists in `project_structure.txt`.
+
+---
+
+## Environment & Dependencies
+
+* **Core:** Python 3.10+, GDAL utils (`gdal_translate` on `PATH`), ISCE2 (SCons install), GCC/GFortran.
+* **Python:** `numpy pandas geopandas shapely rasterio pyproj matplotlib scipy statsmodels`
+
+Create a minimal environment (conda-forge):
+
+```bash
+conda create -n insar python=3.10 numpy pandas geopandas shapely rasterio pyproj matplotlib scipy statsmodels -c conda-forge
+conda activate insar
+# Ensure: gdal_translate is on PATH (install GDAL via conda-forge if needed).
+# Ensure: ISCE2 apps (e.g., stripmapApp.py) reachable via $ISCE_HOME/applications/
 ```
 
 ---
 
-## Data & Inputs
+## Data Prerequisites
 
-* **pairs.csv** (`~/InSAR/main/data/pairs.csv`) with columns:
+* **ALOS PALSAR** Vertex ZIPs + CSV → `<RAW_DIR>/tmp_downloads/`
+* **DEM TIFFs**
 
-  ```
-  path,reference,secondary
-  150,20071216,20080131
-  ...
-  ```
-* **DEMs**:
+  * SRTM: `~/InSAR/main/data/aux/dem/srtm_30m.tif`
+  * 3DEP: `~/InSAR/main/data/aux/dem/3dep_10m.tif`
+    (ISCE `.dem.wgs84` and `.wgs84.xml` are created next to each TIF.)
+* **Tropo/Iono** auxiliaries (e.g., GACOS) → `~/InSAR/main/data/aux/tropo/`
+* **Gauges & areas**
 
-  * `~/InSAR/main/data/aux/dem/srtm_30m.tif`
-  * `~/InSAR/main/data/aux/dem/3dep_10m.tif`
-  * Auto-converted to ISCE (`*.dem.wgs84` + `.vrt` + `.xml`) on first use.
-* **Gauges / areas:**
-
-  * `data/vector/gauge_locations.geojson` (WGS84 points).
-  * `data/vector/water_areas.geojson` (WGS84 polygons with `area` field).
-  * `data/aux/gauges/eden_water_levels.csv` (wide: StationID, Lat, Lon, YYYY-MM-DD...).
-  * `data/aux/gauges/eden_ground_elevation.txt` (for above-ground correction).
-  * `data/aux/gauges/acquisition_dates.csv` (column: `date` in `YYYYMMDD`).
-* **Tropo (GACOS)**: `.ztd` + `.rsc` files in `data/aux/tropo/` (one per REF/SEC).
+  * EDEN wide daily table + ground elevations + acquisition dates
+  * `data/vector/gauge_locations.geojson`, `data/vector/water_areas.geojson`
 
 ---
 
-## Quick Start
+## Pipeline Overview (Scripts 1–8)
+
+### 1) Obtain SAR data
+
+**File:** `1_obtaining_sar_data.py`
+**Does:**
+
+* Runs your ASF downloader (`help_download_all_path_150.py`) → ZIPs + Vertex CSV into `<RAW_DIR>/tmp_downloads/`.
+* Unpacks each ZIP to `path<PATH>/<YYYYMMDD>/`, writes `<GRANULE>.txt` with the full CSV row, and deletes the ZIP on success.
+
+**Run**
 
 ```bash
-# 1) Build interferograms for ALL pairs (SRTM and 3DEP per pair)
-python 2_run_pair_conda.py
-
-# (Optional) Resume quicklooks only, skip ISCE if IFG exists
-python 2_run_pair_conda.py --resume
-
-# 2) Apply IONO & TROPO, export vertical displacement (RAW, IONO, TROPO, TROPO_IONO)
-python 3_do_corrections.py --batch /mnt/DATA2/bakke326l/processing/interferograms
-
-# 3) Build per-area gauge tables + clip vertical products; write coverage report
-python 4_organize_areas.py
-
-# 4) Accuracy assessment (shared split) + 4 per-pair exports into <AREA>/results/
-python 5_accuracy_assessment.py  --reps 50 --seed 42
-
-# 5) Visualizations (per-pair, per-area, all-areas; plus time-series)
-python 6_visualization.py --target-density 500
+python 1_obtaining_sar_data.py
 ```
 
 ---
 
-## Pipeline Stages
+### 2) Batch-run ISCE2 (3DEP & SRTM)
 
-### 2\_run\_pair\_conda.py — Build interferograms
+**File:** `2_run_insar.py`
+**Inputs:** `data/pairs.csv` (`path,reference,secondary`), DEM TIFFs, `raw/` layout.
+**Does:**
 
-Runs each pair **twice** (SRTM & 3DEP) using ISCE2 stripmapApp. Creates quicklooks & logs status.
+* For each pair: runs **twice** (3DEP, then SRTM) with `range=10, az=16, alpha=0.6`.
+* Creates ISCE XML, product VRTs, **quicklook** GeoTIFF/PNG under `inspect/`.
+* Appends to `_reports/path_status.csv`.
 
-**Key features**
+**Output root:**
+`/mnt/DATA2/bakke326l/processing/interferograms/path<PATH>_<REF>_<SEC>_{3DEP|SRTM}/…`
 
-* Auto-convert DEM GeoTIFF to ISCE format (`*.dem.wgs84` + `.xml`) on first use.
-* Fixed multilooks & filter defaults (override via CLI).
-* **Resume mode**: if IFG exists, rebuilds `inspect/` quicklooks and skips ISCE.
-* Per-pair workdir: `path<PATH>_<REF>_<SEC>_<DEM>`.
-
-**Usage**
+**Run**
 
 ```bash
-# Batch all pairs (from pairs.csv); both DEMs
-python 2_run_pair_conda.py
-
-# Limit to first N rows (smoke test)
-python 2_run_pair_conda.py --n 10
-
-# Single pair (both DEMs)
-python 2_run_pair_conda.py --path 150 20071216 20080131
-
-# Override multilooks & Goldstein alpha
-python 2_run_pair_conda.py --range 10 --az 16 --alpha 0.6
-
-# Resume (skip ISCE if IFG present; rebuild quicklooks)
-python 2_run_pair_conda.py --resume
+python 2_run_insar.py
+python 2_run_insar.py --n 10                 # smoke test
+python 2_run_insar.py --path 150 20071216 20080131
+python 2_run_insar.py --range 10 --az 16 --alpha 0.6
+python 2_run_insar.py --resume               # skip if IFG already exists
 ```
-
-**Outputs**
-
-* `interferogram/` (VRT/ENVI products).
-* `inspect/` quicklook TIFF/PNG (`phsig.cor`, `topophase.cor`, `filt_topophase.unw`).
-* `inspect/FRINGES_<REF>_<SEC>_<DEM>.{tif,png}` (wrapped phase preview).
-* Status CSV: `/mnt/DATA2/bakke326l/processing/interferograms/_reports/path_status.csv`.
 
 ---
 
-### 3\_do\_corrections.py — Apply IONO/TROPO & export vertical displacement
+### 3) Corrections + Vertical Exports
 
-Processes each **pair directory**:
+**File:** `3_do_corrections.py`
+**Does:**
 
-1. **RAW** vertical displacement (`vertical_displacement_cm_*_RAW.geo.tif`).
-2. **IONO-only** correction → vertical (`*_IONO.geo.tif`).
-3. **TROPO** correction (GACOS) → vertical (`*_TROPO.geo.tif`) → **IONO on TROPO** → vertical (`*_TROPO_IONO.geo.tif`).
+* Converts unwrapped phase → **LOS** → **vertical (cm)** with off-swath masking.
+* Builds **RAW**, **IONO**, **TROPO**, **TROPO+IONO** variants of unwrapped & vertical.
+* Exports quicklooks for **ΔAPS (tropo differential)** and **ionospheric dispersive** phase.
 
-**Vertical cm conversion**
+**Notes:** Needs `geometry/los.rdr.geo(.vrt)` for vertical; if missing, vertical exports are skipped.
 
-* Uses ALOS L-band wavelength (0.2362 m).
-* Removes LOS **median** prior to dividing by cos(incidence) to avoid 1/cos ramp.
-* Swath mask applied (GDAL mask or amplitude fallback) — off-swath → NaN.
-
-**Usage**
+**Run**
 
 ```bash
-# One pair dir
 python 3_do_corrections.py /mnt/DATA2/.../path150_20071216_20080131_SRTM
-
-# Batch process root
 python 3_do_corrections.py --batch /mnt/DATA2/bakke326l/processing/interferograms
 ```
 
-**Outputs (per pair)**
-
-* `interferogram/filt_topophase_iono.unw.geo`
-* `interferogram/filt_topophase_tropo.unw.geo` (2-band ENVI: amp, phase)
-* `interferogram/filt_topophase_tropo_iono.unw.geo`
-* `inspect/vertical_displacement_cm_<REF>_<SEC>_{RAW|IONO|TROPO|TROPO_IONO}.geo.tif` (+ PNGs)
-
 ---
 
-### 4\_organize\_areas.py — Per-area clipping & gauge tables
+### 4) Per-area Gauges & Clips
 
-* Computes **water above ground** (cm) for **all dates** using EDEN levels and ground elevations — writes a corrected CSV with the **same columns** as the source.
-* Builds **per-area** gauge tables:
+**File:** `4_organize_areas.py`
+**Does:**
 
-  * `<AREA>/water_gauges/eden_gauges.csv`
-  * `<AREA>/water_gauges/eden_metadata.csv`
-* Clips each vertical displacement raster by each water area polygon, **requiring coverage** (default ≥ 65%) and not all-NaN. DEM/CORR tags are embedded to avoid overwrites.
-* Writes a **coverage report** CSV.
+1. Builds **per-area EDEN** “water above ground (cm)” tables + metadata under `<AREA>/water_gauges/`.
+2. For each vertical raster under `…/inspect/vertical_displacement_cm_<REF>_<SEC>_{RAW|IONO|TROPO|TROPO_IONO}.geo.tif`, clips by *(valid-data footprint ∩ area polygon)* and writes per-area **TIFF + PNG** if coverage ≥ threshold.
+3. Writes global **coverage report** CSV.
 
-**Usage**
+**Outputs:**
+
+* `<AREA>/water_gauges/eden_gauges.csv`, `eden_metadata.csv`
+* `<AREA>/interferograms/<AREA>_vertical_cm_<REF>_<SEC>_<DEM>_<CORR>.{tif,png}`
+* `processing/areas/_reports/coverage_report.csv`
+
+**Run**
 
 ```bash
-# Global search for */inspect/vertical_displacement_cm_*.geo.tif under VERT_ROOT
-python 4_organize_areas.py
-
-# One file
-python 4_organize_areas.py --vertical-file /path/to/vertical_displacement_cm_..._RAW.geo.tif
-
-# One pair directory (searches its inspect/)
+python 4_organize_areas.py                      # global search
+python 4_organize_areas.py --min-coverage-pct 50.0
 python 4_organize_areas.py --pair-dir /mnt/DATA2/.../path150_20071216_20080131_SRTM
-
-# Change coverage threshold
-python 4_organize_areas.py --min-coverage-pct 50
-```
-
-**Outputs**
-
-```
-/mnt/DATA2/.../processing/areas/<AREA>/
-├─ water_gauges/
-│  ├─ eden_gauges.csv
-│  └─ eden_metadata.csv
-├─ interferograms/
-│  ├─ <AREA>_vertical_cm_<REF_SEC>_<DEM>_<CORR>.tif
-│  └─ <AREA>_vertical_cm_<REF_SEC>_<DEM>_<CORR>.png
-└─ _reports/coverage_report.csv
 ```
 
 ---
 
-### 5\_accuracy\_assessment.py — Shared-split metrics + per-pair TIFFs
+### 5) Accuracy (DEM × Corr) at Multiple Densities
 
-For each **AREA** (or a single area):
+**File:** `5_accuracy_assessment_dem_corr.py`
+**Does:**
 
-* Discovers per-area interferograms:
+* For each `(AREA, PAIR, DEM, CORR)` and **four calibration densities (60/45/30/15%)**, computes LS metrics (RMSE, MAE, bias, σₑ, r) and an **IDW(Δh_vis)** baseline on identical splits.
+* From replicate #1 at **60%**: exports **IDW Δh_vis** grid, **calibrated** rasters, and **60/40 split** GeoJSON.
 
-  ```
-  <AREA>/interferograms/<AREA>_vertical_cm_<REF>_<SEC>_<DEM>_<CORR>.tif
-  ```
-* Loads per-area gauge table; computes **Δh\_vis** = max(sec,0) − max(ref,0) (cm).
-* Samples **every raster** at gauges (3×3 mean).
-* Builds the **common gauge set** valid across **all** DEM/CORR rasters for the pair.
-* Creates **replicate plans** (default 50) with:
+**Output:** `<AREA>/results/accuracy_metrics.csv` (+ GeoTIFFs/GeoJSON from replicate #1)
 
-  * \~60% **farthest-point** calibration (spread), rest validation.
-  * Iteratively remove crowded calibration points down to n\_cal=2; then **center-only** n\_cal=1.
-  * Evaluate:
-
-    * **least\_squares** (y = a·x + b; force a=−1 for n\_cal≤2)
-    * **idw\_dhvis** (IDW on Δh\_vis at validation gauges)
-* **Per pair**, writes **4 GeoTIFFs** (using replicate #1 plan):
-
-  1. `idw60_<PAIR>.tif` (Δh\_vis, 60% cal)
-  2. `cal_ti_60pct_<DEMsel>_<PAIR>.tif` (TROPO\_IONO, 60% cal)
-  3. `cal_ti_d{D}_<DEMsel>_<PAIR>.tif` (TROPO\_IONO, n\_cal closest to target density)
-  4. `cal_ti_1g_<DEMsel>_<PAIR>.tif` (TROPO\_IONO, center-only)
-
-**Usage**
+**Run**
 
 ```bash
-# All areas (defaults: DEMS=SRTM 3DEP; CORRS=RAW TROPO IONO TROPO_IONO)
-python 5_accuracy_assessment.py
-
-# One area
-python 5_accuracy_assessment.py --area ENP
-
-# Tuning
-python 5_accuracy_assessment.py \
-  --reps 50 --seed 42 --idw-power 2.0 --output-density 500 \
+python 5_accuracy_assessment_dem_corr.py --reps 200 --seed 42 \
   --dems SRTM 3DEP --corrs RAW TROPO IONO TROPO_IONO
 ```
 
-**Output CSV (fresh each run)**
-
-```
-<AREA>/results/accuracy_metrics.csv
-```
-
-One row per (replicate, n\_cal, DEM/CORR, method) with:
-`area, pair_ref, pair_sec, dem, corr, method, replicate, n_total, n_cal, n_val, area_km2, area_per_gauge_km2, rmse_cm, mae_cm, bias_cm, r, a_gain, b_offset_cm`.
-
 ---
 
-### 6\_visualization.py — Figures (accuracy vs density, period plots)
+### 6) Inferential Tests (Corrections & DEMs)
 
-Builds publication-ready figures **from** `accuracy_metrics.csv` and per-pair TIFFs.
+**File:** `6_inferential_tests.py`
+**Corrections (two tracks):**
 
-**What it makes**
+1. *WITH IDW*: RAW, IONO, TROPO, TROPO_IONO, **IDW**
+2. *NO IDW*: RAW, IONO, TROPO, TROPO_IONO
 
-1. **Per-PAIR** acc-vs-density with **clipped 5–95% bands**, SRTM & 3DEP LS + IDW; bottom row shows:
+* Per-pair repeated-measures ANOVA; per-pair paired t-tests (Holm adjusted).
+* Area-level & all-areas ANOVA; **ranking** tables (with-IDW).
 
-   * 60% calibrated TROPO\_IONO map
-   * 60% IDW(Δh\_vis) map
-     → `<AREA>/results/acc_den_pair_<PAIR>.png`
-2. **Per-AREA** acc-vs-density (all pairs), optional **median/mean** lines
-   → `<AREA>/results/acc_den_area_<AREA>.png`
-3. **ALL-AREAS** acc-vs-density
-   → `<areas_root>/results/acc_den_ALL_AREAS.png`
-4. **Per-AREA** time-series boxplots (IDW • TROPO\_IONO at target density), per-DEM & combined
-   → `<AREA>/results/acc_period_*.png`
-5. **ALL-AREAS** time-series (IDW • TROPO\_IONO at target density)
-   → `<areas_root>/results/acc_period_ALL_AREAS_<D>.png`
+**DEMs:** SRTM vs 3DEP for a chosen correction (default RAW) with paired t-tests at pair/area/all-areas.
 
-**Usage**
+**Outputs (per area + all areas):**
+A set of CSVs including `corrections_*anova__{with_idw|no_idw}.csv`, `*_ranking__with_idw.csv`, `dem_*ttest__<CORR>.csv`, and summaries.
+
+**Run**
 
 ```bash
-# Everything
-python 6_visualization.py
-
-# One area; change IDW density DEM, hide mean
-python 6_visualization.py --area ENP --idw-dem-density SRTM --no-show-mean
-
-# Set target density for period plots (km²/gauge)
-python 6_visualization.py --target-density 500
+python 6_inferential_tests.py
+python 6_inferential_tests.py --area ENP
+python 6_inferential_tests.py --metric log_rmse_cm
+python 6_inferential_tests.py --dem-corr IONO
 ```
 
 ---
 
-## Helper Modules
+### 7) Density Study (SRTM+RAW)
 
-* **help\_xml\_isce.py**
-  Build a minimal `stripmapApp.xml` for ALOS with sensible defaults (multilooks, split-spectrum, two-stage unwrap, dense offsets, etc.). Detects **FBD/FBS** and sets `RESAMPLE_FLAG=dual2single` for **FBD**.
+**File:** `7_accuracy_assessment_density.py`
 
-* **help\_xml\_dem.py**
-  Convert DEM GeoTIFF → ISCE: reproject to WGS-84 (EPSG:4326) if needed, run `gdal_translate -of ISCE`, and generate ISCE XML (`gdal2isce_xml`). Writes a small **DEM report**.
+**Does:**
 
-* **help\_atm\_correction.py**
-  `do_iono_correction(...)` subtracts dispersive (ionospheric) phase; writes corrected and rewrapped products.
-  `do_tropo_correction(...)` runs the **GACOS** troposphere workflow: `.rsc→.hdr`, reproject to IFG grid, zenith→slant using incidence, reference−secondary differential, then subtract from unwrapped IFG.
+* Locks to each pair’s `…_SRTM_RAW.tif` (shared valid-data mask across steps).
+* Evaluates **least_squares (LS)** and **IDW** on **identical** gauge sets and **identical** cal/val splits.
+* Starts near **60%** calibration using **stochastic farthest-point**, then steps down one by one, with the **validation set fixed**.
+* Records per-step metrics (`rmse_cm`, `mae_cm`, `bias_cm`, `r`, `n_cal`, `n_val`) and **density** = km²(valid swath) / `n_cal`.
+* Exports three sanity-check rasters per pair: `dens_idw60_…`, `dens_cal_60pct_…`, `dens_cal_1g_…` (float32, NaN nodata).
 
-* **help\_show\_fringes.py**
-  `create_fringe_tif(...)` reads `filt_topophase.flat.geo` (complex), computes wrapped phase, writes `FRINGES_*.tif` for quick inspection.
+**Outputs:**
+
+* `<AREA>/results/accuracy_metrics_density_SRTM_RAW.csv`
+* Per-pair GeoTIFFs:
+
+  * `dens_idw60_SRTM_RAW_<PAIR>.tif`
+  * `dens_cal_60pct_SRTM_RAW_<PAIR>.tif`
+  * `dens_cal_1g_SRTM_RAW_<PAIR>.tif`
+
+**Run**
+
+```bash
+python 7_accuracy_assessment_density.py --reps 50 --seed 42 --spread-top-m 5
+```
+
+**Notes:**
+
+* Increase `--reps` for smoother curves; keep `--seed` for reproducibility.
+* IDW grids and LS exports inherit the SRTM+RAW mask.
+
 
 ---
 
-## Outputs & Naming Conventions
+### 8) Visualizations
 
-**Pair directory**: `path<PATH>_<REF>_<SEC>_<DEM>` where:
+**File:** `8_visualization.py`
+**Produces:**
 
-* `<PATH>`: track (e.g., `150`)
-* `<REF>/<SEC>`: `YYYYMMDD`
-* `<DEM>`: `SRTM` or `3DEP`
-
-**Vertical displacement** (per pair):
-
-```
-interferogram/
-inspect/vertical_displacement_cm_<REF>_<SEC>_{RAW|IONO|TROPO|TROPO_IONO}.geo.tif
-```
-
-**Per-area clipped** rasters:
-
-```
-<AREA>/interferograms/<AREA>_vertical_cm_<REF_SEC>_<DEM>_<CORR>.{tif,png}
-```
-
-**Per-pair figure**:
-
-```
-<AREA>/results/acc_den_pair_<REF_SEC>.png
-```
-
-**Global reports**:
-
-* Status: `/mnt/DATA2/.../interferograms/_reports/path_status.csv`
-* Coverage: `<areas_root>/_reports/coverage_report.csv`
+* **Corrections 2×2** maps (RAW/TROPO/IONO/TROPO+IONO on SRTM) with shared legend, inset, north arrow, scalebar → `corr_maps_pair_<PAIR>.png`
+* **DEM** dual 60% boxplots (TROPO): SRTM vs 3DEP → `dem_boxplots_area_<AREA>_60pct_TROPO.png`
+* **Density RAW per-pair**: RMSE vs density & Bias vs density + bottom row (LS 60%, **AOI square**, IDW 60% with **gauges overlay**) → `density_raw_idw_pair_<PAIR>.png`
 
 ---
 
-## Configuration Notes & Tips
+## Naming Conventions
 
-* **Environment variables**
+* **Pair folders:** `path<PATH>_<REF>_<SEC>_{SRTM|3DEP}` (dates `YYYYMMDD`).
+* **Vertical GeoTIFFs:** `vertical_displacement_cm_<REF>_<SEC>_{RAW|IONO|TROPO|TROPO_IONO}.geo.tif` (under `…/interferogram/inspect/`).
+* **Per-area clips:** `<AREA>_vertical_cm_<REF>_<SEC>_<DEM>_<CORR>.tif`.
+* **Density rasters:**
 
-  * `ISCE_HOME` must point to ISCE2 install (script calls `stripmapApp.py`).
-  * `GDAL_CACHEMAX`: `2_run_pair_conda.py` sets `512` MB by default; bump if RAM allows.
-* **Performance**
+  * `dens_idw60_SRTM_RAW_<PAIR>.tif`
+  * `dens_cal_60pct_SRTM_RAW_<PAIR>.tif`
+  * `dens_cal_1g_SRTM_RAW_<PAIR>.tif`
 
-  * Place `/mnt/DATA2` on fast storage (NVMe/SSD).
-  * Use `--n` to smoke-test a subset before full batch.
-* **Resume mode**
+---
 
-  * `2_run_pair_conda.py --resume` detects core IFG presence and **skips ISCE**, rebuilding `inspect/` only.
-* **Masks**
+## Reproducibility & Logging
 
-  * Swath masks are honored for vertical conversion; off-swath → NaN.
-* **Units**
-
-  * Vertical displacement in **centimeters**, LOS median removed per pair before vertical projection.
+* **Resume-safe** batch in `2_run_insar.py` (`--resume`) checks for `filt_topophase.unw.geo(.vrt)`.
+* **Status log:** `processing/interferograms/_reports/path_status.csv` accumulates attempts & notes.
+* **Coverage report:** `processing/areas/_reports/coverage_report.csv` documents polygon coverage thresholds per clip.
+* **Seeds & knobs:** all stochastic pieces expose `--seed`; farthest-point spread via `--spread-top-m`.
 
 ---
 
 ## Troubleshooting
 
-* **ISCE not found**: ensure `ISCE_HOME` is set and `stripmapApp.py` exists at `$ISCE_HOME/applications/`.
-* **gdal\_translate / gdalwarp not found**: install GDAL via conda-forge and ensure tools are on PATH.
-* **No CEOS files**: check raw layout: `<raw>/path<PATH>/<YYYYMMDD>/` and presence of `LED-*` & `IMG-HH-*`.
-* **Ionosphere/Tropo failures**:
-
-  * IONO: ensure `ionosphere/dispersive.bil.unwCor.filt.geo` and `mask.bil.geo` exist (produced earlier by your iono workflow).
-  * TROPO (GACOS): ensure `<TROPO_DIR>/<YYYYMMDD>.ztd` **and** `.rsc` are present for ref & sec.
-* **No per-area outputs**:
-
-  * Verify `water_areas.geojson` has an `area` field; geometries valid in WGS84.
-  * Increase `--min-coverage-pct` or check raster footprint overlap.
-* **Accuracy CSV empty**:
-
-  * The **common gauge set** may be too small (<3). Check per-area clipped coverage & sampling.
+* **Missing LOS grid** → vertical export is skipped in step 3 (corrections still produced).
+* **DEM binaries (.dem.wgs84/.wgs84.xml)** → ensure GDAL present; re-run step 2 (it auto-creates them).
+* **Path expectations** → scripts assume docstring paths; override via CLI options where available.
+* **Memory** → quicklooks use downsampled reads; further reduce read windows in helpers if needed.
 
 ---
 
-## Reproducibility
+## Quickstart
 
-* Set `--seed` (default **42**) in `5_accuracy_assessment.py` to keep replicate plans stable.
-* `6_visualization.py` reads the **fresh** `accuracy_metrics.csv` per area.
-* DEM conversion is deterministic; reports capture basic stats and metadata.
+```bash
+# 1) Place Vertex ZIPs + CSV under <RAW_DIR>/tmp_downloads/
+python 1_obtaining_sar_data.py
+
+# 2) Run interferograms (3DEP + SRTM)
+python 2_run_insar.py --resume
+
+# 3) Apply corrections + export vertical maps
+python 3_do_corrections.py --batch /mnt/DATA2/bakke326l/processing/interferograms
+
+# 4) Build per-area gauges & clips
+python 4_organize_areas.py
+
+# 5) Accuracy across DEM × Corrections
+python 5_accuracy_assessment_dem_corr.py
+
+# 6) Inferential tests (ANOVA/t-tests)
+python 6_inferential_tests.py
+
+# 7) Density study (SRTM+RAW)
+python 7_accuracy_assessment_density.py
+
+# 8) Figures
+python 8_visualization.py
+```
 
 ---
 
-## License / Acknowledgements
+## Acknowledgements
 
-* This pipeline depends on **ISCE2**, **GDAL**, **snaphu**, and the **GACOS** product.
-* EDEN water‐level data acknowledged for gauge validation.
-* Portions of iono/tropo workflows mirror ISCE2 tutorial patterns.
-* ChatGPT-5 was used for optimizing code, building docstrings and making this README.md file
+* ALOS PALSAR via ASF/Vertex.
+* ISCE2 (JPL/Caltech) for interferometric processing.
+* EDEN gauge network for water-level validation.
+* GACOS for tropospheric delay products.
 
 ---
 
+## License & Citation
+
+* **License:** not specified (default: all rights reserved by the author unless indicated otherwise).
+* **Cite as:**
+  Jack Bakker (2025), *Assessing Data Availability Impact for InSAR Monitoring of Wetland Water Levels: Everglades, ALOS PALSAR*, MSc Thesis, WUR.
