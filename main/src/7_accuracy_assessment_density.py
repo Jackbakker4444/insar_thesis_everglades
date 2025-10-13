@@ -12,15 +12,14 @@ identical gauge sets and splits at every step**:
   • **RAW (least_squares)** — affine calibration of InSAR → Δh_vis on calibration gauges
   • **IDW (gauge-only baseline)** — inverse-distance interpolation of Δh_vis (no raster)
 
-The calibration subset begins around **60%** of usable gauges selected with a
-**stochastic farthest-point** strategy and then is marched down to **2 gauges** and
-finally **1 gauge** (the centroid-closest station), keeping the validation set fixed.
-At each step we log accuracy metrics and the implied **density** (km²/gauge), where the
-km² refers to the valid-data footprint of the SRTM+RAW raster.
-
-Knee (critical-density) points are computed **only for least_squares** and for both
-**RMSE** and **bias** (|bias| by default) via a two-segment (single-break) linear fit
-applied to **binned** median curves (fine bins at low density; coarser at high density).
+The workflow is:
+  1) Randomly split usable gauges into **60% calibration** and **40% validation**.
+     The validation set remains **fixed and independent** throughout.
+  2) Perform a sweep in which the calibration set is reduced **one gauge at a time** by
+     iteratively removing the **closest (most crowded) calibration gauge** based on
+     nearest-neighbor distance within the current calibration set, down to **1 gauge**.
+  3) At each step we log accuracy metrics and the implied **density** (km²/gauge), where
+     the km² refers to the valid-data footprint of the SRTM+RAW raster.
 
 Inputs & outputs
 ----------------
@@ -30,8 +29,6 @@ Per AREA directory (under --areas-root):
     • interferograms/<AREA>_vertical_cm_<REF>_<SEC>_SRTM_RAW.tif
   Output (in <AREA>/results)
     • accuracy_metrics_density_SRTM_RAW.csv
-    • critical_density_pairs_SRTM_RAW.csv       (pair-level knees; LS only)
-    • critical_density_area_SRTM_RAW.csv        (area-level summary of knees)
     • GeoTIFFs per pair:
         - dens_idw60_SRTM_RAW_<PAIR>.tif        (IDW Δh_vis from 60% cal gauges)
         - dens_cal_60pct_SRTM_RAW_<PAIR>.tif    (LS-calibrated raster using 60% gauges)
@@ -45,8 +42,7 @@ One area (e.g., ENP):
   python 7_accuracy_assessment_density.py --area ENP
 Tuning:
   python 7_accuracy_assessment_density.py --reps 50 --seed 42 --idw-power 2.0 \
-    --knee-bins "0:600:25,600:3000:200" --knee-bootstrap 300 --knee-slope-floor 0.002 \
-    --spread-top-m 5
+    --spread-top-m 5   # (deprecated; no effect)
 
 Design guarantees
 -----------------
@@ -69,10 +65,9 @@ Dependencies
 
 Notes for reviewers
 -------------------
-• **No executable logic has been changed**: the edits are limited to
-  docstrings and explanatory comments as requested.
-• Randomness is controlled via --seed and the stochastic farthest-point parameter
-  --spread-top-m.
+• Initial split is **random 60/40 (cal/val)** to ensure independence of validation.
+• The calibration sweep removes the **closest** (most crowded) gauge at each step.
+• Randomness is controlled via --seed.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -101,16 +96,6 @@ CORR_FIXED              = "RAW"
 REPS_DEFAULT            = 100
 SEED_DEFAULT            = 42
 IDW_POWER_DEFAULT       = 2.0
-
-# Stochastic farthest-point selection
-SPREAD_TOP_M_DEFAULT    = 5       # pick randomly among top-M farthest at each add step
-
-# “Elbow” (critical density) detector defaults
-KNEE_BOOTSTRAP_DEFAULT   = 300     # resamples (replicate-bootstrap)
-KNEE_SLOPE_FLOOR_DEFAULT = 0.002   # cm per (km²/gauge): require slope_right >= slope_left + floor
-KNEE_MIN_SEG_POINTS      = 3       # at least 3 points per segment
-KNEE_MIN_TOTAL_POINTS    = 6       # need >=6 median points along the curve
-KNEE_BINS_DEFAULT        = "0:600:25,600:3000:200"  # mixed bins: fine then coarse
 
 # Gauge columns
 ID_COL, LAT_COL, LON_COL = "StationID", "Lat", "Lon"
@@ -148,7 +133,7 @@ def _find_pairs_for_dem_corr(area_dir: Path, area_name: str, dem: str, corr: str
     Files must match the strict name pattern used by this project.
     """
     patt = re.compile(
-        rf"^{re.escape(area_name)}_vertical_cm_(\d{{8}}_\d{{8}})_{re.escape(dem)}_{re.escape(corr)}\\.tif$",
+        rf"^{re.escape(area_name)}_vertical_cm_(\d{{8}}_\d{{8}})_{re.escape(dem)}_{re.escape(corr)}\.tif$",
         re.I,
     )
     folder = area_dir / "interferograms"
@@ -302,38 +287,12 @@ def _haversine_matrix(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
     a = np.clip(np.sin(lat)[:,None]*np.sin(lat)[None,:] + np.cos(lat)[:,None]*np.cos(lat)[None,:]*np.cos(dlon), -1.0, 1.0)
     return 6371000.0 * np.arccos(a)
 
-def _spread_selection_stochastic(lon: np.ndarray, lat: np.ndarray, k: int,
-                                 rng: np.random.Generator, top_m: int = SPREAD_TOP_M_DEFAULT) -> np.ndarray:
-    """
-    Stochastic farthest-point sampling to select k well-spread indices.
-    - Start at a random seed point.
-    - Iteratively add: compute each candidate's distance to its nearest selected point,
-      sort by that min-distance (desc), then **pick randomly among the top-M farthest**.
-    """
-    n = len(lon)
-    if k >= n: return np.arange(n, dtype=int)
-    D = _haversine_matrix(lon, lat)
-    cur = [int(rng.integers(0, n))]
-    remaining = set(range(n)) - set(cur)
-    min_d = D[:, cur].min(axis=1)
-    while len(cur) < k:
-        order = np.argsort(-min_d)  # farthest first
-        order = [o for o in order if o in remaining]
-        if not order:
-            break
-        take = order[:min(top_m, len(order))]
-        cand = int(rng.choice(take))
-        cur.append(cand)
-        remaining.remove(cand)
-        min_d = np.minimum(min_d, D[:, cand])
-    return np.array(cur, dtype=int)
-
 def _crowded_candidates(lon: np.ndarray, lat: np.ndarray, idx: np.ndarray,
-                        keep_global: int, top_n: int = 4) -> np.ndarray:
+                        top_n: int = 4) -> np.ndarray:
     """Return the indices (within idx) of the most spatially crowded calibration points.
 
     Used when marching down calibration size: we prefer to drop a point that is
-    redundant (small nearest-neighbor distance) while keeping the global center.
+    redundant (small nearest-neighbor distance).
     """
     if len(idx) <= 1: return idx
     lon_s, lat_s = lon[idx], lat[idx]
@@ -341,8 +300,7 @@ def _crowded_candidates(lon: np.ndarray, lat: np.ndarray, idx: np.ndarray,
     np.fill_diagonal(D, np.inf)
     nnd = np.min(D, axis=1)
     order = np.argsort(nnd)  # smallest NND -> most crowded
-    order = np.array([o for o in order if idx[o] != keep_global], dtype=int)
-    if order.size == 0: return np.array([], dtype=int)
+    if len(order) == 0: return np.array([], dtype=int)
     return order[:min(top_n, order.size)]
 
 # ----------------------------- Model fitting --------------------------------
@@ -419,7 +377,7 @@ def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndar
     """
     Build an IDW Δh_vis grid masked by the SAME valid pixels as the SRTM+RAW raster.
 
-    px/py/pz must come from the RAW run’s calibration indices to preserve consistency.
+    px/py/pz must come from the RAW run's calibration indices to preserve consistency.
     """
     with rasterio.open(ref_tif) as ds:
         H, W = ds.height, ds.width
@@ -467,194 +425,6 @@ def _apply_calibration_to_raster(src_tif: Path, a: float, b: float) -> np.ndarra
         out[valid_mask] = a * arr[valid_mask] + b
         return out
 
-# ============================= Knee (with variable bins) =====================
-def _parse_knee_bins(spec: str) -> np.ndarray:
-    """
-    Parse a bins spec like "150:600:25,600:2000:200" into a strictly increasing
-    array of bin **edges** suitable for pandas.cut.
-
-    Raises ValueError on malformed tokens.
-    """
-    edges: List[float] = []
-    for i, token in enumerate(spec.split(",")):
-        if not token.strip(): continue
-        parts = token.split(":")
-        if len(parts) != 3:
-            raise ValueError(f"Bad knee-bins token '{token}'. Expected start:end:step.")
-        start, end, step = map(float, parts)
-        if step <= 0 or end <= start:
-            raise ValueError(f"Invalid knee-bins range: {token}")
-        arr = np.arange(start, end + 0.5 * step, step, dtype=float)
-        if i > 0 and len(edges) and arr[0] == edges[-1]:
-            arr = arr[1:]  # avoid duplicate
-        edges.extend(arr.tolist())
-    edges = np.unique(np.array(edges))
-    if edges.size < 3:
-        raise ValueError("Bins need at least 3 edges.")
-    return edges
-
-def _binned_curve(df: pd.DataFrame, bins: np.ndarray, metric_col: str, min_per_bin: int = 3) -> pd.DataFrame:
-    """Compute a binned median curve of a metric vs. density (requires min_per_bin per bin)."""
-    d = df.copy()
-    d = d[np.isfinite(d["density_km2_per_gauge"]) & np.isfinite(d[metric_col])]
-    d["dens_bin"] = pd.cut(d["density_km2_per_gauge"], bins=bins, include_lowest=True)
-    g = (d.groupby("dens_bin", observed=True)
-           .agg(x=("density_km2_per_gauge", "mean"),
-                y=(metric_col, "median"),
-                n=(metric_col, "size"))
-           .dropna()
-           .reset_index(drop=True))
-    g = g[g["n"] >= min_per_bin].sort_values("x").reset_index(drop=True)
-    return g
-
-def _two_segment_break(x, y, min_seg=KNEE_MIN_SEG_POINTS, slope_floor=KNEE_SLOPE_FLOOR_DEFAULT):
-    """
-    One-break, two-segment linear model selection.
-
-    Enforces that the right-segment slope is at least `slope_floor` larger than the left
-    (i.e., improvement slows down after the break), then picks the **earliest** break
-    whose SSE is within +5% of the minimum.
-
-    Returns a dict with keys {i, x0, sse, sl, sr} or None if no valid break.
-    """
-    x = np.asarray(x, float); y = np.asarray(y, float)
-    order = np.argsort(x)
-    x, y = x[order], y[order]
-    cands = []
-    for i in range(min_seg, len(x) - min_seg + 1):
-        sl, il = np.polyfit(x[:i], y[:i], 1);  yhat_l = sl * x[:i] + il;  sse_l = np.sum((y[:i] - yhat_l) ** 2)
-        sr, ir = np.polyfit(x[i-1:], y[i-1:], 1); yhat_r = sr * x[i-1:] + ir; sse_r = np.sum((y[i-1:] - yhat_r) ** 2)
-        sse = sse_l + sse_r
-        cands.append({"i": i-1, "x0": x[i-1], "sse": sse, "sl": sl, "sr": sr})
-    cands = [c for c in cands if c["sr"] >= c["sl"] + slope_floor]
-    if not cands:
-        return None
-    sse_min = min(c["sse"] for c in cands)
-    near = [c for c in cands if c["sse"] <= 1.05 * sse_min]
-    best = sorted(near, key=lambda c: c["x0"])[0]
-    return best
-
-def _bootstrap_break_bins(df_pair: pd.DataFrame, bins: np.ndarray, metric_col: str, B=KNEE_BOOTSTRAP_DEFAULT,
-                          min_total_pts=KNEE_MIN_TOTAL_POINTS, min_seg=KNEE_MIN_SEG_POINTS,
-                          slope_floor=KNEE_SLOPE_FLOOR_DEFAULT) -> Tuple[float,float,float]:
-    """Bootstrap the breakpoint location on the binned curve to obtain a 95% CI."""
-    boot = []
-    has_rep = "replicate" in df_pair.columns
-    if has_rep:
-        reps = df_pair["replicate"].unique()
-    rng = np.random.default_rng(42)
-    for _ in range(B):
-        if has_rep:
-            samp = rng.choice(reps, size=len(reps), replace=True)
-            d = pd.concat([df_pair[df_pair["replicate"] == r] for r in samp], ignore_index=True)
-        else:
-            d = df_pair.sample(frac=1.0, replace=True, random_state=int(rng.integers(0, 2**31-1)))
-        cur = _binned_curve(d, bins=bins, metric_col=metric_col, min_per_bin=3)
-        if len(cur) < min_total_pts:
-            continue
-        br = _two_segment_break(cur["x"].to_numpy(), cur["y"].to_numpy(),
-                                min_seg=min_seg, slope_floor=slope_floor)
-        if br:
-            boot.append(br["x0"])
-    if not boot:
-        return (np.nan, np.nan, np.nan)
-    lo, med, hi = np.nanpercentile(boot, [2.5, 50, 97.5])
-    return (med, lo, hi)
-
-def compute_breakpoints_for_area_LS(df_area: pd.DataFrame, bins: np.ndarray, slope_floor: float, B: int, use_abs_bias: bool) -> pd.DataFrame:
-    """
-    Compute critical-density breakpoints **only for LS** for RMSE and bias.
-
-    Returns one row per (area, pair_ref, pair_sec, method=least_squares) containing
-    the break location, value at the break, segment slopes, and a bootstrap CI.
-    """
-    rows = []
-    df_ls = df_area[df_area["method"] == "least_squares"].copy()
-    if df_ls.empty:
-        return pd.DataFrame(columns=[
-            "area","pair_ref","pair_sec","method",
-            "critical_density_rmse_km2_per_g","critical_rmse_cm","critical_slope_rmse_left","critical_slope_rmse_right","critical_ci95_rmse_lo","critical_ci95_rmse_hi",
-            "critical_density_bias_km2_per_g","critical_bias_cm","critical_slope_bias_left","critical_slope_bias_right","critical_ci95_bias_lo","critical_ci95_bias_hi",
-        ])
-    keys = df_ls[["area","pair_ref","pair_sec"]].drop_duplicates()
-    bias_col = "bias_cm"
-    for ar, ref, sec in keys.itertuples(index=False, name=None):
-        dfp = df_ls[(df_ls["area"]==ar) & (df_ls["pair_ref"]==ref) & (df_ls["pair_sec"]==sec)]
-
-        # ---------- RMSE ----------
-        cur_r = _binned_curve(dfp, bins=bins, metric_col="rmse_cm", min_per_bin=3)
-        rm = {"critical_density_rmse_km2_per_g": np.nan, "critical_rmse_cm": np.nan,
-              "critical_slope_rmse_left": np.nan, "critical_slope_rmse_right": np.nan,
-              "critical_ci95_rmse_lo": np.nan, "critical_ci95_rmse_hi": np.nan}
-        if len(cur_r) >= KNEE_MIN_TOTAL_POINTS:
-            br_r = _two_segment_break(cur_r["x"].to_numpy(), cur_r["y"].to_numpy(),
-                                      min_seg=KNEE_MIN_SEG_POINTS, slope_floor=slope_floor)
-            if br_r:
-                ix = int(np.argmin(np.abs(cur_r["x"].to_numpy() - br_r["x0"])))
-                rm.update({
-                    "critical_density_rmse_km2_per_g": float(br_r["x0"]),
-                    "critical_rmse_cm": float(cur_r["y"].iloc[ix]),
-                    "critical_slope_rmse_left": float(br_r["sl"]),
-                    "critical_slope_rmse_right": float(br_r["sr"]),
-                })
-                med, lo, hi = _bootstrap_break_bins(dfp, bins=bins, metric_col="rmse_cm", B=B, slope_floor=slope_floor)
-                rm["critical_ci95_rmse_lo"] = lo
-                rm["critical_ci95_rmse_hi"] = hi
-
-        # ---------- BIAS ----------
-        dfp_bias = dfp.copy()
-        if use_abs_bias:
-            dfp_bias["bias_use_cm"] = np.abs(dfp_bias[bias_col].astype(float))
-        else:
-            dfp_bias["bias_use_cm"] = dfp_bias[bias_col].astype(float)
-
-        cur_b = _binned_curve(dfp_bias, bins=bins, metric_col="bias_use_cm", min_per_bin=3)
-        bm = {"critical_density_bias_km2_per_g": np.nan, "critical_bias_cm": np.nan,
-              "critical_slope_bias_left": np.nan, "critical_slope_bias_right": np.nan,
-              "critical_ci95_bias_lo": np.nan, "critical_ci95_bias_hi": np.nan}
-        if len(cur_b) >= KNEE_MIN_TOTAL_POINTS:
-            br_b = _two_segment_break(cur_b["x"].to_numpy(), cur_b["y"].to_numpy(),
-                                      min_seg=KNEE_MIN_SEG_POINTS, slope_floor=slope_floor)
-            if br_b:
-                ix = int(np.argmin(np.abs(cur_b["x"].to_numpy() - br_b["x0"])))
-                bm.update({
-                    "critical_density_bias_km2_per_g": float(br_b["x0"]),
-                    "critical_bias_cm": float(cur_b["y"].iloc[ix]),
-                    "critical_slope_bias_left": float(br_b["sl"]),
-                    "critical_slope_bias_right": float(br_b["sr"]),
-                })
-                med, lo, hi = _bootstrap_break_bins(dfp_bias, bins=bins, metric_col="bias_use_cm", B=B, slope_floor=slope_floor)
-                bm["critical_ci95_bias_lo"] = lo
-                bm["critical_ci95_bias_hi"] = hi
-
-        rows.append({
-            "area": ar, "pair_ref": ref, "pair_sec": sec, "method": "least_squares",
-            **rm, **bm
-        })
-    return pd.DataFrame(rows)
-
-def summarize_critical_by_area_dual(df_bp: pd.DataFrame) -> pd.DataFrame:
-    """Summarize pair-level knees to area-level medians and IQRs (RMSE & bias)."""
-    if df_bp.empty:
-        return pd.DataFrame(columns=[
-            "area","method","pairs",
-            "rmse_critical_density_median","rmse_critical_density_IQR_lo","rmse_critical_density_IQR_hi",
-            "bias_critical_density_median","bias_critical_density_IQR_lo","bias_critical_density_IQR_hi",
-        ])
-    def q25(s): return np.nanpercentile(s, 25)
-    def q75(s): return np.nanpercentile(s, 75)
-    g = (df_bp.groupby(["area","method"], as_index=False)
-             .agg(
-                 pairs=("critical_density_rmse_km2_per_g","size"),
-                 rmse_critical_density_median=("critical_density_rmse_km2_per_g","median"),
-                 rmse_critical_density_IQR_lo=("critical_density_rmse_km2_per_g", q25),
-                 rmse_critical_density_IQR_hi=("critical_density_rmse_km2_per_g", q75),
-                 bias_critical_density_median=("critical_density_bias_km2_per_g","median"),
-                 bias_critical_density_IQR_lo=("critical_density_bias_km2_per_g", q25),
-                 bias_critical_density_IQR_hi=("critical_density_bias_km2_per_g", q75),
-             ))
-    return g
-
 # ============================= Core per-pair run =============================
 def _evaluate_pair_single_raster_and_exports(
     area_dir: Path,
@@ -667,14 +437,14 @@ def _evaluate_pair_single_raster_and_exports(
     n_repl: int,
     seed: int,
     idw_power: float,
-    spread_top_m: int,
 ) -> pd.DataFrame:
     """Evaluate one (AREA, PAIR) for the fixed SRTM+RAW raster and export artifacts.
 
-    The initial ~60% calibration set is chosen via stochastic farthest-point selection.
-    We then iteratively **remove** crowded calibration gauges (keeping the centroid
-    station out of the pool) to generate a full accuracy-density trajectory, plus a
-    single-gauge endpoint. At each step, **LS and IDW** are computed on the same split.
+    The initial calibration set is a **random 60%** split of usable gauges; the
+    remaining **40%** are held out for validation and remain fixed. We then
+    iteratively **remove** the **closest (most crowded)** calibration gauge to
+    generate a full accuracy-density trajectory down to **1 gauge**. At each step,
+    **LS and IDW** are computed on the same split.
     """
 
     results_dir = area_dir / "results"
@@ -731,45 +501,32 @@ def _evaluate_pair_single_raster_and_exports(
     lon_all = pts[LON_COL].to_numpy(float)
     lat_all = pts[LAT_COL].to_numpy(float)
     insar_all = pts["insar_cm"].to_numpy(float)
-    dh_all = g.set_index(ID_COL).loc[common_ids_sorted, "dh_cm"].to_numpy(dtype=float)
-
-    # Center (closest to centroid)
-    lon_c, lat_c = float(lon_all.mean()), float(lat_all.mean())
-    _, _, d_center = GEOD.inv(np.full_like(lon_all, lon_c), np.full_like(lat_all, lat_c), lon_all, lat_all)
-    center_idx_global = int(np.argmin(d_center))
+    dh_all = pts["dh_cm"].to_numpy(float)
 
     rng_master = np.random.default_rng(seed)
     records: List[Dict[str, float]] = []
-    export_plan = None
+    export_plan = {}
 
     for rep in range(1, n_repl + 1):
         rng = np.random.default_rng(rng_master.integers(0, 2**31-1))
         all_idx = np.arange(N, dtype=int)
-        available_idx = np.setdiff1d(all_idx, np.array([center_idx_global]), assume_unique=False)
 
-        # Initial ~60% calibration (stochastic farthest-point)
-        n_cal0 = max(1, int(round(0.60 * len(available_idx))))
-        n_cal0 = min(n_cal0, len(available_idx))
-        cal_local = _spread_selection_stochastic(
-            lon_all[available_idx], lat_all[available_idx], n_cal0, rng=rng, top_m=spread_top_m
-        )
-        cal_idx = available_idx[cal_local]
-        val_idx = np.setdiff1d(available_idx, cal_idx, assume_unique=False)
-
-        # Ensure validation not empty for tiny N
-        if len(val_idx) == 0 and len(cal_idx) >= 2:
-            crowded = _crowded_candidates(lon_all, lat_all, cal_idx, keep_global=center_idx_global, top_n=4)
-            move_pos = crowded[0] if crowded.size else 0
-            val_idx = np.r_[val_idx, [cal_idx[move_pos]]]
-            cal_idx = np.delete(cal_idx, move_pos)
+        # ---- Random 60/40 split (calibration/validation) ----
+        n_cal0 = max(1, int(round(0.60 * N)))
+        n_cal0 = min(n_cal0, N - 1)  # ensure validation non-empty
+        perm = rng.permutation(all_idx)
+        cal_idx = np.sort(perm[:n_cal0])
+        val_idx = np.sort(perm[n_cal0:])
 
         # Save export plan (replicate #1)
         if rep == 1:
-            export_plan = {"cal60_idx": cal_idx.copy(), "val_idx": val_idx.copy()}
+            export_plan["cal60_idx"] = cal_idx.copy()
+            export_plan["val_idx"] = val_idx.copy()
+            export_plan["single_idx"] = None  # to be filled when len(cur_idx)==1
 
-        # March down to 2 gauges: LS + IDW (same cal/val each step)
+        # ---- March down to 1 gauge: LS + IDW (same cal/val each step) ----
         cur_idx = cal_idx.copy()
-        while len(cur_idx) >= 2:
+        while len(cur_idx) >= 1:
             stack_idx = np.r_[cur_idx, val_idx]
             pts_split = pd.DataFrame({
                 ID_COL: [common_ids_sorted[i] for i in stack_idx],
@@ -796,31 +553,14 @@ def _evaluate_pair_single_raster_and_exports(
             records.append({**base_common, "method": "least_squares", **mm["least_squares"]})
             records.append({**base_common, "method": "idw_dhvis",    **mm["idw_dhvis"], "a_gain": np.nan, "b_offset_cm": np.nan})
 
-            crowded = _crowded_candidates(lon_all, lat_all, cur_idx, keep_global=center_idx_global, top_n=4)
-            drop_pos = int(rng.choice(crowded)) if crowded.size else 0
+            if len(cur_idx) == 1:
+                if rep == 1:
+                    export_plan["single_idx"] = int(cur_idx[0])
+                break
+
+            crowded = _crowded_candidates(lon_all, lat_all, cur_idx, top_n=1)
+            drop_pos = int(crowded[0]) if crowded.size else 0
             cur_idx = np.delete(cur_idx, drop_pos)
-
-        # Single-gauge (center) — LS + IDW (same val set)
-        stack_idx_1 = np.r_[ [center_idx_global], val_idx ]
-        pts_1 = pd.DataFrame({
-            ID_COL: [common_ids_sorted[i] for i in stack_idx_1],
-            LON_COL: lon_all[stack_idx_1],
-            LAT_COL: lat_all[stack_idx_1],
-            "insar_cm": insar_all[stack_idx_1],
-            "dh_cm": dh_all[stack_idx_1],
-        }).set_index(ID_COL)
-
-        mm1 = _eval_ls_and_idw(pts_1, np.array([0], dtype=int), np.arange(1, pts_1.shape[0]), idw_power=idw_power)
-
-        base_1 = {
-            "area": area_name, "pair_ref": _pair_dates_from_tag(pair_tag)[0], "pair_sec": _pair_dates_from_tag(pair_tag)[1],
-            "dem": dem, "corr": corr, "replicate": rep,
-            "n_total": N, "n_cal": 1, "n_val": int(len(val_idx)),
-            "area_km2": float(area_km2),
-            "density_km2_per_gauge": float(area_km2) / 1.0,
-        }
-        records.append({**base_1, "method": "least_squares", **mm1["least_squares"]})
-        records.append({**base_1, "method": "idw_dhvis",    **mm1["idw_dhvis"], "a_gain": np.nan, "b_offset_cm": np.nan})
 
     # -------------------------- Per-pair GeoTIFFs ---------------------------
     try:
@@ -843,7 +583,10 @@ def _evaluate_pair_single_raster_and_exports(
         print(f"  ⚠️  Calibrated (60%) failed for {pair_tag}: {e}")
 
     try:
-        a1, b1 = _fit_ls_params(insar_all[[center_idx_global]], dh_all[[center_idx_global]])
+        single_idx = export_plan.get("single_idx", None)
+        if single_idx is None:
+            raise RuntimeError("Single-gauge index not recorded.")
+        a1, b1 = _fit_ls_params(insar_all[[single_idx]], dh_all[[single_idx]])
         arr1 = _apply_calibration_to_raster(raster_tif, a1, b1)
         out_cal1 = results_dir / f"dens_cal_1g_{dem}_{corr}_{pair_tag}.tif"
         _write_tif_like(raster_tif, out_cal1, arr1)
@@ -855,9 +598,7 @@ def _evaluate_pair_single_raster_and_exports(
 
 # ================================ Area driver ================================
 def _process_area(area_dir: Path,
-                  reps: int, seed: int, idw_power: float,
-                  knee_bootstrap: int, knee_bins_spec: str, knee_slope_floor: float,
-                  bias_signed: bool, spread_top_m: int) -> None:
+                  reps: int, seed: int, idw_power: float) -> None:
     """Process a single AREA: evaluate all SRTM+RAW pairs and write fresh outputs."""
     area_name   = area_dir.name
     dem         = DEM_FIXED
@@ -866,8 +607,6 @@ def _process_area(area_dir: Path,
     gauge_csv   = area_dir / "water_gauges" / "eden_gauges.csv"
     results_dir = area_dir / "results"
     metrics_csv = results_dir / f"accuracy_metrics_density_{dem}_{corr}.csv"
-    pairs_bp_csv= results_dir / f"critical_density_pairs_{dem}_{corr}.csv"
-    area_bp_csv = results_dir / f"critical_density_area_{dem}_{corr}.csv"
 
     if not gauge_csv.exists():
         print(f"⏭️  Gauge CSV missing for {area_name}: {gauge_csv} — skipping area.")
@@ -879,8 +618,6 @@ def _process_area(area_dir: Path,
         return
 
     results_dir.mkdir(parents=True, exist_ok=True)
-    bins = _parse_knee_bins(knee_bins_spec)
-    use_abs_bias = not bias_signed
 
     all_rows = []
     for pair_tag in pairs:
@@ -897,7 +634,6 @@ def _process_area(area_dir: Path,
                 raster_tif=tif,
                 dem=dem, corr=corr,
                 n_repl=reps, seed=seed, idw_power=idw_power,
-                spread_top_m=spread_top_m,
             )
         except Exception as e:
             print(f"  ⚠️  Pair {pair_tag} failed: {e}")
@@ -912,35 +648,6 @@ def _process_area(area_dir: Path,
 
     # Fresh metrics
     df_all = pd.concat(all_rows, ignore_index=True)
-
-    # ---- Compute & inject critical density (LS only) for RMSE and bias ----
-    try:
-        bp_df = compute_breakpoints_for_area_LS(
-            df_area=df_all,
-            bins=bins,
-            slope_floor=knee_slope_floor,
-            B=knee_bootstrap,
-            use_abs_bias=use_abs_bias
-        )
-        if not bp_df.empty:
-            # Merge only into LS rows; IDW rows will retain NaNs in knee columns
-            df_all = df_all.merge(bp_df, on=["area","pair_ref","pair_sec","method"], how="left")
-            bp_df.to_csv(pairs_bp_csv, index=False)
-            print(f"📄 Critical density (LS only; RMSE & bias) → {pairs_bp_csv}  (rows: {len(bp_df)})")
-            area_sum = summarize_critical_by_area_dual(bp_df)
-            area_sum.to_csv(area_bp_csv, index=False)
-            print(f"📄 Critical density (area summary; RMSE & bias) → {area_bp_csv}")
-        else:
-            # Ensure columns exist (as NaN) for schema stability
-            for col in [
-                "critical_density_rmse_km2_per_g","critical_rmse_cm","critical_slope_rmse_left","critical_slope_rmse_right","critical_ci95_rmse_lo","critical_ci95_rmse_hi",
-                "critical_density_bias_km2_per_g","critical_bias_cm","critical_slope_bias_left","critical_slope_bias_right","critical_ci95_bias_lo","critical_ci95_bias_hi",
-            ]:
-                df_all[col] = np.nan
-            print("ℹ️  No critical-density breakpoints found for LS in this area.")
-    except Exception as e:
-        print(f"⚠️  Critical-density computation failed: {e}")
-
     df_all.to_csv(metrics_csv, index=False)
     print(f"\n✅ [{area_name}] metrics written (fresh): {metrics_csv}  (rows: {len(df_all)})")
 
@@ -952,16 +659,11 @@ def main():
     ---------
     --reps / --seed :
         Control replicate count and randomness.
-    --spread-top-m :
-        Controls the stochastic farthest-point selection (higher → more randomness).
-    --knee-* :
-        Configure the breakpoint detection, including variable bin edges and
-        the minimum slope increase across the break.
-    --bias-signed :
-        Use signed bias for breakpoint detection (default: absolute |bias|).
+    --idw-power :
+        Controls the inverse-distance weighting power for the IDW baseline.
     """
     ap = argparse.ArgumentParser(
-        description="SRTM+RAW accuracy & density assessment. IDW uses SAME gauges/splits as RAW. Knees computed ONLY for least_squares (RMSE & bias)."
+        description="SRTM+RAW accuracy & density assessment with random 60/40 cal/val split and closest-gauge sweep."
     )
     ap.add_argument("--areas-root", type=str, default=str(AREAS_ROOT_DEFAULT),
                     help="Root folder containing per-area subfolders (default: %(default)s)")
@@ -973,17 +675,6 @@ def main():
                     help="Random seed (default: %(default)s)")
     ap.add_argument("--idw-power", type=float, default=IDW_POWER_DEFAULT,
                     help="IDW power (default: %(default)s)")
-    ap.add_argument("--spread-top-m", type=int, default=SPREAD_TOP_M_DEFAULT,
-                    help="Farthest-point selection: pick randomly among top-M farthest at each add step (default: %(default)s)")
-    # Critical-density detector
-    ap.add_argument("--knee-bootstrap", type=int, default=KNEE_BOOTSTRAP_DEFAULT,
-                    help="Bootstrap resamples for knee CI (default: %(default)s)")
-    ap.add_argument("--knee-bins", type=str, default=KNEE_BINS_DEFAULT,
-                    help="Density bins as 'start:end:step,...' in km²/gauge (default: %(default)s)")
-    ap.add_argument("--knee-slope-floor", type=float, default=KNEE_SLOPE_FLOOR_DEFAULT,
-                    help="Minimum slope increase across breakpoint (cm per km²/gauge) (default: %(default)s)")
-    ap.add_argument("--bias-signed", action="store_true",
-                    help="Use SIGNED bias for knee (default: absolute bias).")
     args = ap.parse_args()
 
     root = Path(args.areas_root)
@@ -995,11 +686,6 @@ def main():
             reps=args.reps,
             seed=args.seed,
             idw_power=args.idw_power,
-            knee_bootstrap=args.knee_bootstrap,
-            knee_bins_spec=args.knee_bins,
-            knee_slope_floor=args.knee_slope_floor,
-            bias_signed=args.bias_signed,
-            spread_top_m=args.spread_top_m,
         )
 
 if __name__ == "__main__":

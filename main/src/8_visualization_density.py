@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 """
-8_visualization.py (density-only)
-=================================
+8_visualization.py (density-only, always writes all-areas figures)
 
-From:
-- 7_accuracy_assessment_density.py   -> <area>/results/accuracy_metrics_density_SRTM_RAW.csv
+Inputs (per area):
+- results/accuracy_metrics_density_<DEM>_<CORR>.csv   (default: SRTM_RAW)
 
-Creates:
-C1) Per-pair density visualization (RAW): RMSE vs density, Bias vs density (no elbows)
-    • Bottom row with three big panels: RAW LS (calibrated), Satellite AOI (middle), RAW IDW
-    • Gauges overlay on all three bottom panels (calibration=black, validation=red)
-    • Tunable vertical distance between curves and bottom maps (--maps-gap-frac)
-    • Tunable bottom-map height (--maps-height-frac)
-    -> <area>/results/density_raw_idw_pair_<PAIR>.png
+Outputs:
+- <area>/results/density_<corr_lower>_idw_pair_<PAIR>.png
+- <areas-root>/results/density_all_areas_by_area_<DEM>_<CORR>_<METHOD>.png
+- <areas-root>/results/density_all_areas_combined_<DEM>_<CORR>_<METHOD>.png
 
-C2) All-areas density vs RMSE overview (RAW):
-    • Scatter of *all* points from all areas
-    • Median line + 5–95% uncertainty band for LS and for IDW
-    -> <areas-root>/results/density_all_areas_raw.png
+What it does:
+- Per-pair Error vs Density (RMSE + Bias) with median ± 5–95% bands (no clipping on Bias),
+  bottom-row maps (LS, Satellite AOI, IDW) with gauge points (cal=black, val=red).
+- All-areas figures (NO DOTS):
+  1) ONE figure with TWO panels (RMSE & Bias): each area as its own median line + 5–95% band.
+  2) ONE figure with TWO panels (RMSE & Bias): all areas combined into a single median line + 5–95% band.
 """
 
 from __future__ import annotations
@@ -88,7 +86,6 @@ GAUGE_NAME_CANDIDATES = [
     "split_*_{pair}.geojson",
 ]
 
-# Quiet noisy libs
 os.environ.setdefault("CPL_DEBUG", "NO")
 for _n in ("rasterio", "rasterio._io", "rasterio.env", "rasterio._base", "matplotlib.font_manager"):
     logging.getLogger(_n).setLevel(logging.ERROR)
@@ -127,20 +124,86 @@ def _ensure_density_column(df: pd.DataFrame) -> pd.DataFrame:
         df["density"] = 1.0 / n; return df
     df["density"] = 1.0; return df
 
-def _read_area_density_metrics(area_dir: Path) -> Optional[pd.DataFrame]:
-    f = area_dir / "results" / "accuracy_metrics_density_SRTM_RAW.csv"
-    if not f.exists(): return None
-    df = pd.read_csv(f)
+def _read_area_density_metrics(area_dir: Path, dem: str, corr: str) -> Optional[pd.DataFrame]:
+    """Read results/accuracy_metrics_density_<DEM>_<CORR>.csv (robust to case); fallback to the first matching file."""
+    resdir = area_dir / "results"
+    target = resdir / f"accuracy_metrics_density_{dem.upper()}_{corr.upper()}.csv"
+    path = None
+    if target.exists():
+        path = target
+    else:
+        hits = sorted(resdir.glob("accuracy_metrics_density_*.csv"))
+        for h in hits:
+            m = re.match(r"accuracy_metrics_density_([A-Z0-9]+)_([A-Z0-9_]+)\.csv", h.name, flags=re.I)
+            if m and m.group(1).upper()==dem.upper() and m.group(2).upper()==corr.upper():
+                path = h; break
+        if path is None and hits:
+            path = hits[0]
+    if path is None: return None
+
+    df = pd.read_csv(path)
     df = _ensure_upper(df)
     df = _ensure_density_column(df)
     for c in ("pair_ref", "pair_sec"):
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce").dt.strftime("%Y-%m-%d")
-    df["pair_tag"] = (
-        df["pair_ref"].str.replace("-", "", regex=False) + "_" +
-        df["pair_sec"].str.replace("-", "", regex=False)
-    )
+    if "pair_tag" not in df.columns and {"pair_ref","pair_sec"}.issubset(df.columns):
+        df["pair_tag"] = (df["pair_ref"].str.replace("-", "", regex=False) + "_" +
+                          df["pair_sec"].str.replace("-", "", regex=False))
     return df
+
+def _agg_curve_by_density(df: pd.DataFrame, value_col: str, nbins: int = 30, min_count: int = 1) -> pd.DataFrame:
+    """
+    Aggregate a curve directly as a function of DENSITY (log-binned):
+      - bins: logspace between global min/max positive density in df
+      - per bin: median, mean, 5–95% of `value_col`, and median density (x)
+    Returns columns: ['bin','n','med','mean','p_low','p_high','med_density']
+    """
+    if df is None or df.empty or value_col not in df.columns:
+        return pd.DataFrame(columns=["bin","n","med","mean","p_low","p_high","med_density"])
+
+    d = _ensure_density_column(df.copy())
+    vals = pd.to_numeric(d[value_col], errors="coerce").to_numpy()
+    den  = pd.to_numeric(d["density"], errors="coerce").to_numpy()
+
+    m = np.isfinite(vals) & np.isfinite(den) & (den > 0)
+    vals, den = vals[m], den[m]
+    if vals.size == 0:
+        return pd.DataFrame(columns=["bin","n","med","mean","p_low","p_high","med_density"])
+
+    dmin, dmax = float(np.min(den)), float(np.max(den))
+    if dmax <= dmin:
+        return pd.DataFrame(columns=["bin","n","med","mean","p_low","p_high","med_density"])
+
+    # Log-spaced bins over the *full* density range in the data
+    edges = np.logspace(np.log10(dmin), np.log10(dmax), nbins + 1)
+    bin_idx = np.digitize(den, edges) - 1  # 0..nbins-1
+
+    rows = []
+    for b in range(nbins):
+        mask = (bin_idx == b)
+        if not mask.any():
+            continue
+        v = vals[mask]; x = den[mask]
+        n = v.size
+        if n < min_count:
+            continue
+        rows.append({
+            "bin": b, "n": n,
+            "med": float(np.nanmedian(v)),
+            "mean": float(np.nanmean(v)),
+            "p_low": float(np.nanpercentile(v, P_LOW)),
+            "p_high": float(np.nanpercentile(v, P_HIGH)),
+            # x-coordinate at this bin: median of sample densities in the bin
+            "med_density": float(np.nanmedian(x))
+        })
+
+    g = pd.DataFrame.from_records(rows)
+    if g.empty:
+        return g
+    g.sort_values("med_density", inplace=True)
+    return g
+
 
 def _read_tif_array(path: Optional[Path]) -> Optional[Tuple[np.ndarray, Tuple[float, float, float, float]]]:
     if not path or not path.exists(): return None
@@ -225,12 +288,8 @@ def _draw_north_arrow(ax, extent: Tuple[float, float, float, float], *, size_fra
                             length_includes_head=True, color="k"))
     ax.text(x, y+size+0.01*dy, "N", ha="center", va="bottom", fontsize=9, color="k")
 
-# =========== Satellite basemap, water & gauges overlays, extents =============
-def _sat_source_label(provider_name: str, xyz_url: str) -> str:
-    if xyz_url: return "Custom XYZ"
-    return {"Esri.WorldImagery": "Esri World Imagery"}.get(provider_name, provider_name)
-
-def _add_basemap(ax, extent: Tuple[float, float, float, float], *, provider_name: str, xyz_url: str):
+# =========== Basemap, water & gauges overlays ===========
+def _add_basemap(ax, extent, *, provider_name: str, xyz_url: str):
     xmin, xmax, ymin, ymax = extent
     ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
     ok = False
@@ -249,8 +308,7 @@ def _add_basemap(ax, extent: Tuple[float, float, float, float], *, provider_name
         ax.text(0.5, 0.5, "Satellite basemap unavailable", transform=ax.transAxes,
                 ha="center", va="center", fontsize=9, color="#444")
 
-def _overlay_water(ax, extent: Tuple[float, float, float, float],
-                   water_path: Optional[str], *, highlight_extent: Optional[Tuple[float,float,float,float]]):
+def _overlay_water(ax, extent, water_path: Optional[str], *, highlight_extent: Optional[Tuple[float,float,float,float]]):
     if not water_path or gpd is None or not Path(water_path).exists(): return
     try:
         w = gpd.read_file(water_path)
@@ -265,18 +323,16 @@ def _overlay_water(ax, extent: Tuple[float, float, float, float],
         pass
 
 def _find_gauges_geojson(area_dir: Path, pair_tag: str, gauges_template: Optional[str]) -> Optional[Path]:
-    # 1) explicit template
     if gauges_template:
         try:
             p = Path(gauges_template.format(area=area_dir.name, pair=pair_tag))
             if p.exists(): return p
         except Exception:
             pass
-    # 2) common candidates inside area/results or area/water_gauges
     for base in (area_dir / "results", area_dir / "water_gauges"):
         for name in GAUGE_NAME_CANDIDATES:
             if "*" in name:
-                hits = sorted((base).glob(name.format(pair=pair_tag)))
+                hits = sorted(base.glob(name.format(pair=pair_tag)))
                 if hits: return hits[0]
             else:
                 p = base / name.format(pair=pair_tag)
@@ -348,70 +404,34 @@ def _legend_note(ax):
     ax.text(0.995, 0.005, "Line: median   Band: 5–95%",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8, color="#333333")
 
-def _init_clip_notes(ax): ax._clip_note_top = ax._clip_note_bot = 0
-
-def _shade_band(ax, x, ylo, yhi, color, *, hatched=False, alpha=0.12, z=1, y_min=None, y_max=None, annotate=False, label_for_note=""):
-    """
-    Fill the uncertainty band. If y_min/y_max are None, no clipping occurs and no annotations are added.
-    """
-    if x is None: return
-    x = np.asarray(x); ylo = np.asarray(ylo, float); yhi = np.asarray(yhi, float)
-    if x.size == 0 or ylo.size == 0 or yhi.size == 0: return
-
-    if y_min is None or y_max is None:
-        ylo_c, yhi_c = ylo, yhi
-    else:
-        ylo_c = np.clip(ylo, y_min, y_max)
-        yhi_c = np.clip(yhi, y_min, y_max)
-
-    face = to_rgba(color, alpha)
-    if hatched:
-        ax.fill_between(x, ylo_c, yhi_c, facecolor=face, edgecolor=to_rgba(color,0.8),
-                        hatch='//', linewidth=0.6, zorder=z)
-    else:
-        ax.fill_between(x, ylo_c, yhi_c, facecolor=face, edgecolor='none', zorder=z)
-
-# ============================ DENSITY (RAW vs IDW) =========================
-def _water_total_bounds(water_path: str) -> Optional[Tuple[float, float, float, float]]:
-    if gpd is None or not water_path or not Path(water_path).exists():
-        return None
-    try:
-        w = gpd.read_file(water_path)
-        minx, miny, maxx, maxy = w.total_bounds
-        dx = max(maxx - minx, 1e-9)
-        dy = max(maxy - miny, 1e-9)
-        padx, pady = 0.02 * dx, 0.02 * dy  # small visual padding
-        return (minx - padx, maxx + padx, miny - pady, maxy + pady)
-    except Exception:
-        return None
-
-def plot_density_pair_raw_vs_idw(
+# ============================ DENSITY (per-pair) =========================
+def plot_density_pair(
     area_dir: Path,
     df7_area: pd.DataFrame,
     pair_tag: str,
     *,
+    dem: str,
+    corr: str,
     water_path: str,
     sat_provider: str,
     sat_url: str,
     gauges_template: str = "",
-    maps_gap_frac: float = 0.018,     # distance between bias plot and map row (fig fraction)
-    maps_height_frac: float = 0.32    # height of the map row (fig fraction)
+    maps_gap_frac: float = 0.1,
+    maps_height_frac: float = 0.32
 ):
-    """Per-pair: RMSE & Bias vs density (median ± 5–95%) — bottom row: RAW LS, Satellite, RAW IDW — with gauges."""
+    """Per-pair: RMSE & Bias vs density (median ± 5–95%) — bottom row: LS, Satellite, IDW — with gauges (no bias clipping)."""
 
     area = area_dir.name
-    corr_label = "RAW"  # this figure is for RAW correction
     ref_iso, sec_iso = _pair_dates_from_tag(pair_tag)
     sub = df7_area[(df7_area["pair_ref"] == ref_iso) & (df7_area["pair_sec"] == sec_iso)].copy()
     if sub.empty:
-        print(f"⏭️  No 7_* rows for {area}:{pair_tag}; skip density pair.")
+        print(f"⏭️  No density rows for {area}:{pair_tag}; skip.")
         return
 
-    # Filter for RAW SRTM, LS & IDW
-    ls  = sub[(sub["method"] == METHOD_LS)  & (sub["dem"] == "SRTM") & (sub["corr"] == "RAW")]
-    idw = sub[(sub["method"] == METHOD_IDW) & (sub["dem"] == "SRTM") & (sub["corr"] == "RAW")]
+    ls  = sub[(sub["method"] == METHOD_LS)  & (sub["dem"] == dem) & (sub["corr"] == corr)]
+    idw = sub[(sub["method"] == METHOD_IDW) & (sub["dem"] == dem) & (sub["corr"] == corr)]
     if ls.empty and idw.empty:
-        print(f"⏭️  No RAW LS/IDW rows for {area}:{pair_tag}.")
+        print(f"⏭️  No {corr} LS/IDW rows for {area}:{pair_tag}.")
         return
 
     rmse_ls  = _agg_curve_metric(ls,  "rmse_cm")  if not ls.empty  else pd.DataFrame()
@@ -422,28 +442,26 @@ def plot_density_pair_raw_vs_idw(
     fig = plt.figure(figsize=(14.0, 11.0), dpi=150, constrained_layout=False)
     top_margin, bottom_margin = 0.93, 0.06
     fig.subplots_adjust(top=top_margin, bottom=bottom_margin)
-
     from matplotlib.gridspec import GridSpec
     gs = GridSpec(nrows=4, ncols=3, height_ratios=[2.6, 2.6, 0.10, 3.6], hspace=0.34, wspace=0.08, figure=fig)
 
-    # ----- Title (requested format) -----
-    fig.suptitle(f"Error vs Density: {area} -- {ref_iso} to {sec_iso} -- {corr_label}",
+    # Title (requested format)
+    fig.suptitle(f"Error vs Density: {area} -- {ref_iso} to {sec_iso} -- {corr}",
                  y=0.965, fontsize=14, fontweight="bold")
 
-    # ---------- RMSE curve ----------
+    # ---------- RMSE ----------
     ax1 = fig.add_subplot(gs[0, :])
     med_max  = max([g["med"].max() for g in (rmse_ls, rmse_idw) if not g.empty] or [1.0])
     band_max = max([np.nanmax(g["p_high"]) if ("p_high" in g) and not g.empty else 0 for g in (rmse_ls, rmse_idw)] + [0])
     y_min, y_max = 0.0, float(max(med_max * 1.15, band_max * 1.05, 1.0))
     for g, lab, col, hat in (
-        (rmse_ls,  "Interferogram (RAW) median", COLORS_DEM["SRTM"], False),
-        (rmse_idw, "IDW (same gauges) median",   COLOR_IDW,         True),
+        (rmse_ls,  f"Interferogram ({corr}) median", COLORS_DEM.get(dem, CB["blue"]), False),
+        (rmse_idw, "IDW (same gauges) median",       COLOR_IDW,                         True),
     ):
         if g.empty: continue
         ax1.plot(g["med_density"], g["med"], "--" if hat else "-", color=col, lw=1.9, label=lab)
-        _shade_band(ax1, g["med_density"], g["p_low"], g["p_high"], col,
-                    hatched=hat, alpha=0.12 if not hat else 0.10, z=1,
-                    y_min=y_min, y_max=y_max, annotate=True, label_for_note=lab)
+        face = to_rgba(col, 0.12 if not hat else 0.10)
+        ax1.fill_between(g["med_density"], g["p_low"], g["p_high"], facecolor=face, edgecolor='none', zorder=1)
     _set_log_xlim_safely(ax1, [g["med_density"].values for g in (rmse_ls, rmse_idw) if not g.empty])
     ax1.set_ylim(y_min, y_max)
     ax1.xaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
@@ -456,19 +474,16 @@ def plot_density_pair_raw_vs_idw(
     ax1.legend(ncols=2, fontsize=9, loc="best")
     _legend_note(ax1)
 
-    # ---------- Bias curve (NO clipping; show all data) ----------
+    # ---------- Bias (NO clipping, show all data) ----------
     ax2 = fig.add_subplot(gs[1, :])
     for g, lab, col, hat in (
-        (bias_ls,  "Interferogram (RAW) median", COLORS_DEM["SRTM"], False),
-        (bias_idw, "IDW (same gauges) median",   COLOR_IDW,         True),
+        (bias_ls,  f"Interferogram ({corr}) median", COLORS_DEM.get(dem, CB["blue"]), False),
+        (bias_idw, "IDW (same gauges) median",       COLOR_IDW,                         True),
     ):
         if g.empty: continue
         ax2.plot(g["med_density"], g["med"], "--" if hat else "-", color=col, lw=1.9, label=lab)
-        # No clipping at all; full band drawn
-        _shade_band(ax2, g["med_density"], g["p_low"], g["p_high"], col,
-                    hatched=hat, alpha=0.12 if not hat else 0.10, z=1,
-                    y_min=None, y_max=None, annotate=False)
-    # Autoscale y (keeps all outliers visible)
+        face = to_rgba(col, 0.12 if not hat else 0.10)
+        ax2.fill_between(g["med_density"], g["p_low"], g["p_high"], facecolor=face, edgecolor='none', zorder=1)
     _set_log_xlim_safely(ax2, [x["med_density"].values for x in (bias_ls, bias_idw) if not x.empty])
     ax2.xaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
     ax2.xaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:g}"))
@@ -480,7 +495,7 @@ def plot_density_pair_raw_vs_idw(
     ax2.legend(ncols=2, fontsize=9, loc="best")
     _legend_note(ax2)
 
-    # ---------- Bottom row maps (anchored to bias axis) ----------
+    # ---------- Bottom row maps ----------
     ax_ls  = fig.add_subplot(gs[3, 0])
     ax_sat = fig.add_subplot(gs[3, 1])
     ax_idw = fig.add_subplot(gs[3, 2])
@@ -490,17 +505,15 @@ def plot_density_pair_raw_vs_idw(
     y_top_maps = max(p_bias.y0 - maps_gap_frac, bottom_margin + 0.01)
     maps_height = min(maps_height_frac, y_top_maps - bottom_margin)
     y0 = y_top_maps - maps_height
-
     ax_ls.set_position([p_ls.x0,  y0, p_ls.width,  maps_height])
     ax_sat.set_position([p_sat.x0, y0, p_sat.width, maps_height])
     ax_idw.set_position([p_idw.x0, y0, p_idw.width, maps_height])
 
-    # ---------- Read and draw maps ----------
-    m_ls  = _find_corr_map(area_dir, "SRTM", "RAW", pair_tag)
-    m_idw = _find_idw_map(area_dir, "SRTM", "RAW", pair_tag)
+    # Read rasters
+    m_ls  = _find_corr_map(area_dir, dem, corr, pair_tag)
+    m_idw = _find_idw_map(area_dir, dem, corr, pair_tag)
     a1 = _read_tif_array(m_ls)
     a2 = _read_tif_array(m_idw)
-
     arrays = [a for a in (a1, a2) if a is not None]
     vmin, vmax = (0.0, 1.0)
     if arrays:
@@ -508,10 +521,10 @@ def plot_density_pair_raw_vs_idw(
         if vv.size:
             vmin, vmax = np.nanpercentile(vv, [2, 98])
 
-    # Load gauges once (if available), reuse for all three panels
+    # Gauges once
     gdf_gauges = None
     try:
-        gj_path = _find_gauges_geojson(area_dir, pair_tag, gauges_template)
+        gj_path = _find_gauges_geojson(area_dir, pair_tag, None)
         if gj_path and gpd is not None:
             gdf_gauges = gpd.read_file(gj_path)
             if getattr(gdf_gauges, "crs", None) and gdf_gauges.crs and gdf_gauges.crs.to_string().upper() not in ("EPSG:4326", "WGS84"):
@@ -522,14 +535,14 @@ def plot_density_pair_raw_vs_idw(
     # LS map
     if a1:
         im = ax_ls.imshow(a1[0], extent=a1[1], origin="upper", cmap=CMAP_INV, vmin=vmin, vmax=vmax)
-        ax_ls.set_title("RAW calibrated", fontsize=10, pad=4)
+        ax_ls.set_title(f"{corr} calibrated", fontsize=10, pad=4)
         _draw_scalebar(ax_ls, a1[1]); _draw_north_arrow(ax_ls, a1[1])
         ax_ls.set_xticks([]); ax_ls.set_yticks([])
         if gdf_gauges is not None: _overlay_gauges(ax_ls, gdf_gauges)
     else:
-        ax_ls.text(0.5, 0.5, "Missing RAW calibrated map", ha="center", va="center"); ax_ls.set_axis_off()
+        ax_ls.text(0.5, 0.5, f"Missing {corr} calibrated map", ha="center", va="center"); ax_ls.set_axis_off()
 
-    # Satellite center (union extent)
+    # Union extent for the satellite panel
     union = None
     if a1 and a2:
         union = (min(a1[1][0], a2[1][0]), max(a1[1][1], a2[1][1]),
@@ -556,7 +569,7 @@ def plot_density_pair_raw_vs_idw(
         ax_idw.set_xticks([]); ax_idw.set_yticks([])
         if gdf_gauges is not None: _overlay_gauges(ax_idw, gdf_gauges)
     else:
-        ax_idw.text(0.5, 0.5, "Missing RAW IDW map", ha="center", va="center"); ax_idw.set_axis_off()
+        ax_idw.text(0.5, 0.5, f"Missing {corr} IDW map", ha="center", va="center"); ax_idw.set_axis_off()
 
     # External colorbars
     cbar_w = 0.015; gap = 0.006
@@ -571,74 +584,245 @@ def plot_density_pair_raw_vs_idw(
         cb2 = plt.colorbar(im2, cax=cax_idw, orientation="vertical", location="right")
         cb2.set_label("cm", fontsize=9); cb2.ax.tick_params(labelsize=8)
 
-    out = area_dir / "results" / f"density_raw_idw_pair_{pair_tag}.png"
+    out = area_dir / "results" / f"density_{corr.lower()}_idw_pair_{pair_tag}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"📈 Density RAW per-pair written: {out}")
+    print(f"📈 Per-pair density figure written: {out}")
 
-# --------- All-areas combined density vs RMSE (scatter + uncertainty) ----------
-def plot_all_areas_density(area7: Dict[str, pd.DataFrame], *, out_dir: Path):
+# --------- All-areas: each area as a separate line (NO DOTS), RMSE & Bias ----------
+# --------- All-areas: each area as a separate line (NO DOTS), RMSE & Bias ----------
+def plot_all_areas_density(area7: Dict[str, pd.DataFrame], *, dem: str, corr: str, method: str, out_dir: Path):
+    """
+    One figure with TWO stacked panels (RMSE on top, Bias below).
+    For the selected method (LS or IDW), each AREA is a separate median line with a 5–95% band.
+    No scatter/dots are drawn.
+    Output: density_all_areas_by_area_<DEM>_<CORR>_<METHOD>.png
+    """
     if not area7:
-        print("⏭️  No areas to combine for all-areas density plot.")
-        return
+        print("⏭️  No areas to combine for all-areas plot."); return
 
+    # Gather & standardize
     frames = []
     for area, df in area7.items():
+        if df is None or df.empty:
+            continue
         d = df.copy()
         d["__area__"] = area
         frames.append(d)
     big = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if big.empty:
-        print("⏭️  All-areas: empty dataset.")
-        return
+        print("⏭️  All-areas: empty dataset."); return
 
+    dem_u, corr_u = dem.upper(), corr.upper()
     big = _ensure_upper(_ensure_density_column(big))
-    sel = big[(big["corr"] == "RAW") & (big["dem"] == "SRTM") & (big["method"].isin([METHOD_LS, METHOD_IDW]))].copy()
+    sel = big[(big["dem"] == dem_u) & (big["corr"] == corr_u) & (big["method"] == method)].copy()
     if sel.empty:
-        print("⏭️  All-areas: no RAW/SRTM rows with LS/IDW.")
-        return
+        print(f"⏭️  All-areas: no rows for DEM={dem_u} CORR={corr_u} METHOD={method}."); return
 
-    ls  = sel[sel["method"] == METHOD_LS]
-    idw = sel[sel["method"] == METHOD_IDW]
-    g_ls  = _agg_curve_metric(ls,  "rmse_cm")
-    g_idw = _agg_curve_metric(idw, "rmse_cm")
+    areas = sorted(sel["__area__"].dropna().unique().tolist())
+    palette = mpl.rcParams['axes.prop_cycle'].by_key().get('color', [
+        "#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
+        "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"
+    ])
+    col_for = {a: palette[i % len(palette)] for i, a in enumerate(areas)}
 
-    fig, ax = plt.subplots(figsize=(12, 8), dpi=150)
-    ax.scatter(sel["density"], sel["rmse_cm"], s=14, alpha=0.20, edgecolors="none", label="All area–pair samples")
+    # Helper: plain number formatter on log axis (no 10^k)
+    def _fmt_plain(v, _):
+        if not np.isfinite(v) or v <= 0: return ""
+        # Show integers when near integer; otherwise compact decimals
+        if abs(v - round(v)) < 1e-9:
+            return f"{int(round(v))}"
+        # keep up to 3 significant digits for decimals like 0.2, 0.3, 0.5, 2.5, 12.5
+        s = f"{v:.3g}".rstrip("0").rstrip(".")
+        return s
 
-    ymax = float(np.nanmax(sel["rmse_cm"])) if np.isfinite(sel["rmse_cm"]).any() else 1.0
-    ymax = max(1.0, ymax * 1.10)
+    fig, (ax_r, ax_b) = plt.subplots(nrows=2, ncols=1, figsize=(12, 12), dpi=150, sharex=True)
 
-    if not g_ls.empty:
-        ax.plot(g_ls["med_density"], g_ls["med"], "-", color=COLORS_DEM["SRTM"], lw=2.0, label="LS median")
-        _shade_band(ax, g_ls["med_density"], g_ls["p_low"], g_ls["p_high"], COLORS_DEM["SRTM"],
-                    hatched=False, alpha=0.12, z=1, y_min=0.0, y_max=ymax)
-    if not g_idw.empty:
-        ax.plot(g_idw["med_density"], g_idw["med"], "--", color=COLOR_IDW, lw=2.0, label="IDW median")
-        _shade_band(ax, g_idw["med_density"], g_idw["p_low"], g_idw["p_high"], COLOR_IDW,
-                    hatched=True, alpha=0.10, z=1, y_min=0.0, y_max=ymax)
+    # ---------- RMSE panel ----------
+    for a in areas:
+        sa = sel[sel["__area__"] == a]
+        g = _agg_curve_metric(sa, "rmse_cm")
+        if g.empty:
+            continue
+        c = col_for[a]
+        ax_r.plot(g["med_density"], g["med"], "-", lw=1.8, color=c, label=a)
+        ax_r.fill_between(g["med_density"], g["p_low"], g["p_high"],
+                          facecolor=to_rgba(c, 0.12), edgecolor="none", zorder=1)
 
-    _set_log_xlim_safely(ax, [sel["density"].values])
-    ax.set_ylim(0.0, ymax)
-    ax.set_xlabel("Gauge density (km² per gauge) (log scale)")
-    ax.set_ylabel("RMSE (cm)")
-    ax.grid(True, alpha=0.30, which="both")
-    ax.legend()
-    fig.suptitle("All areas — RAW: density vs RMSE (all samples + 5–95% uncertainty bands)", y=0.96, fontsize=14, fontweight="bold")
+    # X scale + nicer ticks (labels visible on BOTH panels)
+    _set_log_xlim_safely(ax_r, [sel["density"].values])
+    ax_r.xaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 3.0, 5.0)))
+    ax_r.xaxis.set_major_formatter(FuncFormatter(_fmt_plain))
+    ax_r.xaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(1, 10) * 0.1))
+    ax_r.xaxis.set_minor_formatter(NullFormatter())
+    ax_r.tick_params(axis="x", which="both", labelbottom=True)  # make top panel show x tick labels too
+
+    # Y limits + ticks
+    ax_r.set_ylim(0, 25)
+    from matplotlib.ticker import MultipleLocator
+    ax_r.yaxis.set_major_locator(MultipleLocator(5))
+    ax_r.set_ylabel("RMSE (cm)")
+    ax_r.grid(True, alpha=0.30, which="both")
+    _legend_note(ax_r)
+    ax_r.set_title("RMSE")
+
+    # ---------- BIAS panel ----------
+    for a in areas:
+        sa = sel[sel["__area__"] == a]
+        g = _agg_curve_metric(sa, "bias_cm")
+        if g.empty:
+            continue
+        c = col_for[a]
+        ax_b.plot(g["med_density"], g["med"], "-", lw=1.8, color=c, label=a)
+        ax_b.fill_between(g["med_density"], g["p_low"], g["p_high"],
+                          facecolor=to_rgba(c, 0.12), edgecolor="none", zorder=1)
+
+    # X scale + nicer ticks (mirror top)
+    ax_b.set_xscale("log")
+    ax_b.xaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 3.0, 5.0)))
+    ax_b.xaxis.set_major_formatter(FuncFormatter(_fmt_plain))
+    ax_b.xaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(1, 10) * 0.1))
+    ax_b.xaxis.set_minor_formatter(NullFormatter())
+
+    # Y limits + ticks
+    ax_b.set_ylim(-15, 15)
+    ax_b.yaxis.set_major_locator(MultipleLocator(5))
+    ax_b.set_xlabel("Gauge density (km² per gauge) (log)")
+    ax_b.set_ylabel("Bias (cm)")
+    ax_b.grid(True, alpha=0.30, which="both")
+    _legend_note(ax_b)
+    ax_b.set_title("Bias")
+
+    # Shared legend (areas) below
+    handles, labels = ax_r.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=5, frameon=False, bbox_to_anchor=(0.5, 0.01))
+
+    fig.suptitle(f"{corr_u} — {dem_u} — per-area median + 5–95% band",
+                 y=0.98, fontsize=14, fontweight="bold")
+    fig.subplots_adjust(top=0.92, bottom=0.10, hspace=0.28)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / "density_all_areas_raw.png"
+    out = out_dir / f"density_all_areas_by_area_{dem_u}_{corr_u}_{method}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"🌍 All-areas density figure written: {out}")
+    print(f"🌍 Per-area all-areas figure written: {out}")
+
+
+
+# --------- All-areas: single combined line (NO DOTS), RMSE & Bias ----------
+def plot_all_areas_combined(area7: Dict[str, pd.DataFrame], *, dem: str, corr: str, method: str, out_dir: Path):
+    """
+    TWO stacked panels (RMSE on top, Bias below), each showing a SINGLE overall median line
+    with a 5–95% band computed from all areas combined, aggregated *by density* (log-bins).
+    No dots. X-axis spans the FULL density range in the data (no empty margins, no truncated tails).
+    Output: density_all_areas_combined_<DEM>_<CORR>_<METHOD>.png
+    """
+    if not area7:
+        print("⏭️  No areas to combine for combined all-areas plot."); return
+
+    frames = []
+    for _, df in area7.items():
+        if df is None or df.empty:
+            continue
+        frames.append(df.copy())
+    big = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if big.empty:
+        print("⏭️  Combined all-areas: empty dataset."); return
+
+    dem_u, corr_u = dem.upper(), corr.upper()
+    big = _ensure_upper(_ensure_density_column(big))
+    sel = big[(big["dem"] == dem_u) & (big["corr"] == corr_u) & (big["method"] == method)].copy()
+    if sel.empty:
+        print(f"⏭️  Combined all-areas: no rows for DEM={dem_u} CORR={corr_u} METHOD={method}."); return
+
+    # Compute curves directly vs density (covers full density range)
+    g_rmse = _agg_curve_by_density(sel, "rmse_cm", nbins=30, min_count=1)
+    g_bias = _agg_curve_by_density(sel, "bias_cm", nbins=30, min_count=1)
+
+    # Global density range from ALL samples (ensures 65–3000 shows if present)
+    dens_all = pd.to_numeric(sel["density"], errors="coerce")
+    dens_all = dens_all[np.isfinite(dens_all) & (dens_all > 0)]
+    if dens_all.empty:
+        print("⏭️  Combined all-areas: no positive density values."); return
+    xmin, xmax = float(dens_all.min()), float(dens_all.max())
+
+    # Plain-number formatter for log axis (no 10^k)
+    def _fmt_plain(v, _):
+        if not np.isfinite(v) or v <= 0: return ""
+        if abs(v - round(v)) < 1e-9:  # near-integer → show integer
+            return f"{int(round(v))}"
+        s = f"{v:.3g}".rstrip("0").rstrip(".")
+        return s
+
+    fig, (ax_r, ax_b) = plt.subplots(nrows=2, ncols=1, figsize=(12, 12), dpi=150, sharex=False)
+
+    # ---- RMSE panel ----
+    if not g_rmse.empty:
+        line_color = COLORS_DEM.get(dem_u, "#0072B2")
+        ax_r.plot(g_rmse["med_density"], g_rmse["med"], "-", lw=2.8, color=line_color, label="Median")
+        ax_r.fill_between(g_rmse["med_density"], g_rmse["p_low"], g_rmse["p_high"],
+                          facecolor=to_rgba(line_color, 0.18), edgecolor="none", zorder=1)
+    else:
+        ax_r.text(0.5, 0.5, "No RMSE curve", ha="center", va="center")
+
+    ax_r.set_xscale("log"); ax_r.set_xlim(xmin, xmax)
+    ax_r.xaxis.set_major_locator(mpl.ticker.LogLocator(base=10, subs=(1.0, 2.0, 3.0, 5.0)))
+    ax_r.xaxis.set_major_formatter(mpl.ticker.FuncFormatter(_fmt_plain))
+    ax_r.xaxis.set_minor_locator(mpl.ticker.LogLocator(base=10, subs=np.arange(1,10)*0.1))
+    ax_r.xaxis.set_minor_formatter(NullFormatter())
+    ax_r.tick_params(axis="x", which="both", labelbottom=True)  # show labels on top panel too
+
+    from matplotlib.ticker import MultipleLocator
+    ax_r.set_ylim(0, 25)
+    ax_r.yaxis.set_major_locator(MultipleLocator(5))
+    ax_r.set_ylabel("RMSE (cm)")
+    ax_r.grid(True, alpha=0.30, which="both")
+    _legend_note(ax_r); ax_r.set_title("RMSE")
+
+    # ---- Bias panel ----
+    if not g_bias.empty:
+        line_color_b = COLORS_DEM.get(dem_u, "#0072B2")
+        ax_b.plot(g_bias["med_density"], g_bias["med"], "-", lw=2.8, color=line_color_b, label="Median")
+        ax_b.fill_between(g_bias["med_density"], g_bias["p_low"], g_bias["p_high"],
+                          facecolor=to_rgba(line_color_b, 0.18), edgecolor="none", zorder=1)
+    else:
+        ax_b.text(0.5, 0.5, "No Bias curve", ha="center", va="center")
+
+    ax_b.set_xscale("log"); ax_b.set_xlim(xmin, xmax)
+    ax_b.xaxis.set_major_locator(mpl.ticker.LogLocator(base=10, subs=(1.0, 2.0, 3.0, 5.0)))
+    ax_b.xaxis.set_major_formatter(mpl.ticker.FuncFormatter(_fmt_plain))
+    ax_b.xaxis.set_minor_locator(mpl.ticker.LogLocator(base=10, subs=np.arange(1,10)*0.1))
+    ax_b.xaxis.set_minor_formatter(NullFormatter())
+
+    ax_b.set_ylim(-15, 15)
+    ax_b.yaxis.set_major_locator(MultipleLocator(5))
+    ax_b.set_xlabel("Gauge density (km² per gauge) (log)")
+    ax_b.set_ylabel("Bias (cm)")
+    ax_b.grid(True, alpha=0.30, which="both")
+    _legend_note(ax_b); ax_b.set_title("Bias")
+
+    fig.suptitle(f"All areas combined — {corr_u} — {dem_u} — {method}\nMedian + 5–95% band (no dots)",
+                 y=0.98, fontsize=14, fontweight="bold")
+    fig.subplots_adjust(top=0.92, bottom=0.10, hspace=0.28)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"density_all_areas_combined_{dem_u}_{corr_u}_{method}.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"🧮 Combined all-areas figure written: {out}")
+
 
 # ----------------------------------- CLI -------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Density visualization only: per-pair curves + maps, and optional all-areas overview.")
+    ap = argparse.ArgumentParser(description="Density visualization: per-pair curves + maps (with gauges) and all-areas figures (no dots).")
     ap.add_argument("--areas-root", type=str, default=str(AREAS_ROOT_DEFAULT),
                     help="Root folder containing per-area subfolders")
     ap.add_argument("--area", type=str,
                     help="Only process this AREA (subfolder name under --areas-root)")
+    ap.add_argument("--dem", type=str, default="SRTM", help="DEM to visualize (e.g., SRTM, 3DEP)")
+    ap.add_argument("--corr", type=str, default="RAW", help="Correction to visualize (RAW, TROPO, IONO, TROPO_IONO)")
+    ap.add_argument("--method", type=str, default="LEAST_SQUARES",
+                    help="Method to plot for all-areas figures: LEAST_SQUARES (LS) or IDW_DHVIS (IDW).")
     ap.add_argument("--water-areas", type=str, default=DEF_WATER_AREAS,
                     help="Path to water_areas.geojson for overview overlay")
     ap.add_argument("--sat-provider", type=str, default=DEF_SAT_PROVIDER,
@@ -646,26 +830,34 @@ def main():
     ap.add_argument("--sat-url", type=str, default=DEF_SAT_URL,
                     help="Custom XYZ for satellite (e.g. Google XYZ).")
     ap.add_argument("--gauges-template", type=str, default="",
-                    help="Optional template to a per-pair gauges GeoJSON, e.g. '/path/{area}/results/gauges_split_60pct_{pair}.geojson'")
+                    help="Optional template to per-pair gauges GeoJSON, e.g. '/path/{area}/results/gauges_split_60pct_{pair}.geojson'")
     ap.add_argument("--maps-gap-frac", type=float, default=0.1,
                     help="Vertical gap between bias plot and bottom maps (figure fraction).")
     ap.add_argument("--maps-height-frac", type=float, default=0.32,
                     help="Height of bottom maps (figure fraction).")
-    ap.add_argument("--combine-areas", action="store_true",
-                    help="Also write an all-areas density vs RMSE overview figure.")
 
     args = ap.parse_args()
+
+    # normalize method
+    mraw = (args.method or "").strip().upper()
+    if mraw in ("LS", "LEAST_SQUARES"):
+        method_sel = METHOD_LS
+    elif mraw in ("IDW", "IDW_DHVIS"):
+        method_sel = METHOD_IDW
+    else:
+        method_sel = METHOD_LS
 
     root = Path(args.areas_root)
     targets = [root / args.area] if args.area else sorted([d for d in root.iterdir() if d.is_dir()])
 
-    # Load RAW density metrics (7_*) per area
+    # Load density metrics per area for requested DEM/CORR
     area7: Dict[str, pd.DataFrame] = {}
     for area_dir in targets:
-        df7 = _read_area_density_metrics(area_dir)
+        df7 = _read_area_density_metrics(area_dir, dem=args.dem, corr=args.corr)
         if df7 is None or df7.empty:
-            print(f"⏭️  No 7_* (RAW density) metrics for area: {area_dir.name}")
+            print(f"⏭️  No density metrics for area: {area_dir.name} (DEM={args.dem}, CORR={args.corr})")
         else:
+            df7 = _ensure_upper(df7)
             area7[area_dir.name] = df7
 
     if not area7:
@@ -674,11 +866,17 @@ def main():
     # Per-pair figures
     for area_name, df7 in area7.items():
         area_dir = root / area_name
-        pair_tags7 = sorted(set(df7["pair_tag"].dropna().astype(str).tolist()))
-        for pair_tag in pair_tags7:
+        pair_tags = sorted(set(df7.get("pair_tag", pd.Series([], dtype=str)).dropna().astype(str).tolist()))
+        if not pair_tags and {"pair_ref","pair_sec"}.issubset(df7.columns):
+            pair_tags = sorted(set(
+                (df7["pair_ref"].str.replace("-", "", regex=False) + "_" +
+                 df7["pair_sec"].str.replace("-", "", regex=False)).tolist()
+            ))
+        for pair_tag in pair_tags:
             try:
-                plot_density_pair_raw_vs_idw(
+                plot_density_pair(
                     area_dir, df7, pair_tag,
+                    dem=args.dem, corr=args.corr,
                     water_path=args.water_areas,
                     sat_provider=args.sat_provider,
                     sat_url=args.sat_url,
@@ -689,12 +887,13 @@ def main():
             except Exception as e:
                 print(f"⚠️  Density pair failed {area_name}:{pair_tag}: {e}")
 
-    # Combined (all areas) overview
-    if args.combine_areas:
-        try:
-            plot_all_areas_density(area7, out_dir=root / "results")
-        except Exception as e:
-            print(f"⚠️  All-areas density figure failed: {e}")
+    # All-areas figures (ALWAYS, no dots)
+    try:
+        out_dir = root / "results"
+        plot_all_areas_density(area7, dem=args.dem, corr=args.corr, method=method_sel, out_dir=out_dir)
+        plot_all_areas_combined(area7, dem=args.dem, corr=args.corr, method=method_sel, out_dir=out_dir)
+    except Exception as e:
+        print(f"⚠️  All-areas figures failed: {e}")
 
 if __name__ == "__main__":
     main()
