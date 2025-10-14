@@ -553,7 +553,9 @@ python 6_inferential_tests.py
 python 7_accuracy_assessment_density.py
 
 # 8) Figures
-python 8_visualization.py
+python 8_visualization_dem_corr.py
+
+python 8_visualization_density.py
 ```
 
 ---
@@ -569,6 +571,6 @@ python 8_visualization.py
 
 ## License & Citation
 
-* **License:** not specified (default: all rights reserved by the author unless indicated otherwise).
+* **License:** can be found under LICENSE.txt, which contain a Apache 2.0 License
 * **Cite as:**
   Jack Bakker (2025), *Assessing Data Availability Impact for InSAR Monitoring of Wetland Water Levels: Everglades, ALOS PALSAR*, MSc Thesis, WUR.
