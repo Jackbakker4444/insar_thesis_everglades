@@ -263,12 +263,245 @@ python 7_accuracy_assessment_density.py --reps 50 --seed 42 --spread-top-m 5
 
 ### 8) Visualizations
 
-**File:** `8_visualization.py`
-**Produces:**
+**File:** `8_visualization_dem_corr.py`
+**What it covers (Corrections & DEMs):**
 
-* **Corrections 2×2** maps (RAW/TROPO/IONO/TROPO+IONO on SRTM) with shared legend, inset, north arrow, scalebar → `corr_maps_pair_<PAIR>.png`
-* **DEM** dual 60% boxplots (TROPO): SRTM vs 3DEP → `dem_boxplots_area_<AREA>_60pct_TROPO.png`
-* **Density RAW per-pair**: RMSE vs density & Bias vs density + bottom row (LS 60%, **AOI square**, IDW 60% with **gauges overlay**) → `density_raw_idw_pair_<PAIR>.png`
+* **Corrections maps (SRTM)** as a **2×3** grid per pair:
+  `Raw | Tropospheric / Ionospheric | Tropospheric+Ionospheric / Soil (WATER-only) | Satellite (WATER-only)`
+  Single shared colorbar; per-panel north arrow & scalebar; Soil & Satellite clipped to the area’s WATER polygon.
+* **DEM comparisons (RAW, LS 60%)** per area: SRTM vs 3DEP boxplots shown **(i)** with equal widths and **(ii)** with widths ∝ pair duration.
+  RMSE panel fixed to 0–25 cm; Bias auto; dates compact on x-axis.
+* **All-areas summaries (RAW, LS 60%)**: the same DEM comparison logic applied across all areas.
+* **Baseline sensitivity** (RAW, LS 60%): mean RMSE vs temporal baseline (days) across pairs.
+
+**Outputs:**
+
+* `corr_maps_pair_<PAIR>_2x3.png` (per pair, under `<area>/results/`)
+* `dem_boxplots_area_<AREA>_equalwidth_RAW.png` and `dem_boxplots_area_<AREA>_varwidth_RAW.png`
+* `dem_boxplots_ALL_areas_equalwidth_RAW.png` and `dem_boxplots_ALL_areas_varwidth_RAW.png`
+* `scatter_mean_rmse_vs_temporal_baseline_RAW.png`
+
+**Run**
+
+```bash
+# Everything with defaults (all areas)
+python 8_visualization_dem_corr.py
+
+# Single area + custom satellite XYZ + custom water polygons
+python 8_visualization_dem_corr.py --area ENP \
+  --sat-url 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}' \
+  --water-areas /home/bakke326l/InSAR/main/data/vector/water_areas.geojson
+```
+
+---
+
+**File:** `8_visualization_density.py`
+**What it covers (Density):**
+
+* **Per-pair density curves** for **RMSE** and **Bias** vs **gauge density** (km² per gauge, log-x):
+  median line + **5–95%** band, for **Interferogram (LS)** and **IDW (same gauges)**.
+* **Bottom-row AOI maps** per pair: **LS calibrated**, **Satellite AOI** (with WATER overlay), and **IDW baseline**; gauge overlay (cal = black, val = red).
+  Map spacing/height are tunable via `--maps-gap-frac` and `--maps-height-frac`.
+* **All-areas (by area, no dots)**: each area plotted as its own median line + 5–95% band for the selected method (`LEAST_SQUARES` or `IDW_DHVIS`).
+* **All-areas (combined, no dots)**: a **single** median + 5–95% band aggregated directly by density, with the x-axis spanning the **full density range** present in the data.
+
+**Outputs (per pair + all areas):**
+
+* `density_<corr_lower>_idw_pair_<PAIR>.png` (per pair, under `<area>/results/`)
+* `density_all_areas_by_area_<DEM>_<CORR>_<METHOD>.png`
+* `density_all_areas_combined_<DEM>_<CORR>_<METHOD>.png`
+
+**Run**
+
+```bash
+# Defaults: DEM=SRTM, CORR=RAW, METHOD=LEAST_SQUARES (writes per-pair figures + both all-areas figures)
+python 8_visualization_density.py
+
+# Single area, TROPO_IONO, all-areas with IDW method, custom WATER overlay and provider
+python 8_visualization_density.py --area ENP --dem SRTM --corr TROPO_IONO --method IDW_DHVIS \
+  --water-areas /home/bakke326l/InSAR/main/data/vector/water_areas.geojson \
+  --sat-provider Esri.WorldImagery
+
+# With explicit gauges template + tighter map gap below the Bias panel
+python 8_visualization_density.py --gauges-template "/mnt/DATA2/.../{area}/results/gauges_split_60pct_{pair}.geojson" \
+  --maps-gap-frac 0.08 --maps-height-frac 0.30
+```
+
+---
+
+---
+
+### Helper Scripts
+
+**File:** `help_xml_isce.py`
+**Purpose:** build a minimal, robust **`stripmapApp.xml`** for ISCE2 (ALOS stripmap).
+
+* **What it provides:**
+  `ceos_files()` (find LED/IMG-HH files), `detect_beam_mode()` (FBD/FBS),
+  `sensor_component()` (adds `RESAMPLE_FLAG=dual2single` for **FBD**),
+  `write_stripmap_xml()` (writes a full `stripmapApp.xml` for one REF–SEC pair).
+* **Assumptions:** raw ALOS CEOS under `<raw_dir>/path<PATH>/<YYYYMMDD>/…`, HH channel only.
+* **XML defaults (tuned for this project):** multilooks (user-set), Goldstein filter `filter strength`, **dense offsets ON**, **split spectrum + dispersive ON**, **rubbersheeting in range & azimuth ON**, posting **30 m**, two-stage unwrapping (`snaphu`/`MCF`).
+* **Output:** a ready-to-run `stripmapApp.xml` in your chosen location.
+
+**Run**
+
+```python
+from pathlib import Path
+from help_xml_isce import write_stripmap_xml
+
+write_stripmap_xml(
+    xml_file=Path("/out/stripmapApp.xml"),
+    path="150", ref_date="20071216", sec_date="20080131",
+    raw_dir=Path("/mnt/DATA2/bakke326l/raw"),
+    work_dir=Path("/mnt/DATA2/bakke326l/processing/interferograms/path150_20071216_20080131_SRTM"),
+    dem_wgs84=Path("/home/bakke326l/InSAR/main/data/aux/dem/srtm_30m.dem.wgs84"),
+    range_looks=10, az_looks=16, filter_strength=0.6
+)
+```
+
+---
+
+**File:** `help_xml_dem.py`
+**Purpose:** convert a GeoTIFF DEM/DTM to an **ISCE2-ready WGS-84 DEM bundle**.
+
+* **What it does (pipeline):**
+
+  1. Reproject to **EPSG:4326** (ellipsoidal heights; `--keep-egm` to skip),
+  2. `gdal_translate` → **ISCE** binary `*.dem.wgs84` (+ `.vrt`),
+  3. `gdal2isce_xml` → sidecar `*.xml`,
+  4. optional text report `*.txt` (size, posting, bbox, stats).
+* **Requires:** GDAL ≥ 3.4 (tools on `PATH`), ISCE2 Python (`applications.gdal2isce_xml`).
+* **Outputs (same basename):** `.dem.wgs84`, `.dem.wgs84.vrt`, `.dem.wgs84.xml`, `.dem.wgs84.txt`.
+
+**Run**
+
+```bash
+# Basic
+python help_xml_dem.py --input /path/lidar_utm.tif \
+                       --output /path/dem/my_area.dem.wgs84
+
+# Keep geoid heights, overwrite if exists, custom temp dir
+python help_xml_dem.py --input /path/dtm_egm.tif \
+                       --output /path/dem/my_area.dem.wgs84 \
+                       --keep-egm --overwrite --tmp-dir ./tmp_reproj
+```
+
+---
+
+**File:** `help_show_fringes.py`
+**Purpose:** generate a wrapped-phase **“FRINGES”** GeoTIFF from the **geocoded complex** interferogram.
+
+* **Reads:** `<pair>/interferogram/filt_topophase.flat.geo` (band 1 complex).
+* **Writes:** `FRINGES_<REF>_<SEC>_ra<RANGE>_az<AZ>_<ALPHA>.tif` (float64, wrapped phase in [−π, π), NaN nodata) to your chosen `out_dir`.
+* **Spatial metadata:** GeoTransform + CRS copied from source.
+
+**Run**
+
+```python
+from pathlib import Path
+from help_show_fringes import create_fringe_tif
+
+create_fringe_tif(
+    work_dir=Path("/mnt/DATA2/.../path150_20071216_20080131_SRTM"),
+    out_dir=Path("/mnt/DATA2/.../inspect"),
+    ref=20071216, sec=20080131, range_looks=10, azi_looks=16, alpha=0.6
+)
+```
+
+---
+
+**File:** `help_atm_correction.py`
+**Purpose:** high-level helpers for **ionospheric** and **tropospheric (GACOS)** corrections on ISCE2 products.
+
+* **`do_iono_correction(work_dir, out_dir, input_unw, output_suffix="_iono")`**
+  – Subtracts **dispersive** iono phase (`ionosphere/dispersive.bil.unwCor.filt.geo`),
+  – Applies `ionosphere/mask.bil.geo` (off-mask → NaN),
+  – Writes:
+  `interferogram/filt_topophase{suffix}.unw.geo` (single-band phase, rad) and
+  `interferogram/filt_topophase{suffix}_wrapped.unw.geo` (wrapped to [−π, π]).
+  – Band handling: reads phase from band 2 if IFG is 2-band, else band 1.
+
+* **`do_tropo_correction(wdir, ref, sec, gacos_dir, tropo_dir)`**
+  – Converts GACOS `*.rsc` → ENVI `*.hdr`,
+  – Reprojects `<ref>.ztd` / `<sec>.ztd` to IFG grid,
+  – Converts **zenith → slant phase** using incidence (deg) and λ(ALOS)=**0.2362 m**:
+  `phase = -(4π/λ) * (ZTD / cos(inc))`,
+  – Builds ΔAPS = APS_ref − APS_sec,
+  – Subtracts ΔAPS from unwrapped IFG (keeps amplitude in band 1),
+  – **Outputs:**
+  `<tropo_dir>/{ref}.ztd.geo`, `{sec}.ztd.geo`, `{ref}.aps.geo`, `{sec}.aps.geo`, `{ref}_{sec}.aps.geo`,
+  `interferogram/filt_topophase_tropo.unw.geo` (2-band: amp, corrected phase).
+
+**Run**
+
+```python
+from pathlib import Path
+from help_atm_correction import do_iono_correction, do_tropo_correction
+
+pair = Path("/mnt/DATA2/.../path150_20071216_20080131_SRTM")
+
+# 1) Tropospheric correction (GACOS)
+do_tropo_correction(
+    wdir=pair, ref=20071216, sec=20080131,
+    gacos_dir=Path("/mnt/DATA2/.../gacos"),
+    tropo_dir=pair / "troposphere"
+)
+
+# 2) Ionospheric correction (on raw or on tropo-corrected)
+iono_out = do_iono_correction(
+    work_dir=pair, out_dir=pair / "interferogram",
+    input_unw=pair / "interferogram" / "filt_topophase_tropo.unw.geo",
+    output_suffix="_tropo_iono"
+)
+```
+
+---
+
+**File:** `download_all_path_150.py`
+**Purpose:** **ASF/Vertex bulk downloader** with Earthdata Login (UR S) auth and a project-local download path.
+
+* **Defaults:** downloads to `…/raw/tmp_downloads` (created if missing).
+* **Sources:** embedded URL list **or** a provided **`.metalink`**/**`.csv`** from Vertex.
+* **Auth:** saves cookie to `~/.bulk_download_cookiejar.txt` and reuses it.
+* **Flags:** `--insecure` to relax SSL checks (use only for trusted hosts).
+* **Outputs:** ZIP archives placed in the destination directory; prints a transfer summary.
+
+**Run**
+
+```bash
+# Use the embedded URL list
+python download_all_path_150.py
+
+# Use a metalink/CSV you saved from Vertex
+python download_all_path_150.py /path/to/downloads.metalink local.metalink local.csv
+
+# (Optional) Disable strict SSL cert checks for trusted endpoints
+python download_all_path_150.py --insecure
+```
+
+---
+
+**File:** `isce_cleanup_all_pairs.sh`
+**Purpose:** safe, batch **cleanup** of ISCE pair folders (dry-run by default).
+
+* **Defaults:** `--root=/mnt/DATA2/bakke326l/processing/interferograms`, `--pattern='path150_*'`.
+* **Keeps:** `interferogram/`, `ionosphere/`, `troposphere/`, `geometry/`, `PICKLE/`, `inspect/`, `coregisteredSlc/`, and `stripmapApp.xml`, `stripmapProc.xml`, `isce.log`.
+* **Deletes:** `*_raw*`, `*_slc*`, `offsets/`, `denseOffsets/`, `misreg/`, `SplitSpectrum/`, `resampinfo.bin`, zero-byte `*.log`, and DEM scratch (`3dep_*.dem.*`, `dem.crop*`).
+* **Safety:** refuses to run on `/`; non-matching dirs are skipped.
+
+**Run**
+
+```bash
+# Dry-run (default): shows what would be removed
+bash isce_cleanup_all_pairs.sh
+
+# Apply deletions
+bash isce_cleanup_all_pairs.sh --apply
+
+# Custom root/pattern
+bash isce_cleanup_all_pairs.sh --root=/path/to/interferograms --pattern='path150_*' --apply
+```
 
 ---
 
@@ -282,15 +515,6 @@ python 7_accuracy_assessment_density.py --reps 50 --seed 42 --spread-top-m 5
   * `dens_idw60_SRTM_RAW_<PAIR>.tif`
   * `dens_cal_60pct_SRTM_RAW_<PAIR>.tif`
   * `dens_cal_1g_SRTM_RAW_<PAIR>.tif`
-
----
-
-## Reproducibility & Logging
-
-* **Resume-safe** batch in `2_run_insar.py` (`--resume`) checks for `filt_topophase.unw.geo(.vrt)`.
-* **Status log:** `processing/interferograms/_reports/path_status.csv` accumulates attempts & notes.
-* **Coverage report:** `processing/areas/_reports/coverage_report.csv` documents polygon coverage thresholds per clip.
-* **Seeds & knobs:** all stochastic pieces expose `--seed`; farthest-point spread via `--spread-top-m`.
 
 ---
 
