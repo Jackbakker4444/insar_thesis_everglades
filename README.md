@@ -6,13 +6,14 @@
 
 ## TL;DR (What this repo does)
 
-1. **Fetch & stage SAR** from ASF/Vertex.
-2. **Batch-run ISCE2** interferograms (each pair twice: **3DEP** and **SRTM**).
-3. **Post-process**: RAW vertical maps + **IONO**, **TROPO**, **TROPO+IONO** variants.
-4. **Organize per-area assets** (gauges, clips, coverage).
-5. **Evaluate accuracy** across DEM/correction combos and across **density** (gauge sparsity).
-6. **Inferential tests** (ANOVA/t-tests) for corrections and DEM choice.
-7. **Visualize**: correction maps, DEM boxplots, density curves.
+1. **Acquire & stage ALOS SAR** via ASF/Vertex (cookie-auth bulk download) into `raw/path<PATH>/<YYYYMMDD>/…`.
+2. **Prepare inputs**: convert **DEM/DTM → ISCE WGS-84 bundle** and auto-write **`stripmapApp.xml`** per pair (handles FBD→single-pol, looks, filtering, split-spectrum).
+3. **Batch-run ISCE2** interferograms **twice per pair** (**SRTM** and **3DEP**) at consistent posting (30 m).
+4. **Atmospheric corrections**: build **RAW**, **IONO**, **TROPO (GACOS)**, and **TROPO+IONO** products; optional wrapped-phase **FRINGES** quicklooks.
+5. **Per-area organization** of gauges, AOI clips, coverage, and pair metadata.
+6. **Accuracy evaluation**: RMSE/Bias across **DEM × correction** and vs **gauge density** (sparsity); exports metrics CSVs.
+7. **Inferential tests**: repeated-measures ANOVA & paired t-tests (with/without **IDW** baseline); area-level and all-areas summaries + rankings.
+8. **Visualize**: corrections **2×3** maps, **DEM** boxplots (equal/variable widths), **density** curves with per-pair LS/AOI/IDW maps, and all-areas overlays; plus scatter of mean RMSE vs temporal baseline.
 
 ---
 
@@ -31,8 +32,8 @@
   * [6) Inferential Tests (Corrections & DEMs)](#6-inferential-tests-corrections--dems)
   * [7) Density Study (SRTM+RAW)](#7-density-study-srtmraw)
   * [8) Visualizations](#8-visualizations)
+  * [Helper scripts](#helper-scripts)
 * [Naming Conventions](#naming-conventions)
-* [Reproducibility & Logging](#reproducibility--logging)
 * [Troubleshooting](#troubleshooting)
 * [Quickstart](#quickstart)
 * [Acknowledgements](#acknowledgements)

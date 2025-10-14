@@ -1,22 +1,98 @@
 #!/usr/bin/env python3
 """
-8_visualization.py (density-only, always writes all-areas figures)
+8_visualization_density.py
+==========================
 
-Inputs (per area):
-- results/accuracy_metrics_density_<DEM>_<CORR>.csv   (default: SRTM_RAW)
+Density-only visualizations for one or more AREAS. For every run it:
+(1) creates **per-pair** figures (curves + bottom maps with gauges), and
+(2) writes **all-areas** figures (no dots) to the areas root.
 
-Outputs:
-- <area>/results/density_<corr_lower>_idw_pair_<PAIR>.png
-- <areas-root>/results/density_all_areas_by_area_<DEM>_<CORR>_<METHOD>.png
-- <areas-root>/results/density_all_areas_combined_<DEM>_<CORR>_<METHOD>.png
+Inputs (per AREA)
+-----------------
+- `results/accuracy_metrics_density_<DEM>_<CORR>.csv`  (default lookup: `SRTM_RAW`)
 
-What it does:
-- Per-pair Error vs Density (RMSE + Bias) with median ± 5–95% bands (no clipping on Bias),
-  bottom-row maps (LS, Satellite AOI, IDW) with gauge points (cal=black, val=red).
-- All-areas figures (NO DOTS):
-  1) ONE figure with TWO panels (RMSE & Bias): each area as its own median line + 5–95% band.
-  2) ONE figure with TWO panels (RMSE & Bias): all areas combined into a single median line + 5–95% band.
+  Expected columns (case-insensitive, auto-normalized):
+  - `dem`, `corr`, `method` ∈ {`SRTM`,`3DEP`} x {`RAW`,`IONO`,`TROPO`,`TROPO_IONO`} x {`LEAST_SQUARES`,`IDW_DHVIS`}
+  - `rmse_cm`, `bias_cm`
+  - either `density` (km² per gauge) **or** enough to derive it:
+    `area_km2` and `n_cal` (density := area_km2 / n_cal)
+  - pair IDs via `pair_tag` **or** (`pair_ref`,`pair_sec`) as `YYYY-MM-DD`
+
+Outputs
+-------
+- **Per-pair figure** (stored under each AREA):  
+  `<AREA>/results/density_<corr_lower>_idw_pair_<PAIR>.png`
+- **All-areas (by-area) figure** (two panels, RMSE and Bias; each AREA gets a
+  line + 5-95% band):  
+  `<AREAS_ROOT>/results/density_all_areas_by_area_<DEM>_<CORR>_<METHOD>.png`
+- **All-areas (combined) figure** (two panels, single overall line + 5-95% band):  
+  `<AREAS_ROOT>/results/density_all_areas_combined_<DEM>_<CORR>_<METHOD>.png`
+
+What it draws
+-------------
+- **Per-pair curves**: RMSE vs **density** and Bias vs **density**  
+  (median line with **5-95%** band; **no clipping on Bias**).  
+  X-axis is log-scaled **km² per gauge**.
+- **Bottom row maps (per pair)**:  
+  **LS calibrated** map, **Satellite AOI**, and **IDW baseline**, each with:
+  shared color limits, scalebar, north arrow, and **gauge overlay**  
+  (calibration=black, validation=red).
+- **All-areas figures (no dots)**:  
+  1) **By-area**: one figure with two panels (RMSE, Bias); each AREA is a median line + 5-95% band.  
+  2) **Combined**: one figure with two panels (RMSE, Bias); all areas merged into a single median line + 5-95% band.
+
+Conventions & assumptions
+-------------------------
+- **Methods**: `LEAST_SQUARES` (LS) and `IDW_DHVIS` (IDW). The per-pair figure
+  shows LS vs IDW (same gauges); **all-areas** figures are emitted **for the
+  selected method only**.
+- **Density**: if not present, computed from `area_km2` and `n_cal`; curves use
+  **log-spaced bins** and report median ± percentile bands.
+- **Pair detection**: uses `pair_tag` or combines (`pair_ref`,`pair_sec`) into
+  `YYYYMMDD_YYYYMMDD`.
+- **Overlays**:
+  - Gauges are auto-discovered in `results/` or `water_gauges/` via common
+    name patterns (e.g., `gauges_split_60pct_{pair}.geojson`), or provided with
+    `--gauges-template`.
+  - Optional **water** overlay (`--water-areas`) and **satellite basemap**
+    (contextily provider or custom XYZ). Fallback is a plain gray panel if
+    tiles are unavailable.
+
+Dependencies
+------------
+- Required: `numpy`, `pandas`, `rasterio`, `matplotlib`
+- Optional (recommended for maps/overlays): `contextily`, `geopandas`, `shapely`, `pyproj`
+
+CLI
+---
+Basic (default `SRTM_RAW`, all areas):
+    python 8_visualization_density.py
+
+Single area:
+    python 8_visualization_density.py --area ENP
+
+Choose DEM/correction:
+    python 8_visualization_density.py --dem 3DEP --corr TROPO_IONO
+
+All-areas figures for IDW:
+    python 8_visualization_density.py --method IDW
+
+Custom overlays:
+    python 8_visualization_density.py \\
+      --water-areas /path/water_areas.geojson \\
+      --sat-provider Esri.WorldImagery
+
+Advanced layout (bottom maps spacing/heights as figure fractions):
+    python 8_visualization_density.py --maps-gap-frac 0.1 --maps-height-frac 0.32
+
+Notes
+-----
+- Figures are saved alongside inputs: **per-pair** to `<AREA>/results/…`,
+  **all-areas** to `<AREAS_ROOT>/results/…`.
+- Color map for maps: `viridis_r`. Bands are **central 90%** (5th-95th).
+- X ticks are numeric (no 10^k notation) on a log axis to keep density intuitive.
 """
+
 
 from __future__ import annotations
 from pathlib import Path
