@@ -89,9 +89,9 @@ python 4_organize_areas.py --vertical-file /mnt/DATA2/.../inspect/vertical_displ
 python 4_organize_areas.py --pair-dir /mnt/DATA2/.../path150_20071216_20080131_SRTM
 
 # Adjust coverage threshold (default 65.0 %):
-python 4_organize_areas.py --min-coverage-pct 50.0
+python 4_organize_areas.py --min-coverage-pct 65.0
 
-# (NEW) Tail-trim one-sided outlier pixels after clipping (masking):
+# Tail-trim one-sided outlier pixels after clipping (masking):
 python 4_organize_areas.py --tail-z 4 --clip-k 4 --tail-frac 0.005 --tail-min-px 200
 
 Notes
