@@ -745,7 +745,7 @@ def main() -> None:
                         help='Minimum polygon coverage (percent) to write outputs. Default: 50.0')
     # NEW: tail-trimming parameters (masking)
     parser.add_argument('--tail-z', type=float, default=5.0,
-                        help='Robust z-score to detect a far tail (default 4.0).\
+                        help='Robust z-score to detect a far tail (default 5.0).\
                               Lower → more sensitive (flags tails more often). Higher → more conservative.')
     parser.add_argument('--clip-k', type=float, default=4.0,
                         help='Clipping multiple (robust sigma) applied to flagged side(s) (default 4.0).\
