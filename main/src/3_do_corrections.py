@@ -245,7 +245,6 @@ def _regrid_to_match(src_arr, src_transform, src_crs, dst_shape, dst_transform, 
     )
     return dst
 
-# ---------- NEW: build a "swath mask" from the unwrapped dataset ----------
 def _swath_mask(unw_path: Path, count: int, phase_band: int) -> np.ndarray:
     """
     Build a boolean in-swath mask for the unwrapped dataset.
