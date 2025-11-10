@@ -149,6 +149,7 @@ WATER_AREAS_GJS = BASE_DIR / 'data/vector/water_areas.geojson'           # polyg
 
 # Output directory (per-area clips + gauge tables)
 OUT_DIR         = Path('/mnt/DATA2/bakke326l/processing/areas')
+EXPORT_DIR      = Path('/home/bakke326l/InSAR/main/data/output')
 
 # Where to SEARCH for vertical displacement rasters to clip
 # (matches the new pipeline: .../processing/interferograms/pathXXX_..._{SRTM|3DEP}/inspect/)
@@ -686,6 +687,74 @@ def _export_by_area_simple(gdf: gpd.GeoDataFrame, keep_dates_iso: list[str]) -> 
         written += 1
 
     print(f"✅ Wrote gauge tables for {written} area(s) under:\n    {OUT_DIR}")
+    
+def _export_remaining_gauges_and_counts(gdf: gpd.GeoDataFrame) -> None:
+    """
+    Export the remaining (filtered) gauges to GeoJSON and write a per-watershed counts CSV.
+
+    Writes
+    ------
+    /home/bakke326l/InSAR/main/data/output/remaining_gauges.geojson
+    /home/bakke326l/InSAR/main/data/output/gauge_counts_by_watershed.csv
+
+    Notes
+    -----
+    - GeoJSON includes **non-date** attributes only (to avoid massive schemas) + geometry.
+    - The counts CSV groups by 'area' (treated as 'watershed'), includes 'total' and
+      per-type columns (e.g., marsh/forest/river) when TYPE_FLD exists. Missing categories
+      are filled with zeros.
+    """
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # --- GeoJSON of remaining gauges (attributes without the EDEN date columns) ---
+    date_re = re.compile(r"\d{4}-\d{2}-\d{2}")
+    non_date_cols = [c for c in gdf.columns if not date_re.fullmatch(c)]
+    gjs_out = EXPORT_DIR / "remaining_gauges.geojson"
+
+    # Ensure WGS84 and a compact attribute set
+    gdf_out = gdf[non_date_cols].copy()
+    gdf_out = gdf_out.to_crs(4326)
+    gdf_out.to_file(gjs_out, driver="GeoJSON")
+    print(f"✅ Remaining gauges GeoJSON written: {gjs_out}")
+
+    # --- Counts per watershed (area) with categorized amounts ---
+    if 'area' not in gdf.columns:
+        print("⚠️  No 'area' column on gauges; cannot aggregate per watershed.")
+        return
+
+    if TYPE_FLD in gdf.columns:
+        # Normalize category names for stable columns
+        cats = gdf[TYPE_FLD].astype(str).str.strip().str.lower()
+        tmp = gdf.assign(_cat=cats)
+
+        # Pivot to columns per category; fill missing with zero
+        pvt = (tmp.groupby(['area', '_cat'])
+                   .size()
+                   .unstack(fill_value=0)
+                   .rename_axis(None, axis=1))
+
+        # Ensure all VALID_TYPES exist as columns (even if absent in data)
+        for cat in sorted(VALID_TYPES):
+            if cat not in pvt.columns:
+                pvt[cat] = 0
+
+        # Total + reorder columns: total first, then categories alphabetically
+        pvt['total'] = pvt.sum(axis=1)
+        cols = ['total'] + sorted([c for c in pvt.columns if c != 'total'])
+        counts = pvt[cols].reset_index()
+    else:
+        print(f"⚠️  '{TYPE_FLD}' not found — writing totals only.")
+        counts = (gdf.groupby('area')
+                      .size()
+                      .reset_index(name='total'))
+
+    # Rename 'area' → 'watershed' in the output for clarity
+    counts = counts.rename(columns={'area': 'watershed'})
+
+    csv_out = EXPORT_DIR / "gauge_counts_by_watershed.csv"
+    counts.to_csv(csv_out, index=False)
+    print(f"✅ Gauge counts CSV written: {csv_out}")
+
 
 
 # -----------------------------------------------------------------------------
@@ -789,6 +858,10 @@ def main() -> None:
 
     print('🔹 Writing per-area CSV files …')
     _export_by_area_simple(gdf, keep_dates_iso)
+    
+    print('🔹 Exporting remaining gauges (GeoJSON) and per-watershed counts (CSV) …')
+    _export_remaining_gauges_and_counts(gdf)
+
 
     # ---- Collect rasters to clip (single file / one pair / global search) ----
     print('🔹 Collecting vertical displacement rasters …')

@@ -850,6 +850,7 @@ def plot_all_areas_combined(area7: Dict[str, pd.DataFrame], *, dem: str, corr: s
 
     from matplotlib.ticker import MultipleLocator
     ax_r.set_ylim(0, 25)
+    ax_r.set_xlabel("Gauge density (km² per gauge) (log)")
     ax_r.yaxis.set_major_locator(MultipleLocator(5))
     ax_r.set_ylabel("RMSE (cm)")
     ax_r.grid(True, alpha=0.30, which="both")
@@ -877,7 +878,7 @@ def plot_all_areas_combined(area7: Dict[str, pd.DataFrame], *, dem: str, corr: s
     ax_b.grid(True, alpha=0.30, which="both")
     _legend_note(ax_b); ax_b.set_title("Bias")
 
-    fig.suptitle(f"All areas combined — {corr_u} — {dem_u} — {method}\nMedian + 5–95% band (no dots)",
+    fig.suptitle(f"All areas combined — {corr_u} — {dem_u}\nMedian + 5–95% band",
                  y=0.98, fontsize=14, fontweight="bold")
     fig.subplots_adjust(top=0.92, bottom=0.10, hspace=0.28)
 
