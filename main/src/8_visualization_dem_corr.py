@@ -17,7 +17,7 @@ are handled automatically—but can be edited below if you want finer control.)
 
 Outputs
 -------
-A) Per-pair corrections maps (SRTM) as a 2×3 grid:
+A) Per-pair corrections maps (3DEP) as a 2×3 grid:
       [ Raw                 |  Tropospheric               ]
       [ Ionospheric         |  Tropospheric + Ionospheric ]
       [ Soil (WATER only)   |  Satellite (WATER only)     ]
@@ -31,24 +31,24 @@ A) Per-pair corrections maps (SRTM) as a 2×3 grid:
 
    → <area>/results/corr_maps_pair_<PAIR>_2x3.png
 
-B) Per-area DEM boxplots (LS 60%, RAW):
+B) Per-area DEM boxplots (LS 60%, TROPO):
    1) Two DEMs (SRTM & 3DEP), equal widths, adjacent per pair.
    2) Two DEMs, variable widths proportional to each pair’s duration.
    • RMSE y-axis fixed to [0, 25] cm; Bias auto.
    • Legends inside (upper-right); outlier note upper-left.
    • Dates in short form on x-axis.
 
-   → <area>/results/dem_boxplots_area_<AREA>_equalwidth_RAW.png
-   → <area>/results/dem_boxplots_area_<AREA>_varwidth_RAW.png
+   → <area>/results/dem_boxplots_area_<AREA>_equalwidth_TROPO.png
+   → <area>/results/dem_boxplots_area_<AREA>_varwidth_TROPO.png
 
 C) ALL-areas combined:
    • Two DEMs, equal widths:
-     → <areas_root>/results/dem_boxplots_ALL_areas_equalwidth_RAW.png
+     → <areas_root>/results/dem_boxplots_ALL_areas_equalwidth_TROPO.png
    • Two DEMs, variable widths:
-     → <areas_root>/results/dem_boxplots_ALL_areas_varwidth_RAW.png
+     → <areas_root>/results/dem_boxplots_ALL_areas_varwidth_TROPO.png
 
 D) ALL-areas scatter: mean RMSE vs temporal baseline (days)
-   → <areas_root>/results/scatter_mean_rmse_vs_temporal_baseline_RAW.png
+   → <areas_root>/results/scatter_mean_rmse_vs_temporal_baseline_TROPO.png
 """
 
 from __future__ import annotations
@@ -66,6 +66,25 @@ from matplotlib.colors import to_rgba
 from matplotlib.patches import Rectangle, FancyArrow, Patch, PathPatch
 from matplotlib.path import Path as MplPath
 import matplotlib.dates as mdates
+
+# Times new roman fonts
+mpl.rcParams.update({
+    "font.family": "serif",
+    "font.serif": [
+        "Times New Roman",  # preferred
+        "Times",            # generic Times
+        "Nimbus Roman",     # common on Linux
+        "TeX Gyre Termes",
+        "Liberation Serif",
+        "DejaVu Serif"
+    ],
+    "mathtext.fontset": "stix",   # math like $R^2$ matches Times-style
+    "axes.unicode_minus": False,  # nicer minus sign with some serif fonts
+    # If you ever export PDF/SVG and want real text (not paths):
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "svg.fonttype": "none",
+})
 
 # Optional deps
 try:
@@ -126,10 +145,12 @@ CMAP_INV    = "viridis_r"
 
 # Paths / defaults
 AREAS_ROOT_DEFAULT = Path("/mnt/DATA2/bakke326l/processing/areas")
+PERP_BASELINES_CSV_DEFAULT = Path("/home/bakke326l/InSAR/main/data/perpendicular_baselines.csv")
 DEF_WATER_AREAS    = "/home/bakke326l/InSAR/main/data/vector/water_areas.geojson"
 DEF_SAT_PROVIDER   = "Esri.WorldImagery"
 DEF_SAT_URL        = ""  # custom XYZ if you want
 DEF_SOIL_TIF       = "/home/bakke326l/InSAR/main/data/aux/raster/soil_map_florida.tif"
+
 
 # Quiet noisy libs
 os.environ.setdefault("CPL_DEBUG", "NO")
@@ -189,6 +210,30 @@ def _collect_pair_tags_from_maps(area_dir: Path) -> List[str]:
             m = re.match(r".+_(\d{8}_\d{8})\.tif", p.name)
             if m: tags.add(m.group(1))
     return sorted(tags)
+
+def _read_bperp_csv(perp_csv: Path) -> Optional[pd.DataFrame]:
+    """
+    Read perpendicular baselines CSV produced by help_perpendicular_baseline.py.
+    Expects columns: ref_date (YYYYMMDD), sec_date (YYYYMMDD), bperp_abs_m.
+    Returns a dataframe with pair_ref, pair_sec (YYYY-MM-DD), bperp_abs_m (float).
+    """
+    if not perp_csv.exists():
+        print(f"⏭️  Perp-baseline CSV not found: {perp_csv}")
+        return None
+    df = pd.read_csv(perp_csv, dtype=str)
+    need = {"ref_date", "sec_date", "bperp_abs_m"}
+    if not need.issubset(df.columns):
+        print(f"⏭️  Perp-baseline CSV missing columns {need - set(df.columns)}: {perp_csv}")
+        return None
+    df["pair_ref"] = pd.to_datetime(df["ref_date"], format="%Y%m%d", errors="coerce").dt.strftime("%Y-%m-%d")
+    df["pair_sec"] = pd.to_datetime(df["sec_date"], format="%Y%m%d", errors="coerce").dt.strftime("%Y-%m-%d")
+    df["bperp_abs_m"] = pd.to_numeric(df["bperp_abs_m"], errors="coerce")
+    df = df.dropna(subset=["pair_ref","pair_sec","bperp_abs_m"])
+    # If duplicates exist (e.g., both SRTM/3DEP runs), average them:
+    df = (df.groupby(["pair_ref","pair_sec"], as_index=False)
+            .agg(bperp_abs_m=("bperp_abs_m","mean")))
+    return df
+
 
 # ====================== Map helpers: scalebar & north arrow ===================
 def _geod() -> Optional[Geod]:
@@ -392,10 +437,10 @@ def plot_corrections_sixpack(
     # Load correction rasters
     corr_arrays: List[Optional[Tuple[np.ndarray, Tuple[float,float,float,float]]]] = []
     for _, corr in order:
-        p = _find_corr_map(area_dir, "SRTM", corr, pair_tag)
+        p = _find_corr_map(area_dir, "3DEP", corr, pair_tag)
         corr_arrays.append(_read_tif_array(p))
     if all(m is None for m in corr_arrays):
-        print(f"⏭️  No SRTM correction rasters found for {area}:{pair_tag}.")
+        print(f"⏭️  No 3DEP correction rasters found for {area}:{pair_tag}.")
         return
 
     # Shared color stretch
@@ -497,7 +542,7 @@ def plot_corrections_sixpack(
     top_axes_y = max(axes[0].get_position().y1, axes[1].get_position().y1)
     title_y = min(0.99, top_axes_y + (TITLE_GAP_IN / fig_h_in))
     fig.suptitle(
-        f"{area} — SRTM vertical displacement corrections\n{ref_iso} to {sec_iso}",
+        f"{area} — 3DEP vertical displacement corrections\n{ref_iso} to {sec_iso}",
         y=title_y, fontsize=14, fontweight="bold"
     )
 
@@ -519,7 +564,7 @@ def plot_corrections_sixpack(
         pos_ll = axes[4].get_position()
         y = pos_ll.y0 - (0.026 if fig_h_in >= 8 else 0.022)
         src_sat = "Custom XYZ" if sat_url else "Esri World Imagery"
-        fig.text(pos_ll.x0, y, f"Sources: ALOS PALSAR, SRTM, GACOS — Satellite: {src_sat}",
+        fig.text(pos_ll.x0, y, f"Sources: ALOS PALSAR, 3DEP, GACOS — Satellite: {src_sat}",
                  ha="left", va="top", fontsize=9, color="#333333")
     except Exception:
         pass
@@ -530,8 +575,8 @@ def plot_corrections_sixpack(
     plt.close(fig)
     print(f"🖼️  Corrections 2×3 maps written: {out}")
 
-# ========================== DEM boxplots (RAW) ===============================
-def _pick_rows_60pct(df: pd.DataFrame, corr_used: str = "RAW") -> pd.DataFrame:
+# ========================== DEM boxplots (TROPO) ===============================
+def _pick_rows_60pct(df: pd.DataFrame, corr_used: str = "TROPO") -> pd.DataFrame:
     sub = df[(df["method"].str.upper()==METHOD_LS) & (df["corr"].str.upper()==corr_used.upper())].copy()
     if sub.empty: return pd.DataFrame(columns=df.columns)
     out = []
@@ -631,9 +676,9 @@ def _both_dems_varwidth_time(ax, g: pd.DataFrame, meta: pd.DataFrame,
 
 def _plot_area_boxplots(area_dir: Path, df_area: pd.DataFrame):
     area = area_dir.name
-    sub = _pick_rows_60pct(df_area, corr_used="RAW")
+    sub = _pick_rows_60pct(df_area, corr_used="TROPO")
     if sub.empty:
-        print(f"⏭️  No LS RAW 60% rows for {area}; skip DEM boxplots.")
+        print(f"⏭️  No LS TROPO 60% rows for {area}; skip DEM boxplots.")
         return
     sub["dem"] = sub["dem"].astype(str).str.upper()
     sub = sub[sub["dem"].isin(["SRTM","3DEP"])]
@@ -646,7 +691,7 @@ def _plot_area_boxplots(area_dir: Path, df_area: pd.DataFrame):
     _both_dems_equalwidth_adjacent(axAt, sub, meta, "rmse_cm", "RMSE (cm)", area, add_legend=True)
     _both_dems_equalwidth_adjacent(axAb, sub, meta, "bias_cm", "Bias (cm)", area, add_legend=False)
     axAb.set_xlabel("Pair dates (informational; equal spacing)", fontsize=10)
-    outA = area_dir / "results" / f"dem_boxplots_area_{area}_equalwidth_RAW.png"
+    outA = area_dir / "results" / f"dem_boxplots_area_{area}_equalwidth_TROPO.png"
     outA.parent.mkdir(parents=True, exist_ok=True)
     figA.savefig(outA, dpi=150); plt.close(figA)
     print(f"📦 DEM boxplots (equal width, both DEMs): {outA}")
@@ -656,7 +701,7 @@ def _plot_area_boxplots(area_dir: Path, df_area: pd.DataFrame):
     _both_dems_varwidth_time(axBt, sub, meta, "rmse_cm", "RMSE (cm)", area, add_legend=True)
     _both_dems_varwidth_time(axBb, sub, meta, "bias_cm", "Bias (cm)", area, add_legend=False)
     axBb.set_xlabel("Time (dates on x-axis; widths reflect pair durations)", fontsize=10)
-    outB = area_dir / "results" / f"dem_boxplots_area_{area}_varwidth_RAW.png"
+    outB = area_dir / "results" / f"dem_boxplots_area_{area}_varwidth_TROPO.png"
     figB.savefig(outB, dpi=150); plt.close(figB)
     print(f"📦 DEM boxplots (variable width, both DEMs): {outB}")
 
@@ -664,7 +709,7 @@ def _plot_area_boxplots(area_dir: Path, df_area: pd.DataFrame):
 def _collect_all_df(area_df: Dict[str, pd.DataFrame]) -> Optional[pd.DataFrame]:
     all_subs = []
     for df in area_df.values():
-        s = _pick_rows_60pct(df, corr_used="RAW")
+        s = _pick_rows_60pct(df, corr_used="TROPO")
         if s.empty: continue
         s = s[s["dem"].str.upper().isin(["SRTM","3DEP"])]
         if not s.empty: all_subs.append(s)
@@ -675,7 +720,7 @@ def _collect_all_df(area_df: Dict[str, pd.DataFrame]) -> Optional[pd.DataFrame]:
 def _plot_all_areas_equalwidth(root: Path, area_df: Dict[str, pd.DataFrame]):
     all_df = _collect_all_df(area_df)
     if all_df is None:
-        print("⏭️  ALL-areas combined: no LS RAW 60% rows.")
+        print("⏭️  ALL-areas combined: no LS TROPO 60% rows.")
         return
     meta = _pair_meta(all_df)
 
@@ -714,7 +759,7 @@ def _plot_all_areas_equalwidth(root: Path, area_df: Dict[str, pd.DataFrame]):
                 loc="upper right", frameon=True, fontsize=9)
     ax_b.set_xlabel("Pair dates (informational; equal spacing)", fontsize=10)
 
-    out = root / "results" / "dem_boxplots_ALL_areas_equalwidth_RAW.png"
+    out = root / "results" / "dem_boxplots_ALL_areas_equalwidth_TROPO.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=150); plt.close(fig)
     print(f"🌐 ALL-areas (equal width) written: {out}")
@@ -722,7 +767,7 @@ def _plot_all_areas_equalwidth(root: Path, area_df: Dict[str, pd.DataFrame]):
 def _plot_all_areas_varwidth(root: Path, area_df: Dict[str, pd.DataFrame]):
     all_df = _collect_all_df(area_df)
     if all_df is None:
-        print("⏭️  ALL-areas varwidth: no LS RAW 60% rows.")
+        print("⏭️  ALL-areas varwidth: no LS TROPO 60% rows.")
         return
     meta = _pair_meta(all_df)
 
@@ -771,85 +816,103 @@ def _plot_all_areas_varwidth(root: Path, area_df: Dict[str, pd.DataFrame]):
                 loc="upper right", frameon=True, fontsize=9)
     ax_b.set_xlabel("Time (dates on x-axis; widths reflect pair durations)", fontsize=10)
 
-    out = root / "results" / "dem_boxplots_ALL_areas_varwidth_RAW.png"
+    out = root / "results" / "dem_boxplots_ALL_areas_varwidth_TROPO.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=150); plt.close(fig)
     print(f"🌐 ALL-areas (variable width) written: {out}")
 
 # ------------------- ALL-areas scatter: mean RMSE vs baseline ----------------
-def _plot_scatter_rmse_vs_baseline(root: Path, area_df: Dict[str, pd.DataFrame]):
+def _plot_scatter_rmse_vs_temporal_and_bperp(root: Path,
+                                             area_df: Dict[str, pd.DataFrame],
+                                             perp_csv: Path):
+    """
+    Left: mean RMSE vs temporal baseline (days) — as before.
+    Right: mean RMSE vs |B⊥| (km), merged from perpendicular_baselines.csv.
+    """
+    # Build per-pair mean RMSE (across DEMs) and temporal baseline (days)
     rows = []
     for _, df in area_df.items():
         s = _pick_rows_60pct(df, corr_used="RAW")
         if s.empty: 
             continue
         s = s[s["dem"].str.upper().isin(["SRTM","3DEP"])]
-        if s.empty: 
+        if s.empty:
             continue
         g = (s.groupby(["pair_ref","pair_sec"], as_index=False)
                .agg(mean_rmse_cm=("rmse_cm","mean")))
         g["t_ref"] = pd.to_datetime(g["pair_ref"])
         g["t_sec"] = pd.to_datetime(g["pair_sec"])
         g["baseline_days"] = (g["t_sec"] - g["t_ref"]).dt.days.astype(float)
-        rows.append(g[["baseline_days","mean_rmse_cm"]])
+        rows.append(g[["pair_ref","pair_sec","mean_rmse_cm","baseline_days"]])
 
     if not rows:
-        print("⏭️  Scatter: no data.")
+        print("⏭️  Temporal/B⊥ scatter: no data.")
         return
 
-    all_g = pd.concat(rows, ignore_index=True).dropna(subset=["baseline_days","mean_rmse_cm"])
-    # Keep only finite values
-    all_g = all_g[np.isfinite(all_g["baseline_days"]) & np.isfinite(all_g["mean_rmse_cm"])]
+    rmse_df = pd.concat(rows, ignore_index=True).dropna(subset=["baseline_days","mean_rmse_cm"])
 
-    fig, ax = plt.subplots(figsize=(10.5, 6.2), dpi=150, constrained_layout=True)
+    # Read perpendicular baselines and merge
+    bperp_df = _read_bperp_csv(perp_csv)
+    if bperp_df is None or bperp_df.empty:
+        print("⏭️  No perpendicular baseline data -> only temporal scatter will be plotted by existing function.")
+        return
 
-    # Scatter points
-    ax.scatter(all_g["baseline_days"], all_g["mean_rmse_cm"], s=22, alpha=0.8, label="Pairs")
+    m = rmse_df.merge(bperp_df, on=["pair_ref","pair_sec"], how="inner")
+    if m.empty:
+        print("⏭️  No overlapping pairs between RMSE table and perpendicular baselines.")
+        return
 
-    # Fit line if we have at least 2 points
-    if len(all_g) >= 2:
-        x = all_g["baseline_days"].to_numpy(dtype=float)
-        y = all_g["mean_rmse_cm"].to_numpy(dtype=float)
-        # Least-squares linear fit
-        m, b = np.polyfit(x, y, 1)
-        x_line = np.linspace(np.nanmin(x), np.nanmax(x), 200)
-        y_line = m * x_line + b
-        ax.plot(x_line, y_line, linewidth=2.0, color="#424141", label="Linear fit")
+    # Prepare figure: two panels
+    fig, (axL, axR) = plt.subplots(nrows=1, ncols=2, figsize=(14.5, 6.2), dpi=150, constrained_layout=True)
 
-        # R^2
-        y_hat = m * x + b
-        ss_res = np.sum((y - y_hat) ** 2)
-        ss_tot = np.sum((y - np.mean(y)) ** 2)
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    # --- Left: RMSE vs temporal baseline (days) ---
+    axL.scatter(m["baseline_days"], m["mean_rmse_cm"], s=22, alpha=0.8, label="Pairs")
+    if len(m) >= 2:
+        x = m["baseline_days"].to_numpy(float); y = m["mean_rmse_cm"].to_numpy(float)
+        m1, b1 = np.polyfit(x, y, 1)
+        x_line = np.linspace(np.nanmin(x), np.nanmax(x), 200); y_line = m1*x_line + b1
+        axL.plot(x_line, y_line, linewidth=2.0, color="#424141", label="Linear fit")
+        y_hat = m1*x + b1; ss_res = np.sum((y-y_hat)**2); ss_tot = np.sum((y-np.mean(y))**2)
+        r2 = 1.0 - ss_res/ss_tot if ss_tot > 0 else np.nan
+        axL.text(0.02, 0.98, f"Fit: y = {m1:.3f}·x + {b1:.3f}\n$R^2$ = {r2:.3f}",
+                 transform=axL.transAxes, ha="left", va="top", fontsize=9,
+                 bbox=dict(facecolor="white", edgecolor="#cccccc", boxstyle="round,pad=0.25"))
+    axL.set_xlabel("Temporal baseline (days)", fontsize=10)
+    axL.set_ylabel("Mean RMSE (cm) across DEMs", fontsize=10)
+    axL.grid(True, alpha=0.3)
+    axL.set_title("Mean RMSE vs Temporal Baseline (RAW, LS 60%)", fontsize=10)
+    axL.legend(loc="upper right", fontsize=9, frameon=True)
 
-        # Put the formula and R^2 inside the plot (top-left)
-        ax.text(0.02, 0.98,
-                f"Fit: y = {m:.3f}·x + {b:.3f}\n$R^2$ = {r2:.3f}",
-                transform=ax.transAxes, ha="left", va="top",
-                fontsize=9, color="#222222",
-                bbox=dict(facecolor="white", edgecolor="#cccccc", boxstyle="round,pad=0.25"))
-    else:
-        ax.text(0.02, 0.98, "Not enough points for a fit",
-                transform=ax.transAxes, ha="left", va="top",
-                fontsize=9, color="#222222",
-                bbox=dict(facecolor="white", edgecolor="#cccccc", boxstyle="round,pad=0.25"))
+    # --- Right: RMSE vs |B⊥| (km) ---
+    xk = (m["bperp_abs_m"].to_numpy(float) / 1000.0)
+    y  = m["mean_rmse_cm"].to_numpy(float)
+    axR.scatter(xk, y, s=22, alpha=0.8, label="Pairs")
+    if len(m) >= 2:
+        m2, b2 = np.polyfit(xk, y, 1)
+        x_line = np.linspace(np.nanmin(xk), np.nanmax(xk), 200); y_line = m2*x_line + b2
+        axR.plot(x_line, y_line, linewidth=2.0, color="#424141", label="Linear fit")
+        y_hat = m2*xk + b2; ss_res = np.sum((y-y_hat)**2); ss_tot = np.sum((y-np.mean(y))**2)
+        r2 = 1.0 - ss_res/ss_tot if ss_tot > 0 else np.nan
+        axR.text(0.02, 0.98, f"Fit: y = {m2:.3f}·x + {b2:.3f}\n$R^2$ = {r2:.3f}",
+                 transform=axR.transAxes, ha="left", va="top", fontsize=9,
+                 bbox=dict(facecolor="white", edgecolor="#cccccc", boxstyle="round,pad=0.25"))
+    axR.set_xlabel("Perpendicular baseline |B⊥| (km)", fontsize=10)
+    axR.set_ylabel("Mean RMSE (cm) across DEMs", fontsize=10)
+    axR.grid(True, alpha=0.3)
+    axR.set_title("Mean RMSE vs Perpendicular Baseline (RAW, LS 60%)", fontsize=10)
+    axR.legend(loc="upper right", fontsize=9, frameon=True)
 
-    ax.set_xlabel("Temporal baseline (days)", fontsize=10)
-    ax.set_ylabel("Mean RMSE (cm) across DEMs", fontsize=10)
-    ax.grid(True, alpha=0.3)
-    ax.set_title("All areas — Mean RMSE vs Temporal Baseline (RAW, LS 60%)", fontsize=10)
-    ax.legend(loc="upper right", fontsize=9, frameon=True)
-
-    out = root / "results" / "scatter_mean_rmse_vs_temporal_baseline_RAW.png"
+    out = root / "results" / "scatter_mean_rmse_vs_temporal_and_bperp_RAW.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=150)
     plt.close(fig)
-    print(f"📈 Scatter written: {out}")
+    print(f"📈 Temporal & perpendicular baseline scatter written: {out}")
+
 
 # ----------------------------------- CLI -------------------------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Corrections 2×3 maps (with tight column control) and DEM plots (RAW)."
+        description="Corrections 2×3 maps (with tight column control) and DEM plots (TROPO)."
     )
     ap.add_argument("--areas-root", type=str, default=str(AREAS_ROOT_DEFAULT),
                     help="Root folder containing per-area subfolders")
@@ -863,6 +926,8 @@ def main():
                     help="Custom XYZ for satellite (e.g. 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}')")
     ap.add_argument("--soil-tif", type=str, default=DEF_SOIL_TIF,
                     help="Soil GeoTIFF to convert once to PNG and display (PNG saved next to the TIF).")
+    ap.add_argument("--perp-baselines", type=str, default=str(PERP_BASELINES_CSV_DEFAULT),
+                help="Path to perpendicular_baselines.csv (from help_perpendicular_baseline.py)")
     args = ap.parse_args()
 
     root = Path(args.areas_root)
@@ -914,9 +979,9 @@ def main():
     except Exception as e:
         print(f"⚠️  ALL-areas (varwidth) failed: {e}")
     try:
-        _plot_scatter_rmse_vs_baseline(root, area_df)
+        _plot_scatter_rmse_vs_temporal_and_bperp(root, area_df, Path(args.perp_baselines))
     except Exception as e:
-        print(f"⚠️  Scatter plot failed: {e}")
+        print(f"⚠️  Temporal & B⊥ scatter failed: {e}")
 
 if __name__ == "__main__":
     main()

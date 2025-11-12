@@ -9,7 +9,7 @@ Density-only visualizations for one or more AREAS. For every run it:
 
 Inputs (per AREA)
 -----------------
-- `results/accuracy_metrics_density_<DEM>_<CORR>.csv`  (default lookup: `SRTM_RAW`)
+- `results/accuracy_metrics_density_<DEM>_<CORR>.csv`  (default lookup: `3DEP_TROPO`)
 
   Expected columns (case-insensitive, auto-normalized):
   - `dem`, `corr`, `method` ∈ {`SRTM`,`3DEP`} x {`RAW`,`IONO`,`TROPO`,`TROPO_IONO`} x {`LEAST_SQUARES`,`IDW_DHVIS`}
@@ -65,7 +65,7 @@ Dependencies
 
 CLI
 ---
-Basic (default `SRTM_RAW`, all areas):
+Basic (default `3DEP_TROPO`, all areas):
     python 8_visualization_density.py
 
 Single area:
@@ -108,6 +108,25 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgba
 from matplotlib.patches import Rectangle, FancyArrow
 from matplotlib.ticker import LogLocator, FuncFormatter, NullFormatter
+
+# Times new roman fonts
+mpl.rcParams.update({
+    "font.family": "serif",
+    "font.serif": [
+        "Times New Roman",  # preferred
+        "Times",            # generic Times
+        "Nimbus Roman",     # common on Linux
+        "TeX Gyre Termes",
+        "Liberation Serif",
+        "DejaVu Serif"
+    ],
+    "mathtext.fontset": "stix",   # math like $R^2$ matches Times-style
+    "axes.unicode_minus": False,  # nicer minus sign with some serif fonts
+    # If you ever export PDF/SVG and want real text (not paths):
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "svg.fonttype": "none",
+})
 
 # Optional deps
 try:
@@ -896,8 +915,8 @@ def main():
                     help="Root folder containing per-area subfolders")
     ap.add_argument("--area", type=str,
                     help="Only process this AREA (subfolder name under --areas-root)")
-    ap.add_argument("--dem", type=str, default="SRTM", help="DEM to visualize (e.g., SRTM, 3DEP)")
-    ap.add_argument("--corr", type=str, default="RAW", help="Correction to visualize (RAW, TROPO, IONO, TROPO_IONO)")
+    ap.add_argument("--dem", type=str, default="3DEP", help="DEM to visualize (e.g., SRTM, 3DEP)")
+    ap.add_argument("--corr", type=str, default="TROPO", help="Correction to visualize (RAW, TROPO, IONO, TROPO_IONO)")
     ap.add_argument("--method", type=str, default="LEAST_SQUARES",
                     help="Method to plot for all-areas figures: LEAST_SQUARES (LS) or IDW_DHVIS (IDW).")
     ap.add_argument("--water-areas", type=str, default=DEF_WATER_AREAS,

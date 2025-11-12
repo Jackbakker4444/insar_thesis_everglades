@@ -82,13 +82,13 @@ Across ALL AREAS (into <areas_root>/results/):
 
 How to run
 ----------
-# All areas, default metric rmse_cm and DEM correction = RAW
+# All areas, default metric nrmse_sd and DEM correction = RAW
 python 6_inferential_tests.py
 
 # Single area
 python 6_inferential_tests.py --area ENP
 
-# Use log-RMSE instead of RMSE
+# Use log-RMSE instead of NRMSE_SD
 python 6_inferential_tests.py --metric log_rmse_cm
 
 # DEM comparison using IONO instead of RAW
@@ -275,15 +275,20 @@ def _build_blocks_for_pair(df_pair: pd.DataFrame, dem_sel: str, metric_col: str,
     # Subject ID = replicate x n_cal
     cat["block_id"] = cat.apply(lambda r: f"rep{int(r['replicate'])}_n{int(r['n_cal'])}", axis=1)
 
-    # Keep only complete blocks that have all requested variants
-    grp = cat.groupby(["pair","block_id"], observed=False)
-    ok_blocks = grp["variant"].apply(lambda s: set(variant_list).issubset(set(s))).reset_index()
-    ok_blocks = ok_blocks[ok_blocks["variant"] == True][["pair","block_id"]]  # noqa: E712
+    # Keep only blocks that have ALL requested variants with FINITE values
+    pv = (cat.pivot_table(index=["pair","block_id"], columns="variant", values="value",
+                        aggfunc="mean", observed=False)
+            .reindex(columns=variant_list))
+    pv = pv.replace([np.inf, -np.inf], np.nan)  # safety
+    pv = pv.dropna(axis=0, how="any")           # only complete, finite rows remain
 
-    out = cat.merge(ok_blocks, on=["pair","block_id"], how="inner")
-    out = out[["area","pair","block_id","variant","value"]].dropna(subset=["value"])
+    if pv.empty:
+        return pd.DataFrame(columns=["area","pair","block_id","variant","value"])
+
+    out = (pv.stack("variant").rename("value").reset_index()
+            .merge(cat[["pair","block_id","area"]].drop_duplicates(), on=["pair","block_id"], how="left"))
     out["variant"] = pd.Categorical(out["variant"], categories=variant_list, ordered=True)
-    return out
+    return out[["area","pair","block_id","variant","value"]]
 
 
 def _anova_rm_oneway(df_long: pd.DataFrame, dv: str, subject: str, within: str):
@@ -656,7 +661,7 @@ def _process_corrections_for_variantset(area_name: str, df_area: pd.DataFrame,
 
 # ------------------------------ Whole-area process ------------------------------
 
-def process_area(area_dir: Path, metric_col: str = "rmse_cm",
+def process_area(area_dir: Path, metric_col: str = "nrmse_sd",
                  dem_corr: str = DEM_CORR_DEFAULT, alpha: float = 0.05):
     """Run all requested tests for a single AREA and write outputs (all densities).
 
@@ -664,7 +669,7 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm",
     ----------
     area_dir : pathlib.Path
         Path to the area directory containing ``results/accuracy_metrics.csv``.
-    metric_col : str, default "rmse_cm"
+    metric_col : str, default "nrmse_sd"
         Metric to analyze (lower is better), e.g., ``"rmse_cm"`` or ``"log_rmse_cm"``.
     dem_corr : str, default DEM_CORR_DEFAULT
         Correction level to use for DEM (SRTM vs 3DEP) comparisons.
@@ -689,6 +694,10 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm",
     missing = needed - set(df.columns)
     if missing:
         raise RuntimeError(f"{metrics_csv} missing required columns: {missing}")
+    df["dem"]    = df["dem"].astype(str).str.strip().str.upper()
+    df["corr"]   = df["corr"].astype(str).str.strip().str.upper()
+    df["method"] = df["method"].astype(str).str.strip().str.lower()
+    
     df["pair"] = df.apply(lambda r: _pair_tag(str(r["pair_ref"]), str(r["pair_sec"])), axis=1)
 
     corr_for_global_by_set = {}
@@ -709,18 +718,26 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm",
 
     for p in sorted(df["pair"].unique().tolist()):
         dfp = df[df["pair"]==p].copy()
-        sub = dfp[(dfp["method"]==METHOD_LS) & (dfp["corr"]==corr_used)].copy()
+        
+        sub = dfp[(dfp["method"] == METHOD_LS) & (dfp["corr"] == corr_used)].copy()
+        if sub.empty:
+            continue
+
+        # Keep only finite metric rows; tiny validation sets → nrmse_sd = NaN are dropped here
+        sub = sub[np.isfinite(sub[metric_col])].copy()
         if sub.empty:
             continue
 
         sub["block_id"] = sub.apply(lambda r: f"rep{int(r['replicate'])}_n{int(r['n_cal'])}", axis=1)
-        have_both = sub.groupby("block_id", observed=False)["dem"].apply(lambda s: set(s) >= {"SRTM","3DEP"})
+        have_both = sub.groupby("block_id", observed=False)["dem"].apply(lambda s: {"SRTM","3DEP"}.issubset(set(s)))
         ok_blocks = have_both[have_both].index.tolist()
         sub_ok = sub[sub["block_id"].isin(ok_blocks)].copy()
         if sub_ok.empty:
             continue
-        wide = sub_ok.pivot_table(index="block_id", columns="dem", values=metric_col, aggfunc="mean", observed=False) \
-                    .dropna(subset=["SRTM","3DEP"])
+
+        wide = (sub_ok.pivot_table(index="block_id", columns="dem", values=metric_col, aggfunc="mean", observed=False)
+                    .reindex(columns=["SRTM","3DEP"])
+                    .dropna(subset=["SRTM","3DEP"]))   
         if wide.shape[0] < 2:
             continue
         t, pval, n = ttest_rel_safe(wide["3DEP"], wide["SRTM"])
@@ -757,8 +774,10 @@ def process_area(area_dir: Path, metric_col: str = "rmse_cm",
     dem_area_tbl = res_dir / f"dem_area_summary_table{suffix}.csv"
     if dem_pairs_long:
         long_dem = pd.concat(dem_pairs_long, ignore_index=True)
-        wide_pairs = long_dem.pivot_table(index="pair", columns="dem", values="value", aggfunc="mean", observed=False) \
-                             .dropna(subset=["SRTM","3DEP"])
+        wide_pairs = (long_dem.pivot_table(index="pair", columns="dem", values="value",
+                                        aggfunc="mean", observed=False)
+                            .reindex(columns=["SRTM","3DEP"])
+                            .dropna(subset=["SRTM","3DEP"]))
         if wide_pairs.shape[0] >= 2:
             t_area, p_area, _ = ttest_rel_safe(wide_pairs["3DEP"], wide_pairs["SRTM"])
             pd.DataFrame([{
@@ -803,7 +822,7 @@ def main():
         Root with per-area subfolders.
     --area : str, optional
         If provided, only process this AREA (subfolder name).
-    --metric : str, default "rmse_cm"
+    --metric : str, default "nrmse_sd"
         Metric column to analyze (e.g., "rmse_cm", "log_rmse_cm").
     --dem-corr : str, default DEM_CORR_DEFAULT ("RAW")
         Correction used for DEM comparisons (IDW not applicable here).
@@ -815,7 +834,7 @@ def main():
                     help="Root containing per-area subfolders.")
     ap.add_argument("--area", type=str,
                     help="Only process this AREA (subfolder name). If omitted, process all areas.")
-    ap.add_argument("--metric", type=str, default="rmse_cm",
+    ap.add_argument("--metric", type=str, default="nrmse_sd",
                     help="Metric column to analyze (e.g., rmse_cm or log_rmse_cm).")
     ap.add_argument("--dem-corr", type=str, default=DEM_CORR_DEFAULT,
                     help=f"Correction to use for DEM comparisons (default {DEM_CORR_DEFAULT}; options: {sorted(DEM_CORR_CHOICES)}).")
@@ -882,9 +901,11 @@ def main():
     if all_dem:
         dem_all = pd.concat(all_dem, ignore_index=True)
         corr_used = str(args.dem_corr).upper()
-        wide_all = dem_all[dem_all["corr_used"]==corr_used] \
-            .pivot_table(index=["area","pair"], columns="dem", values="value", aggfunc="mean", observed=False) \
-            .dropna(subset=["SRTM","3DEP"])
+        wide_all = (dem_all[dem_all["corr_used"] == corr_used]
+                    .pivot_table(index=["area","pair"], columns="dem", values="value",
+                                aggfunc="mean", observed=False)
+                    .reindex(columns=["SRTM","3DEP"])
+                    .dropna(subset=["SRTM","3DEP"]))
         if wide_all.shape[0] >= 2:
             t_all, p_all, _ = ttest_rel_safe(wide_all["3DEP"], wide_all["SRTM"])
             pd.DataFrame([{

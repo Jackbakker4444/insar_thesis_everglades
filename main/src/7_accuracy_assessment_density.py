@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-7_accuracy_assessment_density.py — Single-raster density & accuracy assessment (SRTM+RAW only)
+7_accuracy_assessment_density.py — Single-raster density & accuracy assessment (3DEP+TROPO only)
 
 Overview
 --------
 This script evaluates, per area and per interferometric pair, a **single fixed raster
-choice** — DEM = **SRTM** and correction = **RAW** — against EDEN water gauges to
+choice** — DEM = **3DEP** and correction = **TROPO** — against EDEN water gauges to
 produce accuracy-versus-density curves. Two accuracy baselines are computed **using
 identical gauge sets and splits at every step**:
 
@@ -19,20 +19,18 @@ The workflow is:
      iteratively removing the **closest (most crowded) calibration gauge** based on
      nearest-neighbor distance within the current calibration set, down to **1 gauge**.
   3) At each step we log accuracy metrics and the implied **density** (km²/gauge), where
-     the km² refers to the valid-data footprint of the SRTM+RAW raster.
+     the km² refers to the valid-data footprint of the 3DEP+TROPO raster.
 
 Inputs & outputs
 ----------------
 Per AREA directory (under --areas-root):
   Input
     • water_gauges/eden_gauges.csv (wide daily; must include the pair dates)
-    • interferograms/<AREA>_vertical_cm_<REF>_<SEC>_SRTM_RAW.tif
+    • interferograms/<AREA>_vertical_cm_<REF>_<SEC>_3DEP_TROPO.tif
   Output (in <AREA>/results)
-    • accuracy_metrics_density_SRTM_RAW.csv
+    • accuracy_metrics_density_3DEP_TROPO.csv
     • GeoTIFFs per pair:
-        - dens_idw60_SRTM_RAW_<PAIR>.tif        (IDW Δh_vis from 60% cal gauges)
-        - dens_cal_60pct_SRTM_RAW_<PAIR>.tif    (LS-calibrated raster using 60% gauges)
-        - dens_cal_1g_SRTM_RAW_<PAIR>.tif       (LS-calibrated raster using 1 gauge)
+        - dens_cal_1g_3DEP_TROPO_<PAIR>.tif       (LS-calibrated raster using 1 gauge)
 
 Run examples
 ------------
@@ -41,16 +39,15 @@ All areas:
 One area (e.g., ENP):
   python 7_accuracy_assessment_density.py --area ENP
 Tuning:
-  python 7_accuracy_assessment_density.py --reps 50 --seed 42 --idw-power 2.0 \
-    --spread-top-m 5   # (deprecated; no effect)
+  python 7_accuracy_assessment_density.py --reps 50 --seed 42 --idw-power 2.0 
 
 Design guarantees
 -----------------
 • Pair discovery is **strict**: only files named
-  <AREA>_vertical_cm_<REF>_<SEC>_SRTM_RAW.tif are used.
+  <AREA>_vertical_cm_<REF>_<SEC>_3DEP_TROPO.tif are used.
 • The IDW baseline *always* uses the **same gauges** and **same splits** as LS:
   identical valid mask, identical cal/val indices at each step.
-• IDW grid exports are masked by the SRTM+RAW raster's NaN mask.
+• IDW grid exports are masked by the 3DEP+TROPO raster's NaN mask.
 
 Assumptions
 -----------
@@ -89,8 +86,8 @@ for _n in ("rasterio", "rasterio._io", "rasterio.env", "rasterio._base"):
 
 # ------------------------------ Fixed setup ----------------------------------
 AREAS_ROOT_DEFAULT      = Path("/mnt/DATA2/bakke326l/processing/areas")
-DEM_FIXED               = "SRTM"
-CORR_FIXED              = "RAW"
+DEM_FIXED               = "3DEP"
+CORR_FIXED              = "TROPO"
 
 # Other defaults
 REPS_DEFAULT            = 100
@@ -147,7 +144,7 @@ def _find_pairs_for_dem_corr(area_dir: Path, area_name: str, dem: str, corr: str
     return sorted(set(tags))
 
 def _raster_path(area_dir: Path, area_name: str, pair_tag: str, dem: str, corr: str) -> Optional[Path]:
-    """Build the expected SRTM+RAW raster path for a given AREA and PAIR.
+    """Build the expected 3DEP+TROPO raster path for a given AREA and PAIR.
 
     Returns the path if it exists, else None.
     """
@@ -375,7 +372,7 @@ def _write_tif_like(src_tif: Path, out_tif: Path, array2d: np.ndarray, nodata_va
 
 def _make_idw_grid_on_raster(px, py, pz, ref_tif: Path, power: float) -> np.ndarray:
     """
-    Build an IDW Δh_vis grid masked by the SAME valid pixels as the SRTM+RAW raster.
+    Build an IDW Δh_vis grid masked by the SAME valid pixels as the 3DEP+TROPO raster.
 
     px/py/pz must come from the RAW run's calibration indices to preserve consistency.
     """
@@ -431,18 +428,18 @@ def _evaluate_pair_single_raster_and_exports(
     area_name: str,
     pair_tag: str,
     gauge_csv: Path,        # wide EDEN CSV
-    raster_tif: Path,        # the single chosen raster (DEM+CORR) => SRTM+RAW
+    raster_tif: Path,       
     dem: str,
     corr: str,
     n_repl: int,
     seed: int,
     idw_power: float,
 ) -> pd.DataFrame:
-    """Evaluate one (AREA, PAIR) for the fixed SRTM+RAW raster and export artifacts.
+    """Evaluate one (AREA, PAIR) for the fixed 3DEP+TROPO raster and export artifacts.
 
     The initial calibration set is a **random 60%** split of usable gauges; the
     remaining **40%** are held out for validation and remain fixed. We then
-    iteratively **remove** the **closest (most crowded)** calibration gauge to
+    iteratively **remove** 1 of the 4 **closest (most crowded)** calibration gauges to
     generate a full accuracy-density trajectory down to **1 gauge**. At each step,
     **LS and IDW** are computed on the same split.
     """
@@ -558,30 +555,14 @@ def _evaluate_pair_single_raster_and_exports(
                     export_plan["single_idx"] = int(cur_idx[0])
                 break
 
-            crowded = _crowded_candidates(lon_all, lat_all, cur_idx, top_n=1)
-            drop_pos = int(crowded[0]) if crowded.size else 0
+            cand_pos = _crowded_candidates(lon_all, lat_all, cur_idx, top_n=4)
+            if cand_pos.size:
+                drop_pos = int(rng.choice(cand_pos))   
+            else:
+                drop_pos = int(rng.integers(len(cur_idx)))  # fallback
             cur_idx = np.delete(cur_idx, drop_pos)
 
     # -------------------------- Per-pair GeoTIFFs ---------------------------
-    try:
-        cal60 = export_plan["cal60_idx"]
-        px = lon_all[cal60]; py = lat_all[cal60]; pz = dh_all[cal60]
-        idw_grid = _make_idw_grid_on_raster(px, py, pz, ref_tif=raster_tif, power=idw_power)
-        out_idw = results_dir / f"dens_idw60_{dem}_{corr}_{pair_tag}.tif"
-        _write_tif_like(raster_tif, out_idw, idw_grid)
-        print(f"  🗺️  IDW Δh_vis (60%) written: {out_idw}")
-    except Exception as e:
-        print(f"  ⚠️  IDW export failed for {pair_tag}: {e}")
-
-    try:
-        a60, b60 = _fit_ls_params(insar_all[export_plan["cal60_idx"]], dh_all[export_plan["cal60_idx"]])
-        arr60 = _apply_calibration_to_raster(raster_tif, a60, b60)
-        out_cal60 = results_dir / f"dens_cal_60pct_{dem}_{corr}_{pair_tag}.tif"
-        _write_tif_like(raster_tif, out_cal60, arr60)
-        print(f"  🗺️  Calibrated (60%) written: {out_cal60}")
-    except Exception as e:
-        print(f"  ⚠️  Calibrated (60%) failed for {pair_tag}: {e}")
-
     try:
         single_idx = export_plan.get("single_idx", None)
         if single_idx is None:
@@ -599,7 +580,7 @@ def _evaluate_pair_single_raster_and_exports(
 # ================================ Area driver ================================
 def _process_area(area_dir: Path,
                   reps: int, seed: int, idw_power: float) -> None:
-    """Process a single AREA: evaluate all SRTM+RAW pairs and write fresh outputs."""
+    """Process a single AREA: evaluate all 3DEP+TROPO pairs and write fresh outputs."""
     area_name   = area_dir.name
     dem         = DEM_FIXED
     corr        = CORR_FIXED
@@ -663,7 +644,7 @@ def main():
         Controls the inverse-distance weighting power for the IDW baseline.
     """
     ap = argparse.ArgumentParser(
-        description="SRTM+RAW accuracy & density assessment with random 60/40 cal/val split and closest-gauge sweep."
+        description="3DEP+TROPO accuracy & density assessment with random 60/40 cal/val split and closest-gauge sweep."
     )
     ap.add_argument("--areas-root", type=str, default=str(AREAS_ROOT_DEFAULT),
                     help="Root folder containing per-area subfolders (default: %(default)s)")
