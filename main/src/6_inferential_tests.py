@@ -27,14 +27,16 @@ A) Corrections (two parallel assessments):
      - Per-pair pairwise paired t-tests (Holm adjusted).
      - Area-level repeated-measures ANOVA (subject = pair; uses per-pair means).
      - Area-level ranking (WITH IDW only): mean/SD/median/IQR, ordered best→worst,
-       enriched with adjusted p-values vs next/lower and vs RAW (two-sided + one-sided-improve).
+       enriched with adjusted p-values vs next/lower and vs RAW
+       (two-sided difference from RAW, plus optional one-sided "improvement").
      - All-areas (global) repeated-measures ANOVA + ranking (WITH IDW only).
 
    Notes:
    - **Corrections analyses use DEM=SRTM only** for LS variants. Pairs without SRTM for
      the four LS corrections are skipped. IDW rows are included for the "with_idw" set.
+   - All tests (ANOVA/t-tests) use the chosen metric (default: nrmse_sd).
 
-B) DEMs (SRTM vs 3DEP), correction FIXED but SWITCHABLE (default RAW):
+B) DEMs (SRTM vs 3DEP), correction FIXED but SWITCHABLE (default TROPO):
    - Per-pair paired t-test (subject = block).
    - Area-level paired t-test (subject = pair; per-pair means).
    - All-areas paired t-test (subject = area::pair).
@@ -45,7 +47,7 @@ Design assumptions
 - Script 5 writes accuracy rows for multiple densities (e.g., 60/40, 45/55, 30/70, 15/85),
   for each replicate and variant.
 - Required columns: area, pair_ref, pair_sec, dem, corr, method, replicate, n_cal, <metric>
-- Lower metric (e.g., rmse_cm) is better.
+- Lower metric (e.g., rmse_cm, nrmse_sd) is better.
 
 Inputs
 ------
@@ -70,19 +72,32 @@ Per AREA (into <areas_root>/<AREA>/results/):
   dem_per_pair_ttest__<CORR>.csv
   dem_area_overall_ttest__<CORR>.csv
   dem_area_summary_table__<CORR>.csv
+  dem_rank_by_area__<CORR>.csv      (RMSE-based per-area DEM rank table)
 
 Across ALL AREAS (into <areas_root>/results/):
   corrections_all_areas_anova__with_idw.csv
   corrections_all_areas_ranking__with_idw.csv
   corrections_all_areas_anova__no_idw.csv
-  dem_all_areas_ttest__<CORR>.csv
-  dem_each_area_overall_ttest__<CORR>.csv
+  corrections_all_areas_rank_rmse__with_idw.csv       (RMSE-based global corrections rank)
   corrections_best_by_area__with_idw.csv
   corrections_best_by_area__no_idw.csv
+  corrections_order_by_area__with_idw.csv             (best→4th per area, RMSE means)
+  dem_all_areas_ttest__<CORR>.csv
+  dem_all_areas_rank__<CORR>.csv                      (RMSE-based global DEM rank)
+  dem_each_area_overall_ttest__<CORR>.csv
+
+P-values vs RAW
+---------------
+- For corrections, p-values vs RAW are **two-sided paired t-tests** on the chosen metric
+  (e.g. nrmse_sd) with Holm correction:
+    - `p_vs_raw_two_sided` (unadjusted)
+    - `p_vs_raw_two_sided_holm` (Holm-adjusted)
+- One-sided "improvement" p-values (H1: variant < RAW) are still computed, but you can
+  ignore them in the thesis tables.
 
 How to run
 ----------
-# All areas, default metric nrmse_sd and DEM correction = RAW
+# All areas, default metric nrmse_sd and DEM correction = TROPO
 python 6_inferential_tests.py
 
 # Single area
@@ -91,13 +106,14 @@ python 6_inferential_tests.py --area ENP
 # Use log-RMSE instead of NRMSE_SD
 python 6_inferential_tests.py --metric log_rmse_cm
 
-# DEM comparison using IONO instead of RAW
+# DEM comparison using IONO instead of TROPO
 python 6_inferential_tests.py --dem-corr IONO
 """
 
 from __future__ import annotations
 from pathlib import Path
 import argparse
+import re
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -115,7 +131,7 @@ except Exception:
 CORR_DEM_ENFORCED = "SRTM"
 
 # Default correction to use for DEM comparisons (can be overridden via --dem-corr)
-DEM_CORR_DEFAULT = "RAW"
+DEM_CORR_DEFAULT = "TROPO"
 
 METHOD_IDW = "idw_dhvis"
 METHOD_LS  = "least_squares"
@@ -130,25 +146,20 @@ VARIANT_SETS = {
 
 DEM_CORR_CHOICES = set(CORR_LEVELS)  # correction used for DEM comparisons (IDW not applicable)
 
+# ------------------------------ Small formatting helpers -------------------------
+
+def _fmt_pm(mean: float, sd: float) -> str:
+    """Format 'mean ± sd' for table-ready RMSE strings."""
+    return f"{mean:.3f} ± {sd:.3f}" if np.isfinite(mean) and np.isfinite(sd) else ""
+
+def _fmt_med_iqr(median: float, iqr: float) -> str:
+    """Format 'median [IQR]' for table-ready RMSE strings."""
+    return f"{median:.3f} [{iqr:.3f}]" if np.isfinite(median) and np.isfinite(iqr) else ""
+
 # ------------------------------ Safe stats helpers --------------------------------
 
 def ttest_rel_safe(a, b, eps: float = 1e-12):
-    """Paired t-test with a stability guard; returns ``(t, p, n)``.
-
-    Parameters
-    ----------
-    a, b : array-like
-        Two matched samples. Non-finite pairs are dropped prior to testing.
-    eps : float, default 1e-12
-        Threshold for deeming the difference vector nearly constant; in that
-        case the function returns ``t=0, p=1`` to avoid numerical issues.
-
-    Returns
-    -------
-    tuple[float, float, int]
-        ``t`` value, two-sided ``p`` value, and effective sample size ``n`` after
-        filtering.
-    """
+    """Paired t-test with a stability guard; returns ``(t, p, n)``."""
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     mask = np.isfinite(a) & np.isfinite(b)
@@ -163,25 +174,7 @@ def ttest_rel_safe(a, b, eps: float = 1e-12):
     return float(t), float(p), int(n)
 
 def one_sided_from_two_sided(t_val: float, p_two: float, n: int, alternative: str = "less") -> float:
-    """Convert a two-sided p-value to a one-sided p-value using the t-statistic sign.
-
-    Parameters
-    ----------
-    t_val : float
-        Observed t-statistic (paired design).
-    p_two : float
-        Reported two-sided p-value for the same test.
-    n : int
-        Sample size (paired). Degrees of freedom are ``df = n − 1``.
-    alternative : {"less", "greater"}, default "less"
-        Direction of the one-sided alternative. For corrections we use
-        ``"less"`` to test H1: variant < RAW (i.e., better if lower metric).
-
-    Returns
-    -------
-    float
-        One-sided p-value, or NaN if inputs are invalid.
-    """
+    """Convert a two-sided p-value to a one-sided p-value using the t-statistic sign."""
     if not np.isfinite(t_val) or n < 2 or not np.isfinite(p_two):
         return np.nan
     df = max(n - 1, 1)
@@ -194,52 +187,24 @@ def one_sided_from_two_sided(t_val: float, p_two: float, n: int, alternative: st
 # ------------------------------ Utility helpers --------------------------------
 
 def _pair_tag(ref: str, sec: str) -> str:
-    """Build a compact pair tag ``YYYYMMDD_YYYYMMDD`` from ISO dates.
-
-    Examples
-    --------
-    ``_pair_tag("2010-03-23", "2010-05-08") -> "20100323_20100508"``
-    """
+    """Build a compact pair tag ``YYYYMMDD_YYYYMMDD`` from ISO dates."""
     return f"{ref.replace('-','')}_{sec.replace('-','')}"
 
-def _choose_dem_for_corrections(df_pair: pd.DataFrame) -> str | None:
-    """Enforce DEM=SRTM for corrections comparisons.
+def _parse_block_id(block_id: str) -> tuple[int, int]:
+    """Extract (replicate, n_cal) from a block_id like 'rep3_n60'."""
+    m = re.match(r"rep(\d+)_n(\d+)", str(block_id))
+    if not m:
+        return np.nan, np.nan
+    return int(m.group(1)), int(m.group(2))
 
-    Returns ``"SRTM"`` if present in ``df_pair['dem']``; otherwise ``None`` to
-    signal that this pair should be skipped in corrections analyses.
-    """
+def _choose_dem_for_corrections(df_pair: pd.DataFrame) -> str | None:
+    """Enforce DEM=SRTM for corrections comparisons."""
     dems_present = set(df_pair["dem"].dropna().astype(str).unique().tolist())
     return "SRTM" if "SRTM" in dems_present else None
 
 def _build_blocks_for_pair(df_pair: pd.DataFrame, dem_sel: str, metric_col: str,
                            variant_list: list[str]) -> pd.DataFrame:
-    """Construct long-format data for per-pair corrections ANOVA.
-
-    Uses **all blocks** (``replicate x n_cal``) available for the pair, but keeps
-    only those blocks where **all** requested variants exist.
-
-    Parameters
-    ----------
-    df_pair : pandas.DataFrame
-        Subset of the metrics table for a single pair.
-    dem_sel : str
-        The enforced DEM to use for LS variants (typically ``"SRTM"``).
-    metric_col : str
-        Name of the metric column to analyze (e.g., ``"rmse_cm"``).
-    variant_list : list[str]
-        Ordered list of variants to include (e.g., ``["RAW","IONO","TROPO","TROPO_IONO","IDW"]``).
-
-    Returns
-    -------
-    pandas.DataFrame
-        Long table with columns ``['area','pair','block_id','variant','value']``.
-
-    Notes
-    -----
-    • LS rows are filtered to ``dem == dem_sel``;
-    • IDW rows are not DEM-filtered (their ``dem`` is ``"N/A"``).
-    • ``block_id`` uniquely identifies a calibration density within a replicate.
-    """
+    """Construct long-format data for per-pair corrections ANOVA."""
     df = df_pair.copy()
     frames = []
 
@@ -277,26 +242,23 @@ def _build_blocks_for_pair(df_pair: pd.DataFrame, dem_sel: str, metric_col: str,
 
     # Keep only blocks that have ALL requested variants with FINITE values
     pv = (cat.pivot_table(index=["pair","block_id"], columns="variant", values="value",
-                        aggfunc="mean", observed=False)
+                          aggfunc="mean", observed=False)
             .reindex(columns=variant_list))
-    pv = pv.replace([np.inf, -np.inf], np.nan)  # safety
-    pv = pv.dropna(axis=0, how="any")           # only complete, finite rows remain
+    pv = pv.replace([np.inf, -np.inf], np.nan)
+    pv = pv.dropna(axis=0, how="any")
 
     if pv.empty:
         return pd.DataFrame(columns=["area","pair","block_id","variant","value"])
 
     out = (pv.stack("variant").rename("value").reset_index()
-            .merge(cat[["pair","block_id","area"]].drop_duplicates(), on=["pair","block_id"], how="left"))
+             .merge(cat[["pair","block_id","area"]].drop_duplicates(),
+                    on=["pair","block_id"], how="left"))
     out["variant"] = pd.Categorical(out["variant"], categories=variant_list, ordered=True)
     return out[["area","pair","block_id","variant","value"]]
 
 
 def _anova_rm_oneway(df_long: pd.DataFrame, dv: str, subject: str, within: str):
-    """Run one-way repeated-measures ANOVA via ``statsmodels.AnovaRM``.
-
-    Returns the fitted object or ``None`` if there are not enough observations
-    or the model fails to fit.
-    """
+    """Run one-way repeated-measures ANOVA via ``statsmodels.AnovaRM``."""
     if df_long.empty:
         return None
     check = df_long[[subject, within]].drop_duplicates().groupby(subject, observed=False).size()
@@ -310,11 +272,7 @@ def _anova_rm_oneway(df_long: pd.DataFrame, dv: str, subject: str, within: str):
 
 def _pairwise_within_subject_ttests(df_long: pd.DataFrame, subject: str, within: str,
                                     dv: str, variant_list: list[str]) -> pd.DataFrame:
-    """Paired t-tests across levels of ``within``, aligned by ``subject``.
-
-    Produces a table with columns: ``level_a, level_b, t, p_raw, p_holm_two_sided,
-    mean_diff, n``. Holm correction is applied over the tested pairs.
-    """
+    """Paired t-tests across levels of ``within``, aligned by ``subject``."""
     wide = df_long.pivot_table(index=subject, columns=within, values=dv,
                                aggfunc="mean", observed=False)
     keep_cols = [c for c in variant_list if c in wide.columns]
@@ -335,11 +293,7 @@ def _pairwise_within_subject_ttests(df_long: pd.DataFrame, subject: str, within:
 
 def _summarize_variant_means(df_long: pd.DataFrame, subject_col: str,
                              variant_list: list[str]) -> pd.DataFrame:
-    """Compute mean/SD/median/IQR per variant across subjects and rank them.
-
-    Returns a table with columns: ``variant, mean, sd, median, iqr, n_subjects, rank``
-    (lower metric values rank better).
-    """
+    """Compute mean/SD/median/IQR per variant across subjects and rank them."""
     def iqr(x):
         q = np.nanpercentile(x, [25, 75])
         return float(q[1]-q[0])
@@ -362,10 +316,7 @@ def _summarize_variant_means(df_long: pd.DataFrame, subject_col: str,
     return out
 
 def _extract_adj_p(pw_df: pd.DataFrame, a: str, b: str) -> float:
-    """Fetch Holm-adjusted two-sided p-value for ``a`` vs ``b`` from a pairwise table.
-
-    The input table must have columns ``level_a``, ``level_b``, ``p_holm_two_sided``.
-    """
+    """Fetch Holm-adjusted two-sided p-value for ``a`` vs ``b`` from a pairwise table."""
     if pw_df is None or pw_df.empty:
         return np.nan
     row = pw_df[((pw_df["level_a"]==a) & (pw_df["level_b"]==b)) |
@@ -374,15 +325,7 @@ def _extract_adj_p(pw_df: pd.DataFrame, a: str, b: str) -> float:
 
 def _best_second_summary(df_long: pd.DataFrame, subject_col: str,
                          variant_list: list[str]):
-    """Produce ranking + summary dict for the best and second-best variants.
-
-    Returns
-    -------
-    (rank_table, summary_dict)
-        ``rank_table`` is the full ranking; ``summary_dict`` includes keys like
-        ``best_variant``, ``best_mean``, ``second_variant``, and adjusted p-values
-        comparing the top entries.
-    """
+    """Produce ranking + summary dict for the best and second-best variants."""
     if df_long.empty:
         return pd.DataFrame(), {}
     rank_tbl = _summarize_variant_means(df_long, subject_col=subject_col, variant_list=variant_list)
@@ -433,13 +376,15 @@ def _best_second_summary(df_long: pd.DataFrame, subject_col: str,
 
 def _vs_raw_table(df_long: pd.DataFrame, subject_col: str,
                   variant_list: list[str]) -> pd.DataFrame:
-    """Build a p-value table for each correction vs RAW across subjects.
+    """
+    Build a p-value table for each correction vs RAW across subjects.
 
-    Reports per variant (excluding RAW):
-      • ``n_subjects`` used,
-      • ``mean_variant``, ``mean_raw``, and ``mean_diff_variant_minus_raw`` (negative → better than RAW),
-      • paired-t ``t`` and two-sided ``p`` values,
-      • one-sided p for improvement (H1: variant < RAW), plus Holm-adjusted one-sided p.
+    Tests are based on the analysis metric (e.g., nrmse_sd) and are:
+      - Two-sided paired t-tests vs RAW  -> p_two_sided
+      - Holm-adjusted two-sided          -> p_two_sided_holm
+
+    One-sided 'improvement' p-values (H1: variant < RAW) are still provided but
+    no longer used in the rank tables by default.
     """
     if df_long.empty or "RAW" not in variant_list:
         return pd.DataFrame()
@@ -450,17 +395,25 @@ def _vs_raw_table(df_long: pd.DataFrame, subject_col: str,
         return pd.DataFrame()
 
     rows = []
-    p_one = []
+    p_two_list = []
+    p_one_list = []
+
     variants = [v for v in variant_list if v != "RAW" and v in wide.columns]
     for v in variants:
         w = wide[["RAW", v]].dropna(axis=0, how="any")
         if w.shape[0] < 2:
             rows.append({"variant": v, "n_subjects": int(w.shape[0])})
-            p_one.append(np.nan)
+            p_two_list.append(np.nan)
+            p_one_list.append(np.nan)
             continue
-        t, p_two, n = ttest_rel_safe(w[v], w["RAW"])  # diff = v - RAW
+
+        # diff = variant - RAW on the chosen metric (e.g., nrmse_sd)
+        t, p_two, n = ttest_rel_safe(w[v], w["RAW"])
         mean_diff = float((w[v] - w["RAW"]).mean()) if n >= 1 else np.nan
-        p_one_sided = one_sided_from_two_sided(t, p_two, n, alternative="less")  # H1: v < RAW (better)
+
+        # One-sided improvement (variant < RAW) — kept for completeness
+        p_one_sided = one_sided_from_two_sided(t, p_two, n, alternative="less")
+
         rows.append({
             "variant": v,
             "n_subjects": int(n),
@@ -471,16 +424,29 @@ def _vs_raw_table(df_long: pd.DataFrame, subject_col: str,
             "p_two_sided": float(p_two),
             "p_one_sided_improve": float(p_one_sided),
         })
-        p_one.append(p_one_sided)
+        p_two_list.append(p_two)
+        p_one_list.append(p_one_sided)
 
     if rows:
-        finite = [p for p in p_one if np.isfinite(p)]
-        if finite:
-            _, p_holm, _, _ = multipletests(finite, method="holm")
+        # Holm adjustment for TWO-SIDED p-values (difference from RAW)
+        finite_two = [p for p in p_two_list if np.isfinite(p)]
+        if finite_two:
+            _, p_two_holm, _, _ = multipletests(finite_two, method="holm")
+            j = 0
+            for r in rows:
+                if np.isfinite(r.get("p_two_sided", np.nan)):
+                    r["p_two_sided_holm"] = float(p_two_holm[j]); j += 1
+                else:
+                    r["p_two_sided_holm"] = np.nan
+
+        # Optional Holm for one-sided improvement (kept, but not used anymore)
+        finite_one = [p for p in p_one_list if np.isfinite(p)]
+        if finite_one:
+            _, p_one_holm, _, _ = multipletests(finite_one, method="holm")
             j = 0
             for r in rows:
                 if np.isfinite(r.get("p_one_sided_improve", np.nan)):
-                    r["p_one_sided_improve_holm"] = float(p_holm[j]); j += 1
+                    r["p_one_sided_improve_holm"] = float(p_one_holm[j]); j += 1
                 else:
                     r["p_one_sided_improve_holm"] = np.nan
 
@@ -490,7 +456,7 @@ def _vs_raw_table(df_long: pd.DataFrame, subject_col: str,
 
 def _enriched_ranking(df_long: pd.DataFrame, subject_col: str,
                       variant_list: list[str]) -> pd.DataFrame:
-    """Ranking + extra p-value columns (two-sided & one-sided-improve vs RAW)."""
+    """Ranking + extra p-value columns (two-sided vs RAW, plus optional one-sided-improve)."""
     rank_tbl = _summarize_variant_means(df_long, subject_col=subject_col, variant_list=variant_list)
     if rank_tbl.empty:
         return rank_tbl
@@ -499,6 +465,26 @@ def _enriched_ranking(df_long: pd.DataFrame, subject_col: str,
                                          dv="value", variant_list=variant_list)
     vsraw = _vs_raw_table(df_long, subject_col=subject_col, variant_list=variant_list)
     vsraw = vsraw.set_index("variant") if not vsraw.empty else pd.DataFrame()
+
+    # Compute descriptive RMSE + bias (if present)
+    def _iqr_arr(a):
+        a = np.asarray(a, float)
+        q = np.nanpercentile(a, [25, 75]); return float(q[1]-q[0])
+
+    rmse_sd_map, rmse_med_map, rmse_iqr_map = {}, {}, {}
+    bias_mean_map, bias_sd_map = {}, {}
+
+    if "rmse_value" in df_long.columns:
+        g = df_long.groupby("variant", observed=False)["rmse_value"]
+        rmse_sd_map  = g.std().to_dict()
+        rmse_med_map = g.median().to_dict()
+        rmse_iqr_map = {v: _iqr_arr(df_long.loc[df_long["variant"]==v, "rmse_value"].values)
+                        for v in g.groups.keys()}
+
+    if "bias_value" in df_long.columns:
+        gb = df_long.groupby("variant", observed=False)["bias_value"]
+        bias_mean_map = gb.mean().to_dict()
+        bias_sd_map   = gb.std().to_dict()
 
     def _p_adj(a, b):
         return _extract_adj_p(pw, str(a), str(b))
@@ -517,13 +503,20 @@ def _enriched_ranking(df_long: pd.DataFrame, subject_col: str,
             if lower_ps:
                 p_min_lower = float(np.nanmin(lower_ps))
 
+        # VS RAW: two-sided p-values (difference), plus optional one-sided
         p2_raw = np.nan
+        p2_raw_holm = np.nan
         p1_raw = np.nan
         p1_raw_holm = np.nan
         if not vsraw.empty and v in vsraw.index:
-            p2_raw = float(vsraw.loc[v, "p_two_sided"]) if "p_two_sided" in vsraw.columns else np.nan
-            p1_raw = float(vsraw.loc[v, "p_one_sided_improve"]) if "p_one_sided_improve" in vsraw.columns else np.nan
-            p1_raw_holm = float(vsraw.loc[v, "p_one_sided_improve_holm"]) if "p_one_sided_improve_holm" in vsraw.columns else np.nan
+            if "p_two_sided" in vsraw.columns:
+                p2_raw = float(vsraw.loc[v, "p_two_sided"])
+            if "p_two_sided_holm" in vsraw.columns:
+                p2_raw_holm = float(vsraw.loc[v, "p_two_sided_holm"])
+            if "p_one_sided_improve" in vsraw.columns:
+                p1_raw = float(vsraw.loc[v, "p_one_sided_improve"])
+            if "p_one_sided_improve_holm" in vsraw.columns:
+                p1_raw_holm = float(vsraw.loc[v, "p_one_sided_improve_holm"])
 
         rows.append({
             "variant": str(v),
@@ -535,9 +528,18 @@ def _enriched_ranking(df_long: pd.DataFrame, subject_col: str,
             "rank": int(rank_tbl.loc[i, "rank"]),
             "p_vs_next_adj_two_sided": float(p_next),
             "p_vs_lower_min_adj_two_sided": float(p_min_lower),
+            # Two-sided vs RAW (difference from RAW)
             "p_vs_raw_two_sided": float(p2_raw),
+            "p_vs_raw_two_sided_holm": float(p2_raw_holm),
+            # Optional one-sided "improve" vs RAW
             "p_vs_raw_one_sided_improve": float(p1_raw),
             "p_vs_raw_one_sided_improve_holm": float(p1_raw_holm),
+            # Added descriptors for reporting:
+            "rmse_sd": float(rmse_sd_map.get(v, np.nan)),
+            "rmse_median": float(rmse_med_map.get(v, np.nan)),
+            "rmse_iqr": float(rmse_iqr_map.get(v, np.nan)),
+            "bias_mean": float(bias_mean_map.get(v, np.nan)),
+            "bias_sd": float(bias_sd_map.get(v, np.nan)),
         })
 
     return pd.DataFrame(rows)
@@ -556,7 +558,7 @@ def _process_corrections_for_variantset(area_name: str, df_area: pd.DataFrame,
     Returns
     -------
     pandas.DataFrame
-        Area-level long table (columns: area, pair, variant, value).
+        Area-level long table (columns: area, pair, variant, value, rmse_value, bias_value).
     """
     perpair_rows = []
     area_perpair_long = []
@@ -568,12 +570,55 @@ def _process_corrections_for_variantset(area_name: str, df_area: pd.DataFrame,
         # Enforce SRTM for corrections LS data
         dem_sel = _choose_dem_for_corrections(dfp)
         if dem_sel is None:
-            # No SRTM for this pair → skip corrections analyses for this pair
             continue
 
         long = _build_blocks_for_pair(dfp, dem_sel, metric_col, variant_list)
         if long.empty:
             continue
+
+        # Attach replicate/n_cal to long for RMSE/bias alignment
+        _rn = long["block_id"].apply(_parse_block_id)
+        long = long.assign(replicate=[r for r, _ in _rn], n_cal=[n for _, n in _rn])
+
+        # Build RMSE (rmse_cm) and Bias (bias_cm) values for the SAME blocks/variants as in 'long'
+        ls_levels = [v for v in variant_list if v != "IDW"]
+        rmse_maps, bias_maps = [], []
+        if ls_levels:
+            ls_sub = dfp[(dfp["method"]==METHOD_LS) & (dfp["dem"]==dem_sel) & (dfp["corr"].isin(ls_levels))].copy()
+            if not ls_sub.empty:
+                rmse_maps.append(
+                    ls_sub[["replicate","n_cal","corr","rmse_cm"]]
+                    .rename(columns={"corr":"variant","rmse_cm":"rmse_value"})
+                )
+                if "bias_cm" in ls_sub.columns:
+                    bias_maps.append(
+                        ls_sub[["replicate","n_cal","corr","bias_cm"]]
+                        .rename(columns={"corr":"variant","bias_cm":"bias_value"})
+                    )
+        if "IDW" in variant_list:
+            idw_sub = dfp[(dfp["method"]==METHOD_IDW)].copy()
+            if not idw_sub.empty:
+                tmp = idw_sub[["replicate","n_cal","rmse_cm"]].copy()
+                tmp["variant"] = "IDW"
+                tmp = tmp.rename(columns={"rmse_cm":"rmse_value"})
+                rmse_maps.append(tmp[["replicate","n_cal","variant","rmse_value"]])
+                if "bias_cm" in idw_sub.columns:
+                    tmpb = idw_sub[["replicate","n_cal","bias_cm"]].copy()
+                    tmpb["variant"] = "IDW"
+                    tmpb = tmpb.rename(columns={"bias_cm":"bias_value"})
+                    bias_maps.append(tmpb[["replicate","n_cal","variant","bias_value"]])
+
+        if rmse_maps:
+            rmse_map = pd.concat(rmse_maps, ignore_index=True)
+            long = long.merge(rmse_map, on=["replicate","n_cal","variant"], how="left")
+        else:
+            long["rmse_value"] = np.nan
+
+        if bias_maps:
+            bias_map = pd.concat(bias_maps, ignore_index=True)
+            long = long.merge(bias_map, on=["replicate","n_cal","variant"], how="left")
+        else:
+            long["bias_value"] = np.nan
 
         # Per-pair ANOVA (subject=block)
         aov = _anova_rm_oneway(long, dv="value", subject="block_id", within="variant")
@@ -584,11 +629,22 @@ def _process_corrections_for_variantset(area_name: str, df_area: pd.DataFrame,
         pw = _pairwise_within_subject_ttests(long, subject="block_id", within="variant",
                                              dv="value", variant_list=variant_list)
 
+        # --- Attach RMSE means per variant to the pairwise table (for reporting) ---
+        if pw is not None and not pw.empty:
+            rmse_means_pair = long.groupby("variant", observed=False)["rmse_value"].mean()
+            pw["mean_a_rmse"] = pw["level_a"].map(lambda v: float(rmse_means_pair.get(v, np.nan)))
+            pw["mean_b_rmse"] = pw["level_b"].map(lambda v: float(rmse_means_pair.get(v, np.nan)))
+            pw["mean_diff_rmse_a_minus_b"] = pw["mean_a_rmse"] - pw["mean_b_rmse"]
+
+        # Means on metric (tests) and RMSE/bias (reporting)
         means = long.groupby("variant", observed=False)["value"].mean().sort_values()
+        rmse_means = long.groupby("variant", observed=False)["rmse_value"].mean()
+        bias_means = long.groupby("variant", observed=False)["bias_value"].mean()
+
         best_variant = str(means.index[0])
 
         long = long.assign(area=area_name)
-        area_perpair_long.append(long)
+        area_perpair_long.append(long[["area","pair","block_id","variant","value","rmse_value","bias_value"]])
 
         row = {
             "area": area_name,
@@ -604,19 +660,23 @@ def _process_corrections_for_variantset(area_name: str, df_area: pd.DataFrame,
             "best_variant": best_variant,
             "best_mean_value": float(means.iloc[0]),
         }
+        # Per-variant metric (tests) and RMSE/Bias (reporting)
         for v in variant_list:
             row[f"mean_{v}"] = float(means.get(v, np.nan))
+            row[f"rmse_mean_{v}"] = float(rmse_means.get(v, np.nan))
+            row[f"bias_mean_{v}"] = float(bias_means.get(v, np.nan))
         perpair_rows.append(row)
 
-        pw_all.append(pw.assign(area=area_name, pair=p,
-                                dem_used=dem_sel, metric=metric_col,
-                                variant_set=variant_set_name))
+        if pw is not None and not pw.empty and variant_set_name == "with_idw":
+            pw_all.append(pw.assign(area=area_name, pair=p,
+                                    dem_used=dem_sel, metric=metric_col,
+                                    variant_set=variant_set_name))
 
     # Write per-pair outputs
     tag = f"__{variant_set_name}"
     if perpair_rows:
         pd.DataFrame(perpair_rows).to_csv(res_dir / f"corrections_per_pair_anova{tag}.csv", index=False)
-        # Only write pairwise table for WITH IDW (keep original behavior)
+        # Only write pairwise table for WITH IDW (keep original behavior) — now with RMSE means attached
         if pw_all and variant_set_name == "with_idw":
             pd.concat(pw_all, ignore_index=True).to_csv(res_dir / f"corrections_per_pair_pairwise{tag}.csv", index=False)
         print(f"✅  Corrections per-pair outputs ({variant_set_name}) written in {res_dir}")
@@ -629,7 +689,14 @@ def _process_corrections_for_variantset(area_name: str, df_area: pd.DataFrame,
 
     if area_perpair_long:
         long_all = pd.concat(area_perpair_long, ignore_index=True)
-        area_long = long_all.groupby(["area","pair","variant"], observed=False)["value"].mean().reset_index()
+
+        # Collapse to per-pair means (metric for tests + rmse/bias for reporting)
+        area_long = (long_all
+                     .groupby(["area","pair","variant"], observed=False)
+                     .agg(value=("value","mean"),
+                          rmse_value=("rmse_value","mean"),
+                          bias_value=("bias_value","mean"))
+                     .reset_index())
 
         # ANOVA (+ explanation columns)
         aov_area = _anova_rm_oneway(area_long.rename(columns={"pair":"subject"}),
@@ -640,48 +707,50 @@ def _process_corrections_for_variantset(area_name: str, df_area: pd.DataFrame,
                            "Lower is better; small p implies at least one correction differs.")
             tbl["k_levels"] = int(len([v for v in variant_list if v in area_long["variant"].unique()]))
             tbl["subjects_n"] = int(area_long["pair"].nunique())
+
+            # --- Attach RMSE & bias summaries (per variant) to the ANOVA CSV for reporting ---
+            def _iqr_ser(x):
+                q = np.nanpercentile(x, [25, 75]); return float(q[1]-q[0])
+            rmse_g = area_long.groupby("variant", observed=False)["rmse_value"]
+            bias_g = area_long.groupby("variant", observed=False)["bias_value"]
+            for v in [vv for vv in variant_list if vv in area_long["variant"].unique()]:
+                # RMSE descriptors
+                tbl[f"rmse_mean_{v}"]   = float(rmse_g.mean().get(v, np.nan))
+                tbl[f"rmse_sd_{v}"]     = float(rmse_g.std().get(v, np.nan))
+                tbl[f"rmse_median_{v}"] = float(rmse_g.median().get(v, np.nan))
+                tbl[f"rmse_iqr_{v}"]    = float(_iqr_ser(area_long.loc[area_long["variant"]==v, "rmse_value"]))
+                tbl[f"rmse_n_pairs_{v}"]= int(area_long.loc[area_long["variant"]==v, "pair"].nunique())
+                # Bias (mean + SD)
+                tbl[f"bias_mean_{v}"] = float(bias_g.mean().get(v, np.nan))
+                tbl[f"bias_sd_{v}"]   = float(bias_g.std().get(v, np.nan))
             tbl.to_csv(corr_area_csv, index=False)
 
         # Ranking (enriched) — ONLY for with_idw
         if variant_set_name == "with_idw":
-            enr = _enriched_ranking(area_long.rename(columns={"pair":"subject"}),
+            enr = _enriched_ranking(area_long.rename(columns={"pair":"subject",
+                                                              "rmse_value":"rmse_value",
+                                                              "bias_value":"bias_value"}),
                                     subject_col="subject", variant_list=variant_list)
             if not enr.empty:
                 enr[["rank","variant","mean","sd","median","iqr","n_subjects",
                      "p_vs_next_adj_two_sided","p_vs_lower_min_adj_two_sided",
-                     "p_vs_raw_two_sided","p_vs_raw_one_sided_improve","p_vs_raw_one_sided_improve_holm"]] \
+                     "p_vs_raw_two_sided","p_vs_raw_two_sided_holm",
+                     "p_vs_raw_one_sided_improve","p_vs_raw_one_sided_improve_holm",
+                     "rmse_sd","rmse_median","rmse_iqr","bias_mean","bias_sd"]] \
                     .to_csv(corr_area_rank, index=False)
 
         print(f"✅  Corrections area-level outputs ({variant_set_name}) written in {res_dir}")
-        # For global aggregation
+        # For global aggregation (carry metric + RMSE + Bias for reporting)
         return area_long.assign(variant_set=variant_set_name)
     else:
         print(f"ℹ️  No area-level corrections data for {area_name} ({variant_set_name}).")
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 # ------------------------------ Whole-area process ------------------------------
 
 def process_area(area_dir: Path, metric_col: str = "nrmse_sd",
                  dem_corr: str = DEM_CORR_DEFAULT, alpha: float = 0.05):
-    """Run all requested tests for a single AREA and write outputs (all densities).
-
-    Parameters
-    ----------
-    area_dir : pathlib.Path
-        Path to the area directory containing ``results/accuracy_metrics.csv``.
-    metric_col : str, default "nrmse_sd"
-        Metric to analyze (lower is better), e.g., ``"rmse_cm"`` or ``"log_rmse_cm"``.
-    dem_corr : str, default DEM_CORR_DEFAULT
-        Correction level to use for DEM (SRTM vs 3DEP) comparisons.
-    alpha : float, default 0.05
-        Reserved for future use (e.g., significance flagging in outputs).
-
-    Returns
-    -------
-    tuple[dict[str, pd.DataFrame], pd.DataFrame | None]
-        ``corr_for_global_by_set``: mapping variant-set → long table for global aggregation;
-        ``dem_for_global``: long table for DEM tests (or ``None`` if not available).
-    """
+    """Run all requested tests for a single AREA and write outputs (all densities)."""
     area_name = area_dir.name
     res_dir = area_dir / "results"
     metrics_csv = res_dir / "accuracy_metrics.csv"
@@ -723,7 +792,7 @@ def process_area(area_dir: Path, metric_col: str = "nrmse_sd",
         if sub.empty:
             continue
 
-        # Keep only finite metric rows; tiny validation sets → nrmse_sd = NaN are dropped here
+        # Keep only finite metric rows; tiny validation sets → metric = NaN are dropped here
         sub = sub[np.isfinite(sub[metric_col])].copy()
         if sub.empty:
             continue
@@ -735,6 +804,7 @@ def process_area(area_dir: Path, metric_col: str = "nrmse_sd",
         if sub_ok.empty:
             continue
 
+        # Metric t-test (tests)
         wide = (sub_ok.pivot_table(index="block_id", columns="dem", values=metric_col, aggfunc="mean", observed=False)
                     .reindex(columns=["SRTM","3DEP"])
                     .dropna(subset=["SRTM","3DEP"]))   
@@ -742,6 +812,20 @@ def process_area(area_dir: Path, metric_col: str = "nrmse_sd",
             continue
         t, pval, n = ttest_rel_safe(wide["3DEP"], wide["SRTM"])
         diff = float((wide["3DEP"] - wide["SRTM"]).mean()) if n >= 1 else np.nan
+
+        # RMSE summaries on the SAME blocks (reporting)
+        wide_rmse_full = (sub_ok.pivot_table(index="block_id", columns="dem", values="rmse_cm", aggfunc="mean", observed=False)
+                               .reindex(columns=["SRTM","3DEP"]))
+        wide_rmse = wide_rmse_full.reindex(wide.index)  # align to metric-tested blocks
+
+        # Bias summaries on the SAME blocks (reporting) — optional if present
+        if "bias_cm" in sub_ok.columns:
+            wide_bias_full = (sub_ok.pivot_table(index="block_id", columns="dem", values="bias_cm", aggfunc="mean", observed=False)
+                                   .reindex(columns=["SRTM","3DEP"]))
+            wide_bias = wide_bias_full.reindex(wide.index)
+        else:
+            wide_bias = None
+
         dem_perpair_rows.append({
             "area": area_name,
             "pair": dfp["pair"].iloc[0] if not dfp.empty else p,
@@ -753,14 +837,24 @@ def process_area(area_dir: Path, metric_col: str = "nrmse_sd",
             "best_dem": "3DEP" if (diff < 0) else "SRTM",
             "mean_SRTM": float(wide["SRTM"].mean()),
             "mean_3DEP": float(wide["3DEP"].mean()),
+            "rmse_mean_SRTM": float(wide_rmse["SRTM"].mean()) if "SRTM" in wide_rmse else np.nan,
+            "rmse_mean_3DEP": float(wide_rmse["3DEP"].mean()) if "3DEP" in wide_rmse else np.nan,
+            "bias_mean_SRTM": float(wide_bias["SRTM"].mean()) if (wide_bias is not None and "SRTM" in wide_bias) else np.nan,
+            "bias_mean_3DEP": float(wide_bias["3DEP"].mean()) if (wide_bias is not None and "3DEP" in wide_bias) else np.nan,
         })
+
+        # carry both metrics to global level (pair means)
         dem_pairs_long.append(pd.DataFrame({
             "area": [area_name, area_name],
             "pair": [dfp["pair"].iloc[0] if not dfp.empty else p,
                      dfp["pair"].iloc[0] if not dfp.empty else p],
             "dem": ["SRTM","3DEP"],
             "corr_used": [corr_used, corr_used],
-            "value": [float(wide["SRTM"].mean()), float(wide["3DEP"].mean())]
+            "value": [float(wide["SRTM"].mean()), float(wide["3DEP"].mean())],
+            "rmse_value": [float(wide_rmse["SRTM"].mean()) if "SRTM" in wide_rmse else np.nan,
+                           float(wide_rmse["3DEP"].mean()) if "3DEP" in wide_rmse else np.nan],
+            "bias_value": [float(wide_bias["SRTM"].mean()) if (wide_bias is not None and "SRTM" in wide_bias) else np.nan,
+                           float(wide_bias["3DEP"].mean()) if (wide_bias is not None and "3DEP" in wide_bias) else np.nan]
         }))
 
     suffix = f"__{corr_used}"
@@ -775,9 +869,23 @@ def process_area(area_dir: Path, metric_col: str = "nrmse_sd",
     if dem_pairs_long:
         long_dem = pd.concat(dem_pairs_long, ignore_index=True)
         wide_pairs = (long_dem.pivot_table(index="pair", columns="dem", values="value",
-                                        aggfunc="mean", observed=False)
+                                           aggfunc="mean", observed=False)
                             .reindex(columns=["SRTM","3DEP"])
                             .dropna(subset=["SRTM","3DEP"]))
+        # RMSE + Bias across same pairs
+        wide_pairs_rmse_full = (long_dem.pivot_table(index="pair", columns="dem", values="rmse_value",
+                                                     aggfunc="mean", observed=False)
+                                         .reindex(columns=["SRTM","3DEP"]))
+        wide_pairs_rmse = wide_pairs_rmse_full.reindex(wide_pairs.index)
+
+        if "bias_value" in long_dem.columns:
+            wide_pairs_bias_full = (long_dem.pivot_table(index="pair", columns="dem", values="bias_value",
+                                                         aggfunc="mean", observed=False)
+                                             .reindex(columns=["SRTM","3DEP"]))
+            wide_pairs_bias = wide_pairs_bias_full.reindex(wide_pairs.index)
+        else:
+            wide_pairs_bias = None
+
         if wide_pairs.shape[0] >= 2:
             t_area, p_area, _ = ttest_rel_safe(wide_pairs["3DEP"], wide_pairs["SRTM"])
             pd.DataFrame([{
@@ -787,27 +895,82 @@ def process_area(area_dir: Path, metric_col: str = "nrmse_sd",
                 "n_pairs": int(wide_pairs.shape[0]),
                 "mean_diff_3DEP_minus_SRTM": float((wide_pairs["3DEP"]-wide_pairs["SRTM"]).mean()),
                 "t": float(t_area), "p": float(p_area),
-                "best_dem_overall": "3DEP" if (wide_pairs["3DEP"]-wide_pairs["SRTM"]).mean() < 0 else "SRTM"
+                "best_dem_overall": "3DEP" if (wide_pairs["3DEP"]-wide_pairs["SRTM"]).mean() < 0 else "SRTM",
+                "rmse_mean_SRTM": float(wide_pairs_rmse["SRTM"].mean()) if "SRTM" in wide_pairs_rmse else np.nan,
+                "rmse_mean_3DEP": float(wide_pairs_rmse["3DEP"].mean()) if "3DEP" in wide_pairs_rmse else np.nan,
+                "bias_mean_SRTM": float(wide_pairs_bias["SRTM"].mean()) if (wide_pairs_bias is not None and "SRTM" in wide_pairs_bias) else np.nan,
+                "bias_mean_3DEP": float(wide_pairs_bias["3DEP"].mean()) if (wide_pairs_bias is not None and "3DEP" in wide_pairs_bias) else np.nan,
             }]).to_csv(dem_area_csv, index=False)
+
+            # Summary table per DEM with both metrics
+            def _iqr_arr(a): 
+                a = np.asarray(a, float)
+                q = np.nanpercentile(a, [25, 75]); return float(q[1]-q[0])
             pd.DataFrame({
                 "variant":["SRTM","3DEP"],
                 "corr_used":[corr_used, corr_used],
                 "mean":[float(wide_pairs["SRTM"].mean()), float(wide_pairs["3DEP"].mean())],
                 "sd":[float(wide_pairs["SRTM"].std()), float(wide_pairs["3DEP"].std())],
                 "median":[float(wide_pairs["SRTM"].median()), float(wide_pairs["3DEP"].median())],
-                "iqr":[float(np.subtract(*np.nanpercentile(wide_pairs["SRTM"], [75,25]))),
-                       float(np.subtract(*np.nanpercentile(wide_pairs["3DEP"], [75,25])))],
-                "n_pairs":[int(wide_pairs.shape[0]), int(wide_pairs.shape[0])]
+                "iqr":[_iqr_arr(wide_pairs["SRTM"].values),
+                       _iqr_arr(wide_pairs["3DEP"].values)],
+                "n_pairs":[int(wide_pairs.shape[0]), int(wide_pairs.shape[0])],
+                # RMSE descriptors
+                "rmse_mean":[float(wide_pairs_rmse["SRTM"].mean()), float(wide_pairs_rmse["3DEP"].mean())],
+                "rmse_sd":[float(wide_pairs_rmse["SRTM"].std()), float(wide_pairs_rmse["3DEP"].std())],
+                "rmse_median":[float(wide_pairs_rmse["SRTM"].median()), float(wide_pairs_rmse["3DEP"].median())],
+                "rmse_iqr":[_iqr_arr(wide_pairs_rmse["SRTM"].values),
+                            _iqr_arr(wide_pairs_rmse["3DEP"].values)],
+                # Bias descriptors (mean/SD only as requested)
+                "bias_mean":[float(wide_pairs_bias["SRTM"].mean()) if wide_pairs_bias is not None else np.nan,
+                             float(wide_pairs_bias["3DEP"].mean()) if wide_pairs_bias is not None else np.nan],
+                "bias_sd":[float(wide_pairs_bias["SRTM"].std()) if wide_pairs_bias is not None else np.nan,
+                           float(wide_pairs_bias["3DEP"].std()) if wide_pairs_bias is not None else np.nan],
             }).to_csv(dem_area_tbl, index=False)
             print(f"✅  DEM area-level t-test ({corr_used}) written: {dem_area_csv}")
             print(f"✅  DEM area summary table ({corr_used}) written: {dem_area_tbl}")
+
+            # Per-AREA DEM rank table for RMSE (for thesis tables)
+            rmse_stats = {}
+            for dem_name in ["SRTM", "3DEP"]:
+                vals = wide_pairs_rmse[dem_name].values
+                mean = float(np.nanmean(vals))
+                sd   = float(np.nanstd(vals, ddof=1))
+                median = float(np.nanmedian(vals))
+                q25, q75 = np.nanpercentile(vals, [25, 75])
+                iqr = float(q75 - q25)
+                rmse_stats[dem_name] = {
+                    "mean": mean,
+                    "sd": sd,
+                    "median": median,
+                    "iqr": iqr,
+                }
+            ordered = sorted(["SRTM","3DEP"], key=lambda d: rmse_stats[d]["mean"])
+            dem_rank_rows = []
+            for r, dem_name in enumerate(ordered, start=1):
+                s = rmse_stats[dem_name]
+                dem_rank_rows.append({
+                    "area": area_name,
+                    "rank": r,
+                    "dem": dem_name,
+                    "rmse_mean": s["mean"],
+                    "rmse_sd": s["sd"],
+                    "rmse_median": s["median"],
+                    "rmse_iqr": s["iqr"],
+                    "mean±SD(rmse)": _fmt_pm(s["mean"], s["sd"]),
+                    "median[IQR](rmse)": _fmt_med_iqr(s["median"], s["iqr"]),
+                    "p_best": float(p_area),  # same p for both in 2-level test
+                })
+            pd.DataFrame(dem_rank_rows).to_csv(res_dir / f"dem_rank_by_area{suffix}.csv", index=False)
         else:
             print(f"ℹ️  Not enough pairs with both DEMs in {area_name} for area-level DEM test at {corr_used}.")
 
     dem_for_global = None
     if dem_pairs_long:
-        dem_for_global = pd.concat(dem_pairs_long, ignore_index=True) \
-            .groupby(["area","pair","dem","corr_used"], observed=False)["value"].mean().reset_index()
+        dem_for_global = (pd.concat(dem_pairs_long, ignore_index=True)
+                          .groupby(["area","pair","dem","corr_used"], observed=False)[["value","rmse_value","bias_value"]]
+                          .mean()
+                          .reset_index())
 
     return corr_for_global_by_set, dem_for_global
 
@@ -824,7 +987,7 @@ def main():
         If provided, only process this AREA (subfolder name).
     --metric : str, default "nrmse_sd"
         Metric column to analyze (e.g., "rmse_cm", "log_rmse_cm").
-    --dem-corr : str, default DEM_CORR_DEFAULT ("RAW")
+    --dem-corr : str, default DEM_CORR_DEFAULT ("TROPO")
         Correction used for DEM comparisons (IDW not applicable here).
     --alpha : float, default 0.05
         Reserved for future use.
@@ -877,6 +1040,21 @@ def main():
                                "Lower is better; small p implies at least one correction differs.")
                 tbl["k_levels"] = int(len([v for v in variants if v in corr_all['variant'].unique()]))
                 tbl["subjects_n"] = int(corr_all["pair_global"].nunique())
+
+                # --- Attach RMSE & bias summaries (per variant) across all subjects ---
+                def _iqr_arr(a):
+                    q = np.nanpercentile(a, [25, 75]); return float(q[1]-q[0])
+                rmse_g = corr_all.groupby("variant", observed=False)["rmse_value"]
+                bias_g = corr_all.groupby("variant", observed=False)["bias_value"] if "bias_value" in corr_all.columns else None
+                for v in [vv for vv in variants if vv in corr_all["variant"].unique()]:
+                    tbl[f"rmse_mean_{v}"]   = float(rmse_g.mean().get(v, np.nan))
+                    tbl[f"rmse_sd_{v}"]     = float(rmse_g.std().get(v, np.nan))
+                    tbl[f"rmse_median_{v}"] = float(rmse_g.median().get(v, np.nan))
+                    tbl[f"rmse_iqr_{v}"]    = float(_iqr_arr(corr_all[corr_all["variant"]==v]["rmse_value"].values))
+                    tbl[f"rmse_n_subjects_{v}"] = int(corr_all[corr_all["variant"]==v]["pair_global"].nunique())
+                    if bias_g is not None:
+                        tbl[f"bias_mean_{v}"] = float(bias_g.mean().get(v, np.nan))
+                        tbl[f"bias_sd_{v}"]   = float(bias_g.std().get(v, np.nan))
                 tbl.to_csv(out_root / f"corrections_all_areas_anova{tag}.csv", index=False)
                 print(f"✅  All-areas corrections ANOVA ({set_name}) written: {out_root / f'corrections_all_areas_anova{tag}.csv'}")
             else:
@@ -889,8 +1067,48 @@ def main():
                 if not enr.empty:
                     enr[["rank","variant","mean","sd","median","iqr","n_subjects",
                          "p_vs_next_adj_two_sided","p_vs_lower_min_adj_two_sided",
-                         "p_vs_raw_two_sided","p_vs_raw_one_sided_improve","p_vs_raw_one_sided_improve_holm"]] \
+                         "p_vs_raw_two_sided","p_vs_raw_two_sided_holm",
+                         "p_vs_raw_one_sided_improve","p_vs_raw_one_sided_improve_holm",
+                         "rmse_sd","rmse_median","rmse_iqr","bias_mean","bias_sd"]] \
                         .to_csv(out_root / f"corrections_all_areas_ranking{tag}.csv", index=False)
+
+                # RMSE-centric global corrections rank table (for thesis tables)
+                if not corr_all.empty:
+                    def _iqr_arr2(a):
+                        a = np.asarray(a, float)
+                        q = np.nanpercentile(a, [25, 75]); return float(q[1]-q[0])
+                    rmse_g = corr_all.groupby("variant", observed=False)["rmse_value"]
+                    stats_tmp = []
+                    for v in variants:
+                        if v not in rmse_g.groups:
+                            continue
+                        vals = corr_all.loc[corr_all["variant"]==v, "rmse_value"].values
+                        mean = float(np.nanmean(vals))
+                        sd   = float(np.nanstd(vals, ddof=1))
+                        med  = float(np.nanmedian(vals))
+                        iqr  = _iqr_arr2(vals)
+                        nsubj = int(corr_all[corr_all["variant"]==v]["pair_global"].nunique())
+                        stats_tmp.append((v, mean, sd, med, iqr, nsubj))
+                    stats_tmp.sort(key=lambda t: t[1])  # by mean RMSE
+                    # map two-sided Holm p vs RAW from enr
+                    pmap = {}
+                    if "p_vs_raw_two_sided_holm" in enr.columns:
+                        pmap = dict(zip(enr["variant"], enr["p_vs_raw_two_sided_holm"]))
+                    rows_rmse = []
+                    for i, (v, mean, sd, med, iqr, nsubj) in enumerate(stats_tmp, start=1):
+                        rows_rmse.append({
+                            "rank": i,
+                            "corr": v,
+                            "rmse_mean": mean,
+                            "rmse_sd": sd,
+                            "rmse_median": med,
+                            "rmse_iqr": iqr,
+                            "mean±SD(rmse)": _fmt_pm(mean, sd),
+                            "median[IQR](rmse)": _fmt_med_iqr(med, iqr),
+                            "n_subjects": nsubj,
+                            "p_diff_from_RAW_two_sided_holm": float(pmap.get(v, np.nan)) if v != "RAW" else np.nan,
+                        })
+                    pd.DataFrame(rows_rmse).to_csv(out_root / "corrections_all_areas_rank_rmse__with_idw.csv", index=False)
 
             print(f"✅  All-areas corrections ranking/ANOVA ({set_name}) written in {out_root}")
         else:
@@ -903,35 +1121,156 @@ def main():
         corr_used = str(args.dem_corr).upper()
         wide_all = (dem_all[dem_all["corr_used"] == corr_used]
                     .pivot_table(index=["area","pair"], columns="dem", values="value",
-                                aggfunc="mean", observed=False)
+                                 aggfunc="mean", observed=False)
                     .reindex(columns=["SRTM","3DEP"])
                     .dropna(subset=["SRTM","3DEP"]))
         if wide_all.shape[0] >= 2:
             t_all, p_all, _ = ttest_rel_safe(wide_all["3DEP"], wide_all["SRTM"])
-            pd.DataFrame([{
+
+            # RMSE across the same pairs
+            wide_all_rmse_full = (dem_all[dem_all["corr_used"] == corr_used]
+                                  .pivot_table(index=["area","pair"], columns="dem", values="rmse_value",
+                                               aggfunc="mean", observed=False)
+                                  .reindex(columns=["SRTM","3DEP"]))
+            wide_all_rmse = wide_all_rmse_full.reindex(wide_all.index)
+
+            # Bias across the same pairs (optional)
+            if "bias_value" in dem_all.columns:
+                wide_all_bias_full = (dem_all[dem_all["corr_used"] == corr_used]
+                                      .pivot_table(index=["area","pair"], columns="dem", values="bias_value",
+                                                   aggfunc="mean", observed=False)
+                                      .reindex(columns=["SRTM","3DEP"]))
+                wide_all_bias = wide_all_bias_full.reindex(wide_all.index)
+            else:
+                wide_all_bias = None
+
+            # RMSE dispersion and medians/IQR
+            def _iqr_arr(a):
+                a = np.asarray(a, float)
+                q = np.nanpercentile(a, [25, 75]); return float(q[1]-q[0])
+
+            out_row = {
                 "corr_used": corr_used,
                 "n_pairs": int(wide_all.shape[0]),
                 "mean_diff_3DEP_minus_SRTM": float((wide_all["3DEP"]-wide_all["SRTM"]).mean()),
                 "t": float(t_all), "p": float(p_all),
-                "best_dem_overall": "3DEP" if (wide_all["3DEP"]-wide_all["SRTM"]).mean() < 0 else "SRTM"
-            }]).to_csv(out_root / f"dem_all_areas_ttest__{corr_used}.csv", index=False)
+                "best_dem_overall": "3DEP" if (wide_all["3DEP"]-wide_all["SRTM"]).mean() < 0 else "SRTM",
+                # RMSE means + descriptors
+                "rmse_mean_SRTM": float(wide_all_rmse["SRTM"].mean()),
+                "rmse_mean_3DEP": float(wide_all_rmse["3DEP"].mean()),
+                "rmse_sd_SRTM": float(wide_all_rmse["SRTM"].std()),
+                "rmse_sd_3DEP": float(wide_all_rmse["3DEP"].std()),
+                "rmse_median_SRTM": float(wide_all_rmse["SRTM"].median()),
+                "rmse_median_3DEP": float(wide_all_rmse["3DEP"].median()),
+                "rmse_iqr_SRTM": _iqr_arr(wide_all_rmse["SRTM"].values),
+                "rmse_iqr_3DEP": _iqr_arr(wide_all_rmse["3DEP"].values),
+            }
+
+            # Bias mean + SD per DEM
+            if wide_all_bias is not None:
+                out_row.update({
+                    "bias_mean_SRTM": float(wide_all_bias["SRTM"].mean()),
+                    "bias_mean_3DEP": float(wide_all_bias["3DEP"].mean()),
+                    "bias_sd_SRTM": float(wide_all_bias["SRTM"].std()),
+                    "bias_sd_3DEP": float(wide_all_bias["3DEP"].std()),
+                })
+
+            pd.DataFrame([out_row]).to_csv(out_root / f"dem_all_areas_ttest__{corr_used}.csv", index=False)
             print(f"✅  All-areas DEM t-test ({corr_used}) written: {out_root / f'dem_all_areas_ttest__{corr_used}.csv'}")
+
+            # All-areas DEM rank table based on RMSE (2 rows, SRTM vs 3DEP)
+            rmse_all = {}
+            for dem_name in ["SRTM","3DEP"]:
+                vals = wide_all_rmse[dem_name].values
+                mean = float(np.nanmean(vals))
+                sd   = float(np.nanstd(vals, ddof=1))
+                median = float(np.nanmedian(vals))
+                q25, q75 = np.nanpercentile(vals, [25, 75])
+                iqr = float(q75 - q25)
+                rmse_all[dem_name] = {
+                    "mean": mean,
+                    "sd": sd,
+                    "median": median,
+                    "iqr": iqr,
+                }
+            ordered_dem = sorted(["SRTM","3DEP"], key=lambda d: rmse_all[d]["mean"])
+            dem_rank_all_rows = []
+            for r, dem_name in enumerate(ordered_dem, start=1):
+                s = rmse_all[dem_name]
+                dem_rank_all_rows.append({
+                    "rank": r,
+                    "dem": dem_name,
+                    "rmse_mean": s["mean"],
+                    "rmse_sd": s["sd"],
+                    "rmse_median": s["median"],
+                    "rmse_iqr": s["iqr"],
+                    "mean±SD(rmse)": _fmt_pm(s["mean"], s["sd"]),
+                    "median[IQR](rmse)": _fmt_med_iqr(s["median"], s["iqr"]),
+                    "p_best": float(p_all),  # same p for both
+                })
+            pd.DataFrame(dem_rank_all_rows).to_csv(out_root / f"dem_all_areas_rank__{corr_used}.csv", index=False)
         else:
             print(f"ℹ️  Not enough pairs with both DEMs across areas for all-areas DEM test at {corr_used}.")
 
-        # Each area's overall DEM t-test at root
-        for area_name, sub in dem_all[dem_all["corr_used"]==corr_used].groupby("area", observed=False):
-            wide = sub.pivot_table(index="pair", columns="dem", values="value", aggfunc="mean", observed=False) \
-                      .dropna(subset=["SRTM","3DEP"])
+        # Each area's overall DEM t-test at root (kept; now includes RMSE mean, SD, median, IQR)
+        for area_name, sub in dem_all[dem_all["corr_used"] == corr_used].groupby("area", observed=False):
+            wide = (
+                sub.pivot_table(
+                    index="pair",
+                    columns="dem",
+                    values="value",
+                    aggfunc="mean",
+                    observed=False,
+                )
+                .reindex(columns=["SRTM", "3DEP"])
+                .dropna(subset=["SRTM", "3DEP"])
+            )
             if wide.shape[0] >= 2:
                 t_a, p_a, _ = ttest_rel_safe(wide["3DEP"], wide["SRTM"])
+
+                # RMSE aligned
+                wide_rmse_full = sub.pivot_table(
+                    index="pair",
+                    columns="dem",
+                    values="rmse_value",
+                    aggfunc="mean",
+                    observed=False,
+                ).reindex(columns=["SRTM", "3DEP"])
+                wide_rmse = wide_rmse_full.reindex(wide.index)
+
+                # Helper for IQR
+                def _iqr_arr_local(a):
+                    a = np.asarray(a, float)
+                    q25, q75 = np.nanpercentile(a, [25, 75])
+                    return float(q75 - q25)
+
+                vals_S = wide_rmse["SRTM"].values
+                vals_3 = wide_rmse["3DEP"].values
+
                 dem_root_rows.append({
                     "area": area_name,
                     "corr_used": corr_used,
                     "n_pairs": int(wide.shape[0]),
-                    "mean_diff_3DEP_minus_SRTM": float((wide["3DEP"]-wide["SRTM"]).mean()),
-                    "t": float(t_a), "p": float(p_a),
-                    "best_dem_overall": "3DEP" if (wide["3DEP"]-wide["SRTM"]).mean() < 0 else "SRTM"
+                    "mean_diff_3DEP_minus_SRTM": float(
+                        (wide["3DEP"] - wide["SRTM"]).mean()
+                    ),
+                    "t": float(t_a),
+                    "p": float(p_a),
+                    "best_dem_overall": "3DEP"
+                    if (wide["3DEP"] - wide["SRTM"]).mean() < 0
+                    else "SRTM",
+                    # RMSE mean (as before)
+                    "rmse_mean_SRTM": float(np.nanmean(vals_S)),
+                    "rmse_mean_3DEP": float(np.nanmean(vals_3)),
+                    # NEW: RMSE SD
+                    "rmse_sd_SRTM": float(np.nanstd(vals_S, ddof=1)),
+                    "rmse_sd_3DEP": float(np.nanstd(vals_3, ddof=1)),
+                    # NEW: RMSE median
+                    "rmse_median_SRTM": float(np.nanmedian(vals_S)),
+                    "rmse_median_3DEP": float(np.nanmedian(vals_3)),
+                    # NEW: RMSE IQR
+                    "rmse_iqr_SRTM": _iqr_arr_local(vals_S),
+                    "rmse_iqr_3DEP": _iqr_arr_local(vals_3),
                 })
         if dem_root_rows:
             pd.DataFrame(dem_root_rows).to_csv(out_root / f"dem_each_area_overall_ttest__{corr_used}.csv", index=False)
@@ -946,25 +1285,109 @@ def main():
         if not stacks:
             continue
         stack = pd.concat(stacks, ignore_index=True)
+
         for area_name, sub in stack.groupby("area", observed=False):
-            area_long = (sub.groupby(["pair","variant"], observed=False)["value"]
-                           .mean().reset_index())
-            rank_tbl, best2 = _best_second_summary(area_long.rename(columns={"pair":"subject"}),
-                                                   subject_col="subject", variant_list=variants)
-            if best2:
-                best_area_rows.append({
-                    "area": area_name,
-                    "best_variant": best2["best_variant"],
-                    "best_mean": best2["best_mean"],
-                    "second_variant": best2["second_variant"],
-                    "second_mean": best2["second_mean"],
-                    "p_best_vs_second_adj_two_sided": best2["p_best_vs_second_adj_two_sided"],
-                    "n_subjects_pairs": best2["n_subjects"],
-                })
+            # per-area, per-pair means already in columns: value (metric), rmse_value, bias_value
+            area_long = (sub.groupby(["pair","variant"], observed=False)
+                           .agg(value=("value","mean"),
+                                rmse_value=("rmse_value","mean"),
+                                bias_value=("bias_value","mean"))
+                           .reset_index())
+
+            # Ranking (by metric value) + p-vs-RAW table for best
+            rank_tbl, _ = _best_second_summary(
+                area_long.rename(columns={"pair": "subject"}),
+                subject_col="subject",
+                variant_list=variants,
+            )
+            if rank_tbl.empty:
+                continue
+
+            # Map RMSE means per variant (reporting)
+            rmse_means = area_long.groupby("variant", observed=False)["rmse_value"].mean()
+
+            # p vs RAW for BEST (metric-based; plain two-sided)
+            vsraw = _vs_raw_table(
+                area_long.rename(columns={"pair": "subject"}),
+                subject_col="subject",
+                variant_list=variants,
+            )
+            vsraw = vsraw.set_index("variant") if not vsraw.empty else pd.DataFrame()
+
+            # Prepare top-4 entries (or fewer if fewer levels exist)
+            ordered = rank_tbl.sort_values("rank")["variant"].tolist()
+            topk = ordered[:min(4, len(ordered))]
+
+            row = {"area": area_name}
+
+            # Best variant fields (metric-based)
+            row["best_variant"] = str(topk[0]) if len(topk) >= 1 else ""
+            row["best_mean"] = (
+                float(
+                    rank_tbl.loc[rank_tbl["variant"] == row["best_variant"], "mean"].values[0]
+                )
+                if len(topk) >= 1
+                else np.nan
+            )
+
+            # Best: RMSE mean
+            row["best_rmse_mean"] = (
+                float(rmse_means.get(row["best_variant"], np.nan))
+                if len(topk) >= 1
+                else np.nan
+            )
+
+            # PLAIN two-sided p vs RAW for the BEST (no Holm)
+            if (
+                not vsraw.empty
+                and row["best_variant"] in vsraw.index
+                and "p_two_sided" in vsraw.columns
+            ):
+                row["best_p_vs_raw_two_sided"] = float(
+                    vsraw.loc[row["best_variant"], "p_two_sided"]
+                )
+            else:
+                row["best_p_vs_raw_two_sided"] = np.nan
+
+            # Second–Fourth: names + RMSE means
+            for i, label in enumerate(["second", "third", "fourth"], start=1):
+                v = str(topk[i]) if len(topk) > i else ""
+                row[f"{label}_variant"] = v
+                row[f"{label}_rmse_mean"] = (
+                    float(rmse_means.get(v, np.nan)) if v else np.nan
+                )
+
+            # Number of subjects (pairs)
+            row["n_subjects_pairs"] = int(area_long["pair"].nunique())
+
+            best_area_rows.append(row)
+
         if best_area_rows:
             out = out_root / f"corrections_best_by_area__{set_name}.csv"
             pd.DataFrame(best_area_rows).to_csv(out, index=False)
             print(f"✅  Best correction by area ({set_name}) written: {out}")
+
+            # Wide, RMSE-focused table for WITH IDW (best→4th corrections per area)
+            if set_name == "with_idw":
+                wide_rows = []
+                for row in best_area_rows:
+                    wide_rows.append({
+                        "area": row["area"],
+                        "best_corr": row.get("best_variant", ""),
+                        "best_mean_rmse": row.get("best_rmse_mean", np.nan),
+                        # also use plain two-sided p vs RAW here
+                        "p_diff_from_RAW_two_sided": row.get("best_p_vs_raw_two_sided", np.nan),
+                        "second_corr": row.get("second_variant", ""),
+                        "second_mean_rmse": row.get("second_rmse_mean", np.nan),
+                        "third_corr": row.get("third_variant", ""),
+                        "third_mean_rmse": row.get("third_rmse_mean", np.nan),
+                        "fourth_corr": row.get("fourth_variant", ""),
+                        "fourth_mean_rmse": row.get("fourth_rmse_mean", np.nan),
+                    })
+                pd.DataFrame(wide_rows).to_csv(
+                    out_root / "corrections_order_by_area__with_idw.csv",
+                    index=False,
+                )
 
 if __name__ == "__main__":
     main()

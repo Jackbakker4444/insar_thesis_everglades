@@ -20,10 +20,10 @@ Outputs
 A) Per-pair corrections maps (3DEP) as a 2×3 grid:
       [ Raw                 |  Tropospheric               ]
       [ Ionospheric         |  Tropospheric + Ionospheric ]
-      [ Soil (WATER only)   |  Satellite (WATER only)     ]
+      [ Vegetation (TYPE)   |  SAR (band 1, 0–20000)      ]
    • Two equal-width columns, all panels aligned (same AOI & aspect, equal sizes).
    • Single colorbar outside, to the right of the first two rows.
-   • Soil & Satellite clipped to the **area-specific** water polygon from
+   • Vegetation (GeoJSON) and SAR baselayer are clipped to the **area-specific** water polygon from
      /home/bakke326l/InSAR/main/data/vector/water_areas.geojson
      (match on properties.area == <AREA DIR NAME>, case-insensitive).
    • North arrow + scalebar per panel.
@@ -47,8 +47,8 @@ C) ALL-areas combined:
    • Two DEMs, variable widths:
      → <areas_root>/results/dem_boxplots_ALL_areas_varwidth_TROPO.png
 
-D) ALL-areas scatter: mean RMSE vs temporal baseline (days)
-   → <areas_root>/results/scatter_mean_rmse_vs_temporal_baseline_TROPO.png
+D) ALL-areas scatter: mean RMSE vs temporal baseline (days) **and** mean RMSE vs |B⊥| (km)
+   → <areas_root>/results/scatter_mean_rmse_vs_temporal_and_bperp_RAW.png
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ except Exception:
 MAP_PANEL_HEIGHT_IN = 3.2   # height of each map panel (inches). Width is computed (no skew).
 COL_PAD_IN          = 0.30  # outer left padding (inches) before the two map columns
 TITLE_GAP_IN        = 0.75  # gap (inches) between the title and the top row of maps
-CBAR_OUTER_PAD_IN   = 0.6  # extra right padding (inches) *after* the colorbar (prevents clipping)
+CBAR_OUTER_PAD_IN   = 0.6   # extra right padding (inches) *after* the colorbar (prevents clipping)
 # =======================================================================
 
 # Internals (you can tweak if needed)
@@ -147,10 +147,21 @@ CMAP_INV    = "viridis_r"
 AREAS_ROOT_DEFAULT = Path("/mnt/DATA2/bakke326l/processing/areas")
 PERP_BASELINES_CSV_DEFAULT = Path("/home/bakke326l/InSAR/main/data/perpendicular_baselines.csv")
 DEF_WATER_AREAS    = "/home/bakke326l/InSAR/main/data/vector/water_areas.geojson"
-DEF_SAT_PROVIDER   = "Esri.WorldImagery"
-DEF_SAT_URL        = ""  # custom XYZ if you want
-DEF_SOIL_TIF       = "/home/bakke326l/InSAR/main/data/aux/raster/soil_map_florida.tif"
 
+# NEW: Vegetation & SAR inputs (bottom row of 2×3)
+DEF_VEG_GEOJSON = "/home/bakke326l/InSAR/main/data/vector/vegetation_map.geojson"
+DEF_SAR_TIF     = "/home/bakke326l/InSAR/main/data/aux/raster/SAR_baselayer.tif"
+
+# NEW: Default TYPE→color mapping (easy to edit or override via --veg-colors)
+VEG_TYPE_COLORS_DEFAULT = {
+    "16b": "#FF0000",  # red
+    "3":   "#800080",  # purple
+    "17":  "#FFD700",  # yellow
+    "9":   "#0000FF",  # blue
+    "14":  "#008000",  # green
+}
+VEG_OTHER_COLOR = "#999999"
+VEG_ALPHA       = 0.75
 
 # Quiet noisy libs
 os.environ.setdefault("CPL_DEBUG", "NO")
@@ -234,7 +245,6 @@ def _read_bperp_csv(perp_csv: Path) -> Optional[pd.DataFrame]:
             .agg(bperp_abs_m=("bperp_abs_m","mean")))
     return df
 
-
 # ====================== Map helpers: scalebar & north arrow ===================
 def _geod() -> Optional[Geod]:
     if Geod is None: return None
@@ -290,8 +300,9 @@ def _draw_north_arrow(ax, extent: Tuple[float,float,float,float], *, size_frac=0
                             length_includes_head=True, color="k"))
     ax.text(x, y+size+0.01*dy, "N", ha="center", va="bottom", fontsize=9, color="k")
 
-# ========================= Basemap / overlays / soil =========================
+# ========================= Basemap / overlays helpers =========================
 def _cx_get_provider(provider_name: str):
+    # (kept for compatibility; no longer used in the 3×2 bottom-right panel)
     prov = cx.providers
     for token in provider_name.split("."):
         prov = getattr(prov, token, None)
@@ -300,6 +311,7 @@ def _cx_get_provider(provider_name: str):
     return prov
 
 def _add_basemap(ax, extent: Tuple[float,float,float,float], *, provider_name: str, xyz_url: str):
+    # (kept for compatibility; not used for SAR panel)
     xmin, xmax, ymin, ymax = extent
     ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
     ok = False
@@ -317,36 +329,6 @@ def _add_basemap(ax, extent: Tuple[float,float,float,float], *, provider_name: s
         ax.set_facecolor("#dddddd")
         ax.text(0.5, 0.5, "Satellite basemap unavailable", transform=ax.transAxes,
                 ha="center", va="center", fontsize=9, color="#444")
-
-def _soil_png_from_tif(soil_tif: Path) -> Optional[Path]:
-    if not soil_tif or not soil_tif.exists():
-        return None
-    png = soil_tif.with_suffix(".png")
-    if png.exists():
-        return png
-    try:
-        with rasterio.open(soil_tif) as ds:
-            arr = ds.read()
-            if arr.dtype != np.uint8:
-                arrf = arr.astype(float)
-                lo = np.nanpercentile(arrf, 2); hi = np.nanpercentile(arrf, 98)
-                if not np.isfinite(lo): lo = np.nanmin(arrf)
-                if not np.isfinite(hi): hi = np.nanmax(arrf)
-                if hi <= lo: hi = lo + 1.0
-                arr8 = np.clip((arrf - lo)/(hi-lo)*255.0, 0, 255).astype(np.uint8)
-            else:
-                arr8 = arr
-            if arr8.shape[0] == 1:
-                rgb = np.repeat(arr8, 3, axis=0)
-            elif arr8.shape[0] >= 3:
-                rgb = arr8[:3]
-            else:
-                rgb = np.repeat(arr8, 3, axis=0)
-            rgb = np.transpose(rgb, (1,2,0))
-        plt.imsave(png, rgb)
-        return png
-    except Exception:
-        return None
 
 # ----------------------- Water geometry for the current AREA ------------------
 def _get_area_water_geom(area_name: str, water_path: Optional[str]):
@@ -378,7 +360,8 @@ def _poly_to_mpl_path(poly: Polygon) -> MplPath:
     for interior in poly.interiors:
         v, c = _ring_to_verts_codes(interior.coords)
         all_verts.extend(v); all_codes.extend(c)
-    return MplPath(all_verts, all_codes)
+    path_combined = MplPath(all_verts, all_codes)
+    return path_combined
 
 def _geom_to_clip_patch(ax, geom) -> Optional[PathPatch]:
     if geom is None or Polygon is None:
@@ -412,17 +395,97 @@ def _clip_ax_images_to_geom(ax, geom):
     for im in list(ax.images):
         im.set_clip_path(patch)
 
+# ====================== NEW: Vegetation + SAR bottom-row helpers ======================
+def _parse_type_color_mapping(s: str) -> Dict[str, str]:
+    """Parse '16b:#ff0000,3:#800080' → {'16b':'#ff0000','3':'#800080'}."""
+    mapping: Dict[str, str] = {}
+    if not s:
+        return mapping
+    for item in s.split(","):
+        if ":" in item:
+            k, v = item.split(":", 1)
+            mapping[k.strip()] = v.strip()
+    return mapping
+
+def _plot_veg_geojson(ax,
+                      geojson_path: Path,
+                      *,
+                      extent: Tuple[float,float,float,float],
+                      area_geom,
+                      type_col: str = "TYPE",
+                      colors_map: Optional[Dict[str,str]] = None,
+                      default_color: str = VEG_OTHER_COLOR,
+                      alpha: float = VEG_ALPHA):
+    """Plot a vegetation GeoJSON, color-coded by a TYPE column; optionally clipped to area water geometry."""
+    if gpd is None or not geojson_path or not geojson_path.exists():
+        ax.text(0.5, 0.5, "Vegetation GeoJSON missing", transform=ax.transAxes,
+                ha="center", va="center", fontsize=9)
+        return
+    gdf = gpd.read_file(geojson_path)
+    if getattr(gdf, "crs", None) and gdf.crs and str(gdf.crs).upper() not in ("EPSG:4326","WGS84","OGC:CRS84"):
+        gdf = gdf.to_crs(epsg=4326)
+    if area_geom is not None:
+        try:
+            gdf = gpd.clip(gdf, area_geom)
+        except Exception:
+            pass
+    cmap = dict(colors_map or {})
+    colors = [cmap.get(str(v), default_color) for v in gdf.get(type_col, pd.Series([""]*len(gdf))).astype(str)]
+    gdf.plot(ax=ax, color=colors, edgecolor="#333333", linewidth=0.2, alpha=alpha)
+
+    # Optional legend (only for explicitly mapped types)
+    if cmap:
+        patches = [Patch(facecolor=c, edgecolor="#333333", label=str(k), alpha=alpha) for k, c in cmap.items()]
+
+        ax.legend(handles=patches, loc="lower left", fontsize=8, frameon=True)
+
+    # Ensure consistent extent/size with other map panels
+    try:
+        xmin, xmax, ymin, ymax = extent
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect("equal", adjustable="box")
+    except Exception:
+        pass
+
+def _read_sar_band1(sar_tif: Path) -> Optional[Tuple[np.ndarray, Tuple[float,float,float,float]]]:
+    """Read band 1 from a SAR baselayer GeoTIFF. Returns (array, extent) or None."""
+    if not sar_tif or not sar_tif.exists():
+        return None
+    with rasterio.open(sar_tif) as ds:
+        arr = ds.read(1).astype(float)
+        if ds.nodata is not None and not np.isnan(ds.nodata):
+            arr = np.where(arr == ds.nodata, np.nan, arr)
+        extent = (ds.bounds.left, ds.bounds.right, ds.bounds.bottom, ds.bounds.top)
+    return arr, extent
+
 # ============================ CORRECTIONS (2×3) ==============================
 def plot_corrections_sixpack(
     area_dir: Path,
     pair_tag: str,
     *,
     water_path: Optional[str],
+    # kept for compatibility (no longer used in bottom-right):
     sat_provider: str,
     sat_url: str,
-    soil_tif: Optional[Path],
+    # NEW inputs for bottom row:
+    veg_geojson: Optional[Path],
+    veg_type_colors: Dict[str, str],
+    sar_tif: Optional[Path],
 ):
-    """Two aligned columns × three rows of maps, equal sizes; colorbar to the right of top two rows."""
+    """Two aligned columns × three rows of maps, equal sizes; colorbar to the right of top two rows.
+
+    Layout
+    ------
+    Row 1: RAW | TROPO
+    Row 2: IONO | TROPO_IONO
+    Row 3: Vegetation Type | SAR HH
+
+    Notes
+    -----
+    • GeoJSON vegetation and SAR panels are clipped to the area's water polygon (if available).
+    • The correction rasters set the colorbar stretch (shared).
+    """
     area = area_dir.name
     ref_iso, sec_iso = _pair_dates_from_tag(pair_tag)
 
@@ -443,7 +506,7 @@ def plot_corrections_sixpack(
         print(f"⏭️  No 3DEP correction rasters found for {area}:{pair_tag}.")
         return
 
-    # Shared color stretch
+    # Shared color stretch (correction rasters)
     vals = [m[0][np.isfinite(m[0])] for m in corr_arrays if m is not None]
     vmin, vmax = (0.0, 1.0)
     if len(vals):
@@ -454,18 +517,7 @@ def plot_corrections_sixpack(
     aoi_extent = (min(e[0] for e in extents), max(e[1] for e in extents),
                   min(e[2] for e in extents), max(e[3] for e in extents))
 
-    # Soil preview
-    soil_png: Optional[Path] = None
-    soil_extent: Optional[Tuple[float,float,float,float]] = None
-    if soil_tif:
-        soil_png = _soil_png_from_tif(soil_tif)
-        try:
-            with rasterio.open(soil_tif) as ds:
-                soil_extent = (ds.bounds.left, ds.bounds.right, ds.bounds.bottom, ds.bounds.top)
-        except Exception:
-            soil_extent = None
-
-    # Water geom for this area
+    # Water geom for this area (for clipping)
     area_geom = _get_area_water_geom(area, water_path)
 
     # ---------- Compute figure size from AOI aspect and the four knobs ----------
@@ -507,7 +559,7 @@ def plot_corrections_sixpack(
         ax.set_ylim(aoi_extent[2], aoi_extent[3])
         ax.set_aspect('equal', adjustable='box')
         ax.set_xticks([]); ax.set_yticks([])
-        ax.set_title(title, fontsize=10, pad=3)
+        ax.set_title(title, fontsize=12, pad=3)
         _draw_scalebar(ax, aoi_extent); _draw_north_arrow(ax, aoi_extent)
 
     # First two rows (corrections)
@@ -521,29 +573,39 @@ def plot_corrections_sixpack(
         ims.append(im)
         _prep_ax(ax, label_map[disp])
 
-    # Soil (WATER-only)
-    ax_soil = axes[4]
-    if soil_png is not None and soil_extent is not None:
-        img = plt.imread(str(soil_png))
-        ax_soil.imshow(img, extent=soil_extent, origin="upper")
-        _prep_ax(ax_soil, "Soil")
-        _clip_ax_images_to_geom(ax_soil, area_geom)
-    else:
-        ax_soil.text(0.5, 0.5, "Soil PNG/TIF unavailable", ha="center", va="center")
-        ax_soil.set_axis_off()
+    # --- Bottom-left: Vegetation (GeoJSON, colored by TYPE, WATER-only clip) ---
+    ax_veg = axes[4]
+    _prep_ax(ax_veg, "Vegetation Type")
+    _plot_veg_geojson(
+        ax_veg,
+        Path(veg_geojson) if veg_geojson else None,
+        extent=aoi_extent,
+        area_geom=area_geom,
+        type_col="TYPE",
+        colors_map=veg_type_colors,
+        default_color=VEG_OTHER_COLOR,
+        alpha=VEG_ALPHA,
+    )
 
-    # Satellite (WATER-only)
-    ax_sat = axes[5]
-    _add_basemap(ax_sat, aoi_extent, provider_name=sat_provider, xyz_url=sat_url)
-    _prep_ax(ax_sat, "Satellite")
-    _clip_ax_images_to_geom(ax_sat, area_geom)
+    # --- Bottom-right: SAR baselayer  ---
+    ax_sar = axes[5]
+    sar = _read_sar_band1(Path(sar_tif) if sar_tif else None)
+    if sar is not None:
+        sar_arr, sar_extent = sar
+        ax_sar.imshow(sar_arr, extent=sar_extent, origin="upper",
+                      cmap="gray", vmin=0, vmax=20000)
+        _prep_ax(ax_sar, "SAR HH Backscatter")
+        _clip_ax_images_to_geom(ax_sar, area_geom)
+    else:
+        ax_sar.text(0.5, 0.5, "SAR baselayer missing", ha="center", va="center")
+        ax_sar.set_axis_off()
 
     # Title (place at a distance of TITLE_GAP_IN above the top row)
     top_axes_y = max(axes[0].get_position().y1, axes[1].get_position().y1)
     title_y = min(0.99, top_axes_y + (TITLE_GAP_IN / fig_h_in))
     fig.suptitle(
-        f"{area} — 3DEP vertical displacement corrections\n{ref_iso} to {sec_iso}",
-        y=title_y, fontsize=14, fontweight="bold"
+        f"{area} - Vertical Displacement Corrections - 3DEP\n{ref_iso} to {sec_iso}",
+        y=title_y, fontsize=16, fontweight="normal"
     )
 
     # Colorbar — outside, to the right of the first two rows
@@ -563,8 +625,8 @@ def plot_corrections_sixpack(
     try:
         pos_ll = axes[4].get_position()
         y = pos_ll.y0 - (0.026 if fig_h_in >= 8 else 0.022)
-        src_sat = "Custom XYZ" if sat_url else "Esri World Imagery"
-        fig.text(pos_ll.x0, y, f"Sources: ALOS PALSAR, 3DEP, GACOS — Satellite: {src_sat}",
+        fig.text(pos_ll.x0, y,
+                 "Sources: ALOS PALSAR, 3DEP, GACOS, and SFWMD",
                  ha="left", va="top", fontsize=9, color="#333333")
     except Exception:
         pass
@@ -642,11 +704,11 @@ def _both_dems_equalwidth_adjacent(ax, g: pd.DataFrame, meta: pd.DataFrame,
         ax.set_ylim(*RMSE_YLIMS)
         if any(v.size for v in all_vals):
             _annotate_outliers(ax, np.concatenate([v for v in all_vals if v.size]), *RMSE_YLIMS)
-    ax.set_title(f"{area_label} — Two DEMs (equal width) — {ylab}", fontsize=10)
+    ax.set_title(f"{area_label} - SRTM & 3DEP - {ylab}", fontsize=16)
     if add_legend:
         handles=[Patch(facecolor=to_rgba(COLORS_DEM["SRTM"],0.30), edgecolor=COLORS_DEM["SRTM"], label="SRTM"),
                  Patch(facecolor=to_rgba(COLORS_DEM["3DEP"],0.30), edgecolor=COLORS_DEM["3DEP"], label="3DEP")]
-        ax.legend(handles=handles, loc="upper right", frameon=True, fontsize=9)
+        ax.legend(handles=handles, loc="upper right", frameon=True, fontsize=12)
 
 def _both_dems_varwidth_time(ax, g: pd.DataFrame, meta: pd.DataFrame,
                              metric: str, ylab: str, area_label: str,
@@ -668,11 +730,11 @@ def _both_dems_varwidth_time(ax, g: pd.DataFrame, meta: pd.DataFrame,
     xlims = (meta["t_ref"].min(), meta["t_sec"].max())
     ax.xaxis_date(); ax.xaxis.set_major_formatter(mdates.DateFormatter(DATE_FMT_SHORT))
     ax.tick_params(axis="x", rotation=45, labelsize=8); ax.set_xlim(xlims)
-    ax.set_title(f"{area_label} — Two DEMs (variable width) — {ylab}", fontsize=10)
+    ax.set_title(f"{area_label} - SRTM & 3DEP - {ylab}", fontsize=16)
     if add_legend:
         handles=[Patch(facecolor=to_rgba(COLORS_DEM["SRTM"],0.30), edgecolor=COLORS_DEM["SRTM"], label="SRTM"),
                  Patch(facecolor=to_rgba(COLORS_DEM["3DEP"],0.30), edgecolor=COLORS_DEM["3DEP"], label="3DEP")]
-        ax.legend(handles=handles, loc="upper right", frameon=True, fontsize=9)
+        ax.legend(handles=handles, loc="upper right", frameon=True, fontsize=12)
 
 def _plot_area_boxplots(area_dir: Path, df_area: pd.DataFrame):
     area = area_dir.name
@@ -741,10 +803,10 @@ def _plot_all_areas_equalwidth(root: Path, area_df: Dict[str, pd.DataFrame]):
     ax_t.set_ylim(*RMSE_YLIMS)
     if any(v.size for v in rmse_all_vals):
         _annotate_outliers(ax_t, np.concatenate([v for v in rmse_all_vals if v.size]), *RMSE_YLIMS)
-    ax_t.set_title("All areas — Two DEMs (equal width) — RMSE", fontsize=10)
+    ax_t.set_title("RMSE Boxplots SRTM & 3DEP: All Watersheds - TROPO", fontsize=16)
     ax_t.legend(handles=[Patch(facecolor=to_rgba(COLORS_DEM["SRTM"],0.30), edgecolor=COLORS_DEM["SRTM"], label="SRTM"),
                          Patch(facecolor=to_rgba(COLORS_DEM["3DEP"],0.30), edgecolor=COLORS_DEM["3DEP"], label="3DEP")],
-                loc="upper right", frameon=True, fontsize=9)
+                loc="upper right", frameon=True, fontsize=12)
 
     # Bias
     for i, (pref, psec, _) in enumerate(pairs):
@@ -753,10 +815,10 @@ def _plot_all_areas_equalwidth(root: Path, area_df: Dict[str, pd.DataFrame]):
             _simple_box(ax_b, vals, x_centers[i] + dx, width, COLORS_DEM[dem])
     ax_b.set_xticks(x_centers); ax_b.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
     ax_b.set_ylabel("Bias (cm)", fontsize=10); ax_b.grid(True, alpha=0.3, axis="y")
-    ax_b.set_title("All areas — Two DEMs (equal width) — Bias", fontsize=10)
+    ax_b.set_title("RMSE Boxplots SRTM & 3DEP: All Watersheds - TROPO", fontsize=16)
     ax_b.legend(handles=[Patch(facecolor=to_rgba(COLORS_DEM["SRTM"],0.30), edgecolor=COLORS_DEM["SRTM"], label="SRTM"),
                          Patch(facecolor=to_rgba(COLORS_DEM["3DEP"],0.30), edgecolor=COLORS_DEM["3DEP"], label="3DEP")],
-                loc="upper right", frameon=True, fontsize=9)
+                loc="upper right", frameon=True, fontsize=12)
     ax_b.set_xlabel("Pair dates (informational; equal spacing)", fontsize=10)
 
     out = root / "results" / "dem_boxplots_ALL_areas_equalwidth_TROPO.png"
@@ -790,10 +852,10 @@ def _plot_all_areas_varwidth(root: Path, area_df: Dict[str, pd.DataFrame]):
     xlims = (meta["t_ref"].min(), meta["t_sec"].max())
     ax_t.xaxis_date(); ax_t.xaxis.set_major_formatter(mdates.DateFormatter(DATE_FMT_SHORT))
     ax_t.tick_params(axis="x", rotation=45, labelsize=8); ax_t.set_xlim(xlims)
-    ax_t.set_title("All areas — Two DEMs (variable width) — RMSE", fontsize=10)
+    ax_t.set_title("RMSE Boxplots SRTM & 3DEP: All Watersheds - TROPO", fontsize=16)
     ax_t.legend(handles=[Patch(facecolor=to_rgba(COLORS_DEM["SRTM"],0.30), edgecolor=COLORS_DEM["SRTM"], label="SRTM"),
                          Patch(facecolor=to_rgba(COLORS_DEM["3DEP"],0.30), edgecolor=COLORS_DEM["3DEP"], label="3DEP")],
-                loc="upper right", frameon=True, fontsize=9)
+                loc="upper right", frameon=True, fontsize=12)
 
     # Bias
     for _, row in meta.iterrows():
@@ -810,10 +872,10 @@ def _plot_all_areas_varwidth(root: Path, area_df: Dict[str, pd.DataFrame]):
     ax_b.set_ylabel("Bias (cm)", fontsize=10); ax_b.grid(True, alpha=0.3, axis="y")
     ax_b.xaxis_date(); ax_b.xaxis.set_major_formatter(mdates.DateFormatter(DATE_FMT_SHORT))
     ax_b.tick_params(axis="x", rotation=45, labelsize=8); ax_b.set_xlim(xlims)
-    ax_b.set_title("All areas — Two DEMs (variable width) — Bias", fontsize=10)
+    ax_b.set_title("RMSE Boxplots SRTM & 3DEP: All Watersheds - TROPO", fontsize=16)
     ax_b.legend(handles=[Patch(facecolor=to_rgba(COLORS_DEM["SRTM"],0.30), edgecolor=COLORS_DEM["SRTM"], label="SRTM"),
                          Patch(facecolor=to_rgba(COLORS_DEM["3DEP"],0.30), edgecolor=COLORS_DEM["3DEP"], label="3DEP")],
-                loc="upper right", frameon=True, fontsize=9)
+                loc="upper right", frameon=True, fontsize=12)
     ax_b.set_xlabel("Time (dates on x-axis; widths reflect pair durations)", fontsize=10)
 
     out = root / "results" / "dem_boxplots_ALL_areas_varwidth_TROPO.png"
@@ -821,18 +883,124 @@ def _plot_all_areas_varwidth(root: Path, area_df: Dict[str, pd.DataFrame]):
     fig.savefig(out, dpi=150); plt.close(fig)
     print(f"🌐 ALL-areas (variable width) written: {out}")
 
+# ------------------- ALL-areas RMSE histograms (NEW) --------------------------
+def _plot_hist_rmse_dem_all(root: Path, area_df: Dict[str, pd.DataFrame]):
+    """
+    All-areas histogram of RMSE for the two DEMs (SRTM, 3DEP), TROPO, LS 60%.
+    """
+    all_df = _collect_all_df(area_df)
+    if all_df is None or all_df.empty:
+        print("⏭️  ALL-areas DEM RMSE hist: no LS TROPO 60% rows.")
+        return
+
+    all_df = all_df.copy()
+    all_df["dem"] = all_df["dem"].astype(str).str.upper()
+    vals_srtm = pd.to_numeric(all_df[all_df["dem"] == "SRTM"]["rmse_cm"], errors="coerce").to_numpy(float)
+    vals_3dep = pd.to_numeric(all_df[all_df["dem"] == "3DEP"]["rmse_cm"], errors="coerce").to_numpy(float)
+    vals_srtm = vals_srtm[np.isfinite(vals_srtm)]
+    vals_3dep = vals_3dep[np.isfinite(vals_3dep)]
+
+    if vals_srtm.size == 0 and vals_3dep.size == 0:
+        print("⏭️  ALL-areas DEM RMSE hist: no finite RMSE values.")
+        return
+
+    all_vals = np.concatenate([v for v in (vals_srtm, vals_3dep) if v.size])
+    if all_vals.size == 0:
+        print("⏭️  ALL-areas DEM RMSE hist: no finite RMSE values.")
+        return
+
+    bins = int(min(40, max(10, np.ceil(np.sqrt(all_vals.size)))))
+
+    fig, ax = plt.subplots(figsize=(10.5, 6.2), dpi=150, constrained_layout=True)
+    if vals_srtm.size:
+        ax.hist(vals_srtm, bins=bins, alpha=0.45,
+                label="SRTM", color=COLORS_DEM["SRTM"], edgecolor="white", linewidth=0.6)
+    if vals_3dep.size:
+        ax.hist(vals_3dep, bins=bins, alpha=0.45,
+                label="3DEP", color=COLORS_DEM["3DEP"], edgecolor="white", linewidth=0.6)
+
+    ax.set_xlabel("RMSE (cm)", fontsize=10)
+    ax.set_ylabel("Count", fontsize=10)
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.set_xlim(RMSE_YLIMS[0], RMSE_YLIMS[1])
+    ax.set_title("RMSE Distribution: All Watersheds by DEM - TROPO", fontsize=16)
+    ax.legend(loc="upper right", frameon=True, fontsize=12)
+
+    out = root / "results" / "hist_rmse_ALL_areas_DEM_TROPO.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"📊 ALL-areas DEM RMSE histogram written: {out}")
+
+def _plot_hist_rmse_corr_all(root: Path, area_df: Dict[str, pd.DataFrame]):
+    """
+    All-areas histogram of RMSE for the four corrections (RAW, TROPO, IONO, TROPO_IONO),
+    using SRTM, LS 60%.
+    """
+    corr_types = ["RAW", "TROPO", "IONO", "TROPO_IONO"]
+    corr_vals: Dict[str, np.ndarray] = {}
+
+    for corr in corr_types:
+        vals_list = []
+        for df in area_df.values():
+            s = _pick_rows_60pct(df, corr_used=corr)
+            if s.empty:
+                continue
+            s = s[s["dem"].str.upper() == "SRTM"]
+            if s.empty:
+                continue
+            v = pd.to_numeric(s["rmse_cm"], errors="coerce").to_numpy(float)
+            v = v[np.isfinite(v)]
+            if v.size:
+                vals_list.append(v)
+        if vals_list:
+            corr_vals[corr] = np.concatenate(vals_list)
+
+    if not corr_vals:
+        print("⏭️  ALL-areas correction RMSE hist: no SRTM LS 60% rows.")
+        return
+
+    all_vals = np.concatenate(list(corr_vals.values()))
+    if all_vals.size == 0:
+        print("⏭️  ALL-areas correction RMSE hist: no finite RMSE values.")
+        return
+
+    bins = int(min(40, max(10, np.ceil(np.sqrt(all_vals.size)))))
+
+    fig, ax = plt.subplots(figsize=(10.5, 6.2), dpi=150, constrained_layout=True)
+    for corr in corr_types:
+        v = corr_vals.get(corr)
+        if v is None or v.size == 0:
+            continue
+        color = COLORS_CORR.get(corr, "#666666")
+        ax.hist(v, bins=bins, alpha=0.35,
+                label=corr, color=color, edgecolor="white", linewidth=0.6)
+
+    ax.set_xlabel("RMSE (cm)", fontsize=10)
+    ax.set_ylabel("Count", fontsize=10)
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.set_xlim(RMSE_YLIMS[0], RMSE_YLIMS[1])
+    ax.set_title("RMSE Distribution: All Watersheds by Correction - SRTM", fontsize=16)
+    ax.legend(loc="upper right", frameon=True, fontsize=12)
+
+    out = root / "results" / "hist_rmse_ALL_areas_CORR_SRTM.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"📊 ALL-areas correction RMSE histogram written: {out}")
+
 # ------------------- ALL-areas scatter: mean RMSE vs baseline ----------------
 def _plot_scatter_rmse_vs_temporal_and_bperp(root: Path,
                                              area_df: Dict[str, pd.DataFrame],
                                              perp_csv: Path):
     """
-    Left: mean RMSE vs temporal baseline (days) — as before.
+    Left: mean RMSE vs temporal baseline (days) — TROPO, LS 60%.
     Right: mean RMSE vs |B⊥| (km), merged from perpendicular_baselines.csv.
     """
     # Build per-pair mean RMSE (across DEMs) and temporal baseline (days)
     rows = []
     for _, df in area_df.items():
-        s = _pick_rows_60pct(df, corr_used="RAW")
+        s = _pick_rows_60pct(df, corr_used="TROPO")
         if s.empty: 
             continue
         s = s[s["dem"].str.upper().isin(["SRTM","3DEP"])]
@@ -880,8 +1048,8 @@ def _plot_scatter_rmse_vs_temporal_and_bperp(root: Path,
     axL.set_xlabel("Temporal baseline (days)", fontsize=10)
     axL.set_ylabel("Mean RMSE (cm) across DEMs", fontsize=10)
     axL.grid(True, alpha=0.3)
-    axL.set_title("Mean RMSE vs Temporal Baseline (RAW, LS 60%)", fontsize=10)
-    axL.legend(loc="upper right", fontsize=9, frameon=True)
+    axL.set_title("Mean RMSE vs Temporal Baseline - TROPO", fontsize=16)
+    axL.legend(loc="upper right", fontsize=12, frameon=True)
 
     # --- Right: RMSE vs |B⊥| (km) ---
     xk = (m["bperp_abs_m"].to_numpy(float) / 1000.0)
@@ -899,33 +1067,40 @@ def _plot_scatter_rmse_vs_temporal_and_bperp(root: Path,
     axR.set_xlabel("Perpendicular baseline |B⊥| (km)", fontsize=10)
     axR.set_ylabel("Mean RMSE (cm) across DEMs", fontsize=10)
     axR.grid(True, alpha=0.3)
-    axR.set_title("Mean RMSE vs Perpendicular Baseline (RAW, LS 60%)", fontsize=10)
-    axR.legend(loc="upper right", fontsize=9, frameon=True)
+    axR.set_title("Mean RMSE vs Perpendicular Baseline - TROPO", fontsize=16)
+    axR.legend(loc="upper right", fontsize=12, frameon=True)
 
-    out = root / "results" / "scatter_mean_rmse_vs_temporal_and_bperp_RAW.png"
+    out = root / "results" / "scatter_mean_rmse_vs_temporal_and_bperp_TROPO.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"📈 Temporal & perpendicular baseline scatter written: {out}")
 
-
 # ----------------------------------- CLI -------------------------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Corrections 2×3 maps (with tight column control) and DEM plots (TROPO)."
+        description="Corrections 2×3 maps (with tight column control), DEM plots (TROPO), and temporal/|B⊥| scatter."
     )
     ap.add_argument("--areas-root", type=str, default=str(AREAS_ROOT_DEFAULT),
                     help="Root folder containing per-area subfolders")
     ap.add_argument("--area", type=str,
                     help="Only process this AREA (subfolder name under --areas-root).")
     ap.add_argument("--water-areas", type=str, default=DEF_WATER_AREAS,
-                    help="Path to water_areas.geojson (clip Soil & Satellite to this area's water polygon)")
-    ap.add_argument("--sat-provider", type=str, default=DEF_SAT_PROVIDER,
-                    help="contextily provider string (ignored if --sat-url is set)")
-    ap.add_argument("--sat-url", type=str, default=DEF_SAT_URL,
-                    help="Custom XYZ for satellite (e.g. 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}')")
-    ap.add_argument("--soil-tif", type=str, default=DEF_SOIL_TIF,
-                    help="Soil GeoTIFF to convert once to PNG and display (PNG saved next to the TIF).")
+                    help="Path to water_areas.geojson (clip Vegetation & SAR to this area's water polygon)")
+    # (kept for compatibility; no longer used in bottom-right)
+    ap.add_argument("--sat-provider", type=str, default="Esri.WorldImagery",
+                    help="contextily provider string (unused in 3×2 bottom-right; kept for compatibility)")
+    ap.add_argument("--sat-url", type=str, default="",
+                    help="Custom XYZ for satellite (unused in 3×2 bottom-right; kept for compatibility)")
+
+    # NEW: vegetation + SAR inputs
+    ap.add_argument("--veg-geojson", type=str, default=DEF_VEG_GEOJSON,
+                    help="Vegetation map (GeoJSON) colored by TYPE")
+    ap.add_argument("--veg-colors", type=str, default="",
+                    help="TYPE→color mapping like '16b:#FF0000,3:#800080,17:#FFD700,9:#0000FF,14:#008000'")
+    ap.add_argument("--sar-tif", type=str, default=DEF_SAR_TIF,
+                    help="SAR baselayer GeoTIFF; band 1 shown grayscale, stretch 0–20000")
+
     ap.add_argument("--perp-baselines", type=str, default=str(PERP_BASELINES_CSV_DEFAULT),
                 help="Path to perpendicular_baselines.csv (from help_perpendicular_baseline.py)")
     args = ap.parse_args()
@@ -945,8 +1120,13 @@ def main():
     if not area_df:
         print("⏭️  Nothing to visualize."); return
 
+    # Prepare vegetation color mapping and file paths
+    veg_map_path = Path(args.veg_geojson) if args.veg_geojson else None
+    veg_colors = VEG_TYPE_COLORS_DEFAULT.copy()
+    veg_colors.update(_parse_type_color_mapping(args.veg_colors))
+    sar_tif_path = Path(args.sar_tif) if args.sar_tif else None
+
     # Corrections — per pair maps
-    soil_tif_path = Path(args.soil_tif) if args.soil_tif else None
     for area_name, df5 in area_df.items():
         area_dir = root / area_name
         pair_tags = _collect_pair_tags_from_maps(area_dir)
@@ -956,9 +1136,11 @@ def main():
             try:
                 plot_corrections_sixpack(area_dir, pair_tag,
                                          water_path=args.water_areas,
-                                         sat_provider=args.sat_provider,
-                                         sat_url=args.sat_url,
-                                         soil_tif=soil_tif_path)
+                                         sat_provider=args.sat_provider,   # kept but unused for bottom-right
+                                         sat_url=args.sat_url,             # kept but unused
+                                         veg_geojson=veg_map_path,
+                                         veg_type_colors=veg_colors,
+                                         sar_tif=sar_tif_path)
             except Exception as e:
                 print(f"⚠️  Corrections maps failed {area_name}:{pair_tag}: {e}")
 
@@ -969,7 +1151,7 @@ def main():
         except Exception as e:
             print(f"⚠️  DEM boxplots failed {area_name}: {e}")
 
-    # ALL-areas combined + scatter
+    # ALL-areas combined + histograms + scatter
     try:
         _plot_all_areas_equalwidth(root, area_df)
     except Exception as e:
@@ -978,6 +1160,14 @@ def main():
         _plot_all_areas_varwidth(root, area_df)
     except Exception as e:
         print(f"⚠️  ALL-areas (varwidth) failed: {e}")
+    try:
+        _plot_hist_rmse_dem_all(root, area_df)
+    except Exception as e:
+        print(f"⚠️  ALL-areas DEM RMSE histogram failed: {e}")
+    try:
+        _plot_hist_rmse_corr_all(root, area_df)
+    except Exception as e:
+        print(f"⚠️  ALL-areas correction RMSE histogram failed: {e}")
     try:
         _plot_scatter_rmse_vs_temporal_and_bperp(root, area_df, Path(args.perp_baselines))
     except Exception as e:
