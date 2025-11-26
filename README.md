@@ -264,71 +264,153 @@ python 7_accuracy_assessment_density.py --reps 50 --seed 42 --spread-top-m 5
 
 ### 8) Visualizations
 
-**File:** `8_visualization_dem_corr.py`
-**What it covers (Corrections & DEMs):**
 
-* **Corrections maps (SRTM)** as a **2×3** grid per pair:
-  `Raw | Tropospheric / Ionospheric | Tropospheric+Ionospheric / Soil (WATER-only) | Satellite (WATER-only)`
-  Single shared colorbar; per-panel north arrow & scalebar; Soil & Satellite clipped to the area’s WATER polygon.
-* **DEM comparisons (RAW, LS 60%)** per area: SRTM vs 3DEP boxplots shown **(i)** with equal widths and **(ii)** with widths ∝ pair duration.
-  RMSE panel fixed to 0–25 cm; Bias auto; dates compact on x-axis.
-* **All-areas summaries (RAW, LS 60%)**: the same DEM comparison logic applied across all areas.
-* **Baseline sensitivity** (RAW, LS 60%): mean RMSE vs temporal baseline (days) across pairs.
+**File:** `8_visualization_dem_corr.py`  
+**What it covers (Corrections, DEMs & Baselines):**
+
+* **Per-pair corrections maps (3DEP, LS 60%)** as a **2×3 grid** per pair:  
+  `Raw | Tropospheric / Ionospheric | Tropospheric+Ionospheric / Vegetation TYPE | SAR HH backscatter`  
+  Single shared colorbar for the four correction panels; per-panel north arrow & scalebar.  
+  Vegetation and SAR panels are clipped to the area’s WATER polygon (`water_areas.geojson`).
+
+* **Per-area DEM comparisons (TROPO, LS 60%)**: SRTM vs 3DEP boxplots shown  
+  **(i)** with equal widths (pairs equally spaced on the x-axis), and  
+  **(ii)** with widths ∝ pair duration (time axis).  
+  RMSE axis is fixed (cm), Bias auto; dates shown in compact `'yy-mm-dd` format.
+
+* **All-areas DEM summaries (TROPO, LS 60%)**:  
+  Combined SRTM vs 3DEP boxplots over all watersheds, again as  
+  **(i)** equal-width and **(ii)** duration-weighted figures.
+
+* **All-areas RMSE distributions** (TROPO / SRTM):  
+  Histograms + smooth KDE-style lines for  
+  **(a)** DEMs (SRTM vs 3DEP, TROPO, LS 60%), and  
+  **(b)** corrections (RAW, TROPO, IONO, TROPO+IONO, SRTM, LS 60%).
+
+* **Baseline sensitivity (TROPO, LS 60%)**:  
+  Per-pair *mean* RMSE (averaged over DEMs) vs  
+  **(i)** temporal baseline (days), and  
+  **(ii)** perpendicular baseline \(|B_\perp|\) (km), each with a linear fit and \(R^2\).
+
+* **DEM difference export**:  
+  Creates a GeoTIFF with **3DEP − SRTM** (m), warping SRTM to the 3DEP grid first.
 
 **Outputs:**
 
-* `corr_maps_pair_<PAIR>_2x3.png` (per pair, under `<area>/results/`)
-* `dem_boxplots_area_<AREA>_equalwidth_RAW.png` and `dem_boxplots_area_<AREA>_varwidth_RAW.png`
-* `dem_boxplots_ALL_areas_equalwidth_RAW.png` and `dem_boxplots_ALL_areas_varwidth_RAW.png`
-* `scatter_mean_rmse_vs_temporal_baseline_RAW.png`
+* Per pair (per area, under `<area>/results/`):  
+  * `corr_maps_pair_<PAIR>_2x3.png`
+* Per area (DEM boxplots, TROPO, LS 60%):  
+  * `dem_boxplots_area_<AREA>_equalwidth_TROPO.png`  
+  * `dem_boxplots_area_<AREA>_varwidth_TROPO.png`
+* All areas (DEM boxplots, TROPO, LS 60%):  
+  * `dem_boxplots_ALL_areas_equalwidth_TROPO.png`  
+  * `dem_boxplots_ALL_areas_varwidth_TROPO.png`
+* All areas (RMSE histograms):  
+  * `hist_rmse_ALL_areas_DEM_TROPO.png`  
+  * `hist_rmse_ALL_areas_CORR_SRTM.png`
+* All areas (baseline scatter):  
+  * `scatter_mean_rmse_vs_temporal_and_bperp_TROPO.png`
+* DEM difference (3DEP − SRTM):  
+  * Path from `--dem-diff-out` (default:  
+    `/home/bakke326l/InSAR/main/data/aux/dem/diff_dem.tif`)
 
 **Run**
 
 ```bash
-# Everything with defaults (all areas)
+# Everything with defaults (all areas; 3DEP/TROPO LS 60% metrics, default overlays)
 python 8_visualization_dem_corr.py
 
-# Single area + custom satellite XYZ + custom water polygons
+# Single area + custom water polygon + custom vegetation + custom SAR baselayer
 python 8_visualization_dem_corr.py --area ENP \
-  --sat-url 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}' \
-  --water-areas /home/bakke326l/InSAR/main/data/vector/water_areas.geojson
-```
+  --water-areas /home/bakke326l/InSAR/main/data/vector/water_areas.geojson \
+  --veg-geojson /home/bakke326l/InSAR/main/data/vector/vegetation_map.geojson \
+  --sar-tif /home/bakke326l/InSAR/main/data/aux/raster/SAR_baselayer.tif
+
+# Only adjust DEM-difference export locations
+python 8_visualization_dem_corr.py \
+  --dem-3dep /path/to/3dep_10m.dem.wgs84.vrt \
+  --dem-srtm /path/to/srtm_30m.dem.wgs84.vrt \
+  --dem-diff-out /mnt/DATA2/.../diff_dem.tif
+````
+
+*(Layout of the 2×3 corrections map can be fine-tuned via the internal
+`MAP_PANEL_HEIGHT_IN`, `COL_PAD_IN`, `TITLE_GAP_IN`, `CBAR_OUTER_PAD_IN` constants.)*
 
 ---
 
 **File:** `8_visualization_density.py`
-**What it covers (Density):**
+**What it covers (Gauge density):**
 
-* **Per-pair density curves** for **RMSE** and **Bias** vs **gauge density** (km² per gauge, log-x):
-  median line + **5–95%** band, for **Interferogram (LS)** and **IDW (same gauges)**.
-* **Bottom-row AOI maps** per pair: **LS calibrated**, **Satellite AOI** (with WATER overlay), and **IDW baseline**; gauge overlay (cal = black, val = red).
-  Map spacing/height are tunable via `--maps-gap-frac` and `--maps-height-frac`.
-* **All-areas (by area, no dots)**: each area plotted as its own median line + 5–95% band for the selected method (`LEAST_SQUARES` or `IDW_DHVIS`).
-* **All-areas (combined, no dots)**: a **single** median + 5–95% band aggregated directly by density, with the x-axis spanning the **full density range** present in the data.
+* **Per-pair density curves** for **RMSE** and **Bias** vs **gauge density**
+  (km² per gauge, log-x):
+  median line + **5–95%** band, for **Interferogram (LS)** and **IDW** (same gauges).
+  Bias panel is *not* clipped (full range shown).
+
+* **Bottom-row AOI maps (per pair)**:
+  3-panel layout with shared color stretch for LS/IDW:
+
+  * Left: LS-calibrated displacement (selected `DEM` + `CORR`)
+  * Middle: **SAR baselayer** (band 1, 0–20000, grayscale), clipped to WATER polygon
+  * Right: IDW surface
+    All three maps include scalebar, north arrow, and **gauge overlay**
+    (calibration = black, validation = red).
+
+* **All-areas (per-area) figure (no dots)**:
+  For a chosen `DEM` / `CORR` / `METHOD` (`LEAST_SQUARES` or `IDW_DHVIS`),
+  one figure with two stacked panels (RMSE, Bias); each **area** is a median line
+  with a 5–95% band vs gauge density (log-x, plain-number ticks).
+
+* **All-areas (combined) figure (no dots)**:
+  One figure with two panels (RMSE, Bias); **all areas merged** into LS and IDW curves,
+  aggregated directly by density using log-spaced bins over the **full** density range.
+  LS = solid line, IDW = dashed; both with 5–95% bands.
+
+* **All-areas RMSE: combined vs per-area**:
+  Extra 2-panel figure (RMSE only):
+
+  * Top: combined LS and IDW RMSE vs density (all watersheds)
+  * Bottom: per-area median RMSE vs density for the **selected method**.
+    Shared log-density axis with plain-number tick labels.
 
 **Outputs (per pair + all areas):**
 
-* `density_<corr_lower>_idw_pair_<PAIR>.png` (per pair, under `<area>/results/`)
-* `density_all_areas_by_area_<DEM>_<CORR>_<METHOD>.png`
-* `density_all_areas_combined_<DEM>_<CORR>_<METHOD>.png`
+* Per pair (per area, under `<area>/results/`):
+
+  * `density_<corr_lower>_idw_pair_<PAIR>.png`
+* All areas (per-area, selected method):
+
+  * `density_all_areas_by_area_<DEM>_<CORR>_<METHOD>.png`
+* All areas (combined LS+IDW):
+
+  * `density_all_areas_combined_<DEM>_<CORR>_<METHOD>.png`
+* All areas (RMSE, combined vs per-area):
+
+  * `density_all_areas_rmse_byarea_vs_combined_<DEM>_<CORR>_<METHOD>.png`
 
 **Run**
 
 ```bash
-# Defaults: DEM=SRTM, CORR=RAW, METHOD=LEAST_SQUARES (writes per-pair figures + both all-areas figures)
+# Defaults: DEM=3DEP, CORR=TROPO, METHOD=LEAST_SQUARES
+# -> per-pair figures + all three all-areas figures
 python 8_visualization_density.py
 
-# Single area, TROPO_IONO, all-areas with IDW method, custom WATER overlay and provider
-python 8_visualization_density.py --area ENP --dem SRTM --corr TROPO_IONO --method IDW_DHVIS \
+# Single area (3DEP, TROPO, LS only)
+python 8_visualization_density.py --area ENP
+
+# TROPO+IONO, IDW method, all areas
+python 8_visualization_density.py --dem 3DEP --corr TROPO_IONO --method IDW_DHVIS
+
+# With explicit water overlay + SAR baselayer for the middle map
+python 8_visualization_density.py \
   --water-areas /home/bakke326l/InSAR/main/data/vector/water_areas.geojson \
-  --sat-provider Esri.WorldImagery
+  --sar-tif /home/bakke326l/InSAR/main/data/aux/raster/SAR_baselayer.tif
 
-# With explicit gauges template + tighter map gap below the Bias panel
-python 8_visualization_density.py --gauges-template "/mnt/DATA2/.../{area}/results/gauges_split_60pct_{pair}.geojson" \
-  --maps-gap-frac 0.08 --maps-height-frac 0.30
+# With explicit gauges template + tighter bottom-map gap/height
+python 8_visualization_density.py \
+  --gauges-template "/mnt/DATA2/.../{area}/results/gauges_split_60pct_{pair}.geojson" \
+  --maps-gap-frac 0.08 \
+  --maps-height-frac 0.30
 ```
-
----
 
 ---
 

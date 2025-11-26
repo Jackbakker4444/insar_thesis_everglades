@@ -1017,6 +1017,199 @@ def plot_all_areas_combined(area7: Dict[str, pd.DataFrame], *, dem: str, corr: s
     plt.close(fig)
     print(f"🧮 Combined all-areas figure written: {out}")
 
+def plot_all_areas_rmse_byarea_vs_combined(
+    area7: Dict[str, pd.DataFrame], *, dem: str, corr: str, method: str, out_dir: Path
+):
+    """
+    Two stacked panels (RMSE only):
+
+      Top   : All watersheds combined RMSE vs gauge density, with
+              LS (solid) and IDW (dashed) median lines + 5–95% bands.
+
+      Bottom: Per-watershed median RMSE vs gauge density, one line per AREA
+              (selected method only: LS or IDW).
+
+    X-axis is gauge density (km² per gauge, log). Markers indicate bin centers.
+    Output:
+      density_all_areas_rmse_byarea_vs_combined_<DEM>_<CORR>_<METHOD>.png
+    """
+    if not area7:
+        print("⏭️  No areas to combine for RMSE by-area vs combined plot.")
+        return
+
+    # ---- Gather & standardize all areas ----
+    frames = []
+    for area, df in area7.items():
+        if df is None or df.empty:
+            continue
+        d = _ensure_upper(_ensure_density_column(df.copy()))
+        d["__area__"] = area
+        frames.append(d)
+
+    big = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if big.empty:
+        print("⏭️  RMSE by-area vs combined: empty dataset.")
+        return
+
+    dem_u, corr_u = dem.upper(), corr.upper()
+    big = _ensure_upper(_ensure_density_column(big))
+
+    # Per-area curves for the selected method (LS or IDW)
+    sel_method = big[
+        (big["dem"] == dem_u) &
+        (big["corr"] == corr_u) &
+        (big["method"] == method)
+    ].copy()
+    if sel_method.empty:
+        print(f"⏭️  RMSE by-area vs combined: no rows for DEM={dem_u} CORR={corr_u} METHOD={method}.")
+        return
+
+    # Combined curves (LS + IDW if available)
+    sel_ls  = big[(big["dem"] == dem_u) & (big["corr"] == corr_u) & (big["method"] == METHOD_LS)].copy()
+    sel_idw = big[(big["dem"] == dem_u) & (big["corr"] == corr_u) & (big["method"] == METHOD_IDW)].copy()
+    if sel_ls.empty and sel_idw.empty:
+        print(f"⏭️  RMSE by-area vs combined: no LS/IDW rows for DEM={dem_u} CORR={corr_u}.")
+        return
+
+    # ---- Density range from ALL relevant samples ----
+    dens_list = []
+    for s in (sel_method, sel_ls, sel_idw):
+        if s is None or s.empty or "density" not in s.columns:
+            continue
+        d = pd.to_numeric(s["density"], errors="coerce")
+        dens_list.append(d)
+
+    if not dens_list:
+        print("⏭️  RMSE by-area vs combined: no positive density values.")
+        return
+
+    dens_all = pd.concat(dens_list, ignore_index=True)
+    dens_all = dens_all[np.isfinite(dens_all) & (dens_all > 0)]
+    if dens_all.empty:
+        print("⏭️  RMSE by-area vs combined: no positive density values after filtering.")
+        return
+
+    xmin, xmax = float(dens_all.min()), float(dens_all.max())
+
+    # ---- Per-area stats (selected method) ----
+    areas = sorted(sel_method["__area__"].dropna().unique().tolist())
+    palette = mpl.rcParams["axes.prop_cycle"].by_key().get(
+        "color",
+        ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
+         "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"]
+    )
+    col_for = {a: palette[i % len(palette)] for i, a in enumerate(areas)}
+
+    # ---- Combined stats (LS + IDW) ----
+    g_rmse_ls  = _agg_curve_by_density(sel_ls,  "rmse_cm", nbins=30, min_count=1) if not sel_ls.empty  else pd.DataFrame()
+    g_rmse_idw = _agg_curve_by_density(sel_idw, "rmse_cm", nbins=30, min_count=1) if not sel_idw.empty else pd.DataFrame()
+
+    col_ls  = COLORS_DEM.get(dem_u, CB["blue"])
+    col_idw = COLOR_IDW
+
+    # ---- Helper: plain-number formatter on log axis (no 10^k) ----
+    def _fmt_plain(v, _):
+        if not np.isfinite(v) or v <= 0:
+            return ""
+        if abs(v - round(v)) < 1e-9:
+            return f"{int(round(v))}"
+        s = f"{v:.3g}".rstrip("0").rstrip(".")
+        return s
+
+    from matplotlib.ticker import MultipleLocator
+
+    # NOTE: flip order → ax_comb on top, ax_by on bottom
+    fig, (ax_comb, ax_by) = plt.subplots(
+        nrows=2, ncols=1, figsize=(12, 10), dpi=150, sharex=True
+    )
+
+    # ---------- TOP: all watersheds combined RMSE ----------
+    if not g_rmse_ls.empty:
+        ax_comb.plot(
+            g_rmse_ls["med_density"], g_rmse_ls["med"],
+            "-", lw=2.4, color=col_ls, label="LS median",
+            marker="o", markersize=4
+        )
+        ax_comb.fill_between(
+            g_rmse_ls["med_density"], g_rmse_ls["p_low"], g_rmse_ls["p_high"],
+            facecolor=to_rgba(col_ls, 0.18), edgecolor="none", zorder=1
+        )
+    if not g_rmse_idw.empty:
+        ax_comb.plot(
+            g_rmse_idw["med_density"], g_rmse_idw["med"],
+            "--", lw=2.2, color=col_idw, label="IDW median",
+            marker="o", markersize=4
+        )
+        ax_comb.fill_between(
+            g_rmse_idw["med_density"], g_rmse_idw["p_low"], g_rmse_idw["p_high"],
+            facecolor=to_rgba(col_idw, 0.18), edgecolor="none", zorder=1
+        )
+
+    ax_comb.set_ylabel("RMSE (cm)", fontsize=12)
+    ax_comb.set_title("All Watersheds Combined - TROPO - 3DEP", fontsize=12)
+    ax_comb.set_ylim(0, 25)
+    ax_comb.yaxis.set_major_locator(MultipleLocator(5))
+    ax_comb.grid(True, alpha=0.30, which="both")
+    _legend_note(ax_comb)
+    ax_comb.legend(loc="upper right", fontsize=10, frameon=True)
+
+    # ---------- BOTTOM: per-watershed RMSE (by-area) ----------
+    for a in areas:
+        sa = sel_method[sel_method["__area__"] == a]
+        g = _agg_curve_metric(sa, "rmse_cm")
+        if g.empty:
+            continue
+        c = col_for[a]
+        ax_by.plot(
+            g["med_density"], g["med"],
+            "-", lw=1.8, color=c, label=a,
+            marker="o", markersize=4
+        )
+        ax_by.fill_between(
+            g["med_density"], g["p_low"], g["p_high"],
+            facecolor=to_rgba(c, 0.12), edgecolor="none", zorder=1
+        )
+
+    ax_by.set_ylabel("RMSE (cm)", fontsize=12)
+    ax_by.set_title("Per-Watershed Median - TROPO - 3DEP", fontsize=12)
+    ax_by.set_ylim(0, 25)
+    ax_by.yaxis.set_major_locator(MultipleLocator(5))
+    ax_by.grid(True, alpha=0.30, which="both")
+    _legend_note(ax_by)
+
+    # ---------- Shared density axis (log) ----------
+    for ax in (ax_comb, ax_by):
+        ax.set_xscale("log")
+        ax.set_xlim(xmin, xmax)
+        ax.xaxis.set_major_locator(mpl.ticker.LogLocator(base=10, subs=(1.0, 2.0, 3.0, 5.0)))
+        ax.xaxis.set_major_formatter(mpl.ticker.FuncFormatter(_fmt_plain))
+        ax.xaxis.set_minor_locator(mpl.ticker.LogLocator(base=10, subs=np.arange(1,10)*0.1))
+        ax.xaxis.set_minor_formatter(NullFormatter())
+
+    ax_comb.tick_params(axis="x", which="both", labelbottom=False)
+    ax_by.set_xlabel("Gauge density (km² per gauge) (log)", fontsize=12)
+
+    # Shared legend for areas (bottom panel curves, but legend centred below figure)
+    handles_a, labels_a = ax_by.get_legend_handles_labels()
+    if handles_a:
+        fig.legend(
+            handles_a, labels_a,
+            loc="lower center", ncol=5, frameon=False, fontsize=10, bbox_to_anchor=(0.5, 0.01)
+        )
+
+    fig.suptitle(
+        f"Error vs Density: Per-Watershed and All Watersheds Combined - {corr_u} - {dem_u}",
+        y=0.97, fontsize=16, fontweight="normal"
+    )
+    fig.subplots_adjust(top=0.90, bottom=0.12, hspace=0.28)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"density_all_areas_rmse_byarea_vs_combined_{dem_u}_{corr_u}_{method}.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"📊 RMSE by-area vs combined figure written: {out}")
+
+
 
 # ----------------------------------- CLI -------------------------------------
 def main():
@@ -1101,6 +1294,7 @@ def main():
         out_dir = root / "results"
         plot_all_areas_density(area7, dem=args.dem, corr=args.corr, method=method_sel, out_dir=out_dir)
         plot_all_areas_combined(area7, dem=args.dem, corr=args.corr, method=method_sel, out_dir=out_dir)
+        plot_all_areas_rmse_byarea_vs_combined(area7, dem=args.dem, corr=args.corr, method=method_sel, out_dir=out_dir)
     except Exception as e:
         print(f"⚠️  All-areas figures failed: {e}")
 

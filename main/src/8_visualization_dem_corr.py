@@ -59,6 +59,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import rasterio
+from rasterio.warp import reproject, Resampling
 import matplotlib as mpl
 mpl.set_loglevel("warning")
 import matplotlib.pyplot as plt
@@ -66,6 +67,11 @@ from matplotlib.colors import to_rgba
 from matplotlib.patches import Rectangle, FancyArrow, Patch, PathPatch
 from matplotlib.path import Path as MplPath
 import matplotlib.dates as mdates
+
+try:
+    from scipy.stats import gaussian_kde
+except Exception:
+    gaussian_kde = None
 
 # Times new roman fonts
 mpl.rcParams.update({
@@ -135,7 +141,14 @@ DATE_FMT_SHORT = "'%y-%m-%d"  # e.g. '08-03-17
 # Corrections / DEM config
 METHOD_LS = "LEAST_SQUARES"
 DEMS      = ["SRTM", "3DEP"]
-RMSE_YLIMS = (0.0, 25.0)  # fixed
+RMSE_YLIMS = (0.0, 30.0)  # fixed
+RMSE_BIN_WIDTH_CM = 1.0
+RMSE_BINS = np.arange(
+    RMSE_YLIMS[0],
+    RMSE_YLIMS[1] + RMSE_BIN_WIDTH_CM,
+    RMSE_BIN_WIDTH_CM,
+)
+
 
 # Colors
 CB = {"black":"#000000","blue":"#0072B2","green":"#009E73","orange":"#D55E00"}
@@ -221,6 +234,31 @@ def _collect_pair_tags_from_maps(area_dir: Path) -> List[str]:
             m = re.match(r".+_(\d{8}_\d{8})\.tif", p.name)
             if m: tags.add(m.group(1))
     return sorted(tags)
+
+def _add_hist_smooth_line(ax, data: np.ndarray, *, color: str,
+                          bin_width: float = RMSE_BIN_WIDTH_CM):
+    """
+    Overlay a smooth KDE-style line on top of a histogram.
+
+    The KDE is converted from density to 'counts' so it matches the
+    histogram's y-axis when using fixed-width bins.
+    """
+    if gaussian_kde is None:
+        # SciPy not available: keep histogram only.
+        return
+
+    data = np.asarray(data, dtype=float)
+    data = data[np.isfinite(data)]
+    if data.size < 2:
+        return
+
+    kde = gaussian_kde(data)
+    x_grid = np.linspace(RMSE_YLIMS[0], RMSE_YLIMS[1], 512)
+    y_density = kde(x_grid)                 # density (area = 1)
+    # Convert density to counts for given bin width:
+    y_counts = y_density * data.size * bin_width
+
+    ax.plot(x_grid, y_counts, linewidth=2.0, color=color)
 
 def _read_bperp_csv(perp_csv: Path) -> Optional[pd.DataFrame]:
     """
@@ -310,26 +348,6 @@ def _cx_get_provider(provider_name: str):
             return cx.providers.Esri.WorldImagery
     return prov
 
-def _add_basemap(ax, extent: Tuple[float,float,float,float], *, provider_name: str, xyz_url: str):
-    # (kept for compatibility; not used for SAR panel)
-    xmin, xmax, ymin, ymax = extent
-    ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
-    ok = False
-    if cx is not None:
-        try:
-            if xyz_url:
-                cx.add_basemap(ax, source=xyz_url, crs="EPSG:4326", attribution=False)
-            else:
-                prov = _cx_get_provider(provider_name)
-                cx.add_basemap(ax, source=prov, crs="EPSG:4326", attribution=False)
-            ok = True
-        except Exception:
-            ok = False
-    if not ok:
-        ax.set_facecolor("#dddddd")
-        ax.text(0.5, 0.5, "Satellite basemap unavailable", transform=ax.transAxes,
-                ha="center", va="center", fontsize=9, color="#444")
-
 # ----------------------- Water geometry for the current AREA ------------------
 def _get_area_water_geom(area_name: str, water_path: Optional[str]):
     if not water_path or gpd is None:
@@ -394,8 +412,8 @@ def _clip_ax_images_to_geom(ax, geom):
     ax.set_facecolor("white")
     for im in list(ax.images):
         im.set_clip_path(patch)
-
-# ====================== NEW: Vegetation + SAR bottom-row helpers ======================
+        
+# ====================== Vegetation + SAR bottom-row helpers ======================
 def _parse_type_color_mapping(s: str) -> Dict[str, str]:
     """Parse '16b:#ff0000,3:#800080' → {'16b':'#ff0000','3':'#800080'}."""
     mapping: Dict[str, str] = {}
@@ -600,7 +618,7 @@ def plot_corrections_sixpack(
         ax_sar.text(0.5, 0.5, "SAR baselayer missing", ha="center", va="center")
         ax_sar.set_axis_off()
 
-    # Title (place at a distance of TITLE_GAP_IN above the top row)
+    # Title
     top_axes_y = max(axes[0].get_position().y1, axes[1].get_position().y1)
     title_y = min(0.99, top_axes_y + (TITLE_GAP_IN / fig_h_in))
     fig.suptitle(
@@ -683,6 +701,68 @@ def _simple_box(ax, values: np.ndarray, center: float, width: float, color: str)
     for cap in bp["caps"]:       cap.set(color=color, linewidth=1.2)
     for med in bp["medians"]:    med.set(color="k", linewidth=1.8)
     for fl in bp["fliers"]:      fl.set(marker="o", ms=3.5, mfc=color, mec="white", alpha=0.85)
+    
+def export_dem_difference(dem_3dep: Path, dem_srtm: Path, out_path: Path) -> None:
+    """
+    Export a GeoTIFF with the elevation difference 3DEP - SRTM (in metres).
+
+    The SRTM DEM is warped to the 3DEP grid before differencing.
+    """
+    dem_3dep = Path(dem_3dep)
+    dem_srtm = Path(dem_srtm)
+    out_path = Path(out_path)
+
+    if not dem_3dep.exists():
+        print(f"⏭️  DEM diff: 3DEP DEM not found: {dem_3dep}")
+        return
+    if not dem_srtm.exists():
+        print(f"⏭️  DEM diff: SRTM DEM not found: {dem_srtm}")
+        return
+
+    with rasterio.open(dem_3dep) as src_3dep, rasterio.open(dem_srtm) as src_srtm:
+        data_3dep = src_3dep.read(1).astype("float32")
+        if src_3dep.nodata is not None:
+            data_3dep = np.where(data_3dep == src_3dep.nodata, np.nan, data_3dep)
+
+        data_srtm = src_srtm.read(1).astype("float32")
+        if src_srtm.nodata is not None:
+            data_srtm = np.where(data_srtm == src_srtm.nodata, np.nan, data_srtm)
+
+        # Warp SRTM to 3DEP grid
+        srtm_on_3dep = np.full_like(data_3dep, np.nan, dtype="float32")
+        reproject(
+            source=data_srtm,
+            destination=srtm_on_3dep,
+            src_transform=src_srtm.transform,
+            src_crs=src_srtm.crs,
+            dst_transform=src_3dep.transform,
+            dst_crs=src_3dep.crs,
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+        )
+
+        diff = data_3dep - srtm_on_3dep  # 3DEP minus SRTM
+
+        nodata_val = -9999.0
+        diff_out = np.where(np.isfinite(diff), diff, nodata_val).astype("float32")
+
+        meta = src_3dep.meta.copy()
+
+        # 🔧 IMPORTANT: write a GeoTIFF, not a VRT
+        meta.update(
+            driver="GTiff",      # <- force GeoTIFF output
+            dtype="float32",
+            nodata=nodata_val,
+            count=1,
+        )
+
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(out_path, "w", **meta) as dst:
+            dst.write(diff_out, 1)
+
+        print(f"🗺️  DEM difference written (3DEP - SRTM): {out_path}")
+
 
 def _both_dems_equalwidth_adjacent(ax, g: pd.DataFrame, meta: pd.DataFrame,
                                    metric: str, ylab: str, area_label: str,
@@ -887,6 +967,7 @@ def _plot_all_areas_varwidth(root: Path, area_df: Dict[str, pd.DataFrame]):
 def _plot_hist_rmse_dem_all(root: Path, area_df: Dict[str, pd.DataFrame]):
     """
     All-areas histogram of RMSE for the two DEMs (SRTM, 3DEP), TROPO, LS 60%.
+    Bins are fixed at 1 cm width from 0 to 25 cm.
     """
     all_df = _collect_all_df(area_df)
     if all_df is None or all_df.empty:
@@ -895,8 +976,14 @@ def _plot_hist_rmse_dem_all(root: Path, area_df: Dict[str, pd.DataFrame]):
 
     all_df = all_df.copy()
     all_df["dem"] = all_df["dem"].astype(str).str.upper()
-    vals_srtm = pd.to_numeric(all_df[all_df["dem"] == "SRTM"]["rmse_cm"], errors="coerce").to_numpy(float)
-    vals_3dep = pd.to_numeric(all_df[all_df["dem"] == "3DEP"]["rmse_cm"], errors="coerce").to_numpy(float)
+    vals_srtm = pd.to_numeric(
+        all_df[all_df["dem"] == "SRTM"]["rmse_cm"],
+        errors="coerce",
+    ).to_numpy(float)
+    vals_3dep = pd.to_numeric(
+        all_df[all_df["dem"] == "3DEP"]["rmse_cm"],
+        errors="coerce",
+    ).to_numpy(float)
     vals_srtm = vals_srtm[np.isfinite(vals_srtm)]
     vals_3dep = vals_3dep[np.isfinite(vals_3dep)]
 
@@ -909,15 +996,43 @@ def _plot_hist_rmse_dem_all(root: Path, area_df: Dict[str, pd.DataFrame]):
         print("⏭️  ALL-areas DEM RMSE hist: no finite RMSE values.")
         return
 
-    bins = int(min(40, max(10, np.ceil(np.sqrt(all_vals.size)))))
-
     fig, ax = plt.subplots(figsize=(10.5, 6.2), dpi=150, constrained_layout=True)
+
+    # --- Hist + line for SRTM ---
     if vals_srtm.size:
-        ax.hist(vals_srtm, bins=bins, alpha=0.45,
-                label="SRTM", color=COLORS_DEM["SRTM"], edgecolor="white", linewidth=0.6)
+        ax.hist(
+            vals_srtm,
+            bins=RMSE_BINS,
+            alpha=0.45,
+            label="SRTM",
+            color=COLORS_DEM["SRTM"],
+            edgecolor="white",
+            linewidth=0.6,
+        )
+        _add_hist_smooth_line(
+            ax,
+            vals_srtm,
+            color=COLORS_DEM["SRTM"],
+            bin_width=RMSE_BIN_WIDTH_CM,
+        )
+
+    # --- Hist + line for 3DEP ---
     if vals_3dep.size:
-        ax.hist(vals_3dep, bins=bins, alpha=0.45,
-                label="3DEP", color=COLORS_DEM["3DEP"], edgecolor="white", linewidth=0.6)
+        ax.hist(
+            vals_3dep,
+            bins=RMSE_BINS,
+            alpha=0.45,
+            label="3DEP",
+            color=COLORS_DEM["3DEP"],
+            edgecolor="white",
+            linewidth=0.6,
+        )
+        _add_hist_smooth_line(
+            ax,
+            vals_3dep,
+            color=COLORS_DEM["3DEP"],
+            bin_width=RMSE_BIN_WIDTH_CM,
+        )
 
     ax.set_xlabel("RMSE (cm)", fontsize=10)
     ax.set_ylabel("Count", fontsize=10)
@@ -932,10 +1047,12 @@ def _plot_hist_rmse_dem_all(root: Path, area_df: Dict[str, pd.DataFrame]):
     plt.close(fig)
     print(f"📊 ALL-areas DEM RMSE histogram written: {out}")
 
+
+
 def _plot_hist_rmse_corr_all(root: Path, area_df: Dict[str, pd.DataFrame]):
     """
     All-areas histogram of RMSE for the four corrections (RAW, TROPO, IONO, TROPO_IONO),
-    using SRTM, LS 60%.
+    using SRTM, LS 60%. Bins are fixed at 1 cm width from 0 to 25 cm.
     """
     corr_types = ["RAW", "TROPO", "IONO", "TROPO_IONO"]
     corr_vals: Dict[str, np.ndarray] = {}
@@ -965,16 +1082,32 @@ def _plot_hist_rmse_corr_all(root: Path, area_df: Dict[str, pd.DataFrame]):
         print("⏭️  ALL-areas correction RMSE hist: no finite RMSE values.")
         return
 
-    bins = int(min(40, max(10, np.ceil(np.sqrt(all_vals.size)))))
-
     fig, ax = plt.subplots(figsize=(10.5, 6.2), dpi=150, constrained_layout=True)
+
     for corr in corr_types:
         v = corr_vals.get(corr)
         if v is None or v.size == 0:
             continue
         color = COLORS_CORR.get(corr, "#666666")
-        ax.hist(v, bins=bins, alpha=0.35,
-                label=corr, color=color, edgecolor="white", linewidth=0.6)
+
+        # Histogram
+        ax.hist(
+            v,
+            bins=RMSE_BINS,
+            alpha=0.35,
+            label=corr,
+            color=color,
+            edgecolor="white",
+            linewidth=0.6,
+        )
+
+        # Smooth line on top
+        _add_hist_smooth_line(
+            ax,
+            v,
+            color=color,
+            bin_width=RMSE_BIN_WIDTH_CM,
+        )
 
     ax.set_xlabel("RMSE (cm)", fontsize=10)
     ax.set_ylabel("Count", fontsize=10)
@@ -1093,7 +1226,7 @@ def main():
     ap.add_argument("--sat-url", type=str, default="",
                     help="Custom XYZ for satellite (unused in 3×2 bottom-right; kept for compatibility)")
 
-    # NEW: vegetation + SAR inputs
+    # vegetation + SAR inputs
     ap.add_argument("--veg-geojson", type=str, default=DEF_VEG_GEOJSON,
                     help="Vegetation map (GeoJSON) colored by TYPE")
     ap.add_argument("--veg-colors", type=str, default="",
@@ -1102,7 +1235,18 @@ def main():
                     help="SAR baselayer GeoTIFF; band 1 shown grayscale, stretch 0–20000")
 
     ap.add_argument("--perp-baselines", type=str, default=str(PERP_BASELINES_CSV_DEFAULT),
-                help="Path to perpendicular_baselines.csv (from help_perpendicular_baseline.py)")
+                    help="Path to perpendicular_baselines.csv (from help_perpendicular_baseline.py)")
+    # DEM diff export
+    ap.add_argument("--dem-3dep", type=str,
+                    default="/home/bakke326l/InSAR/main/data/aux/dem/3dep_10m.dem.wgs84.vrt",
+                    help="3DEP DEM in WGS84 ellipsoidal heights (VRT).",)
+    ap.add_argument("--dem-srtm", type=str,
+                    default="/home/bakke326l/InSAR/main/data/aux/dem/srtm_30m.dem.wgs84.vrt",
+                    help="SRTM DEM in WGS84 ellipsoidal heights (VRT).",)
+    ap.add_argument("--dem-diff-out", type=str,
+                    default="/home/bakke326l/InSAR/main/data/aux/dem/diff_dem.tif",
+                    help="Output path for DEM difference GeoTIFF (3DEP - SRTM).",)
+    
     args = ap.parse_args()
 
     root = Path(args.areas_root)
@@ -1172,6 +1316,17 @@ def main():
         _plot_scatter_rmse_vs_temporal_and_bperp(root, area_df, Path(args.perp_baselines))
     except Exception as e:
         print(f"⚠️  Temporal & B⊥ scatter failed: {e}")
+      
+        
+    # DEM difference GeoTIFF (3DEP - SRTM)
+    try:
+        export_dem_difference(
+            Path(args.dem_3dep),
+            Path(args.dem_srtm),
+            Path(args.dem_diff_out),
+        )
+    except Exception as e:
+        print(f"⚠️  DEM difference export failed: {e}")    
 
 if __name__ == "__main__":
     main()
