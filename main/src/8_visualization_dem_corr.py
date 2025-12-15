@@ -20,7 +20,7 @@ Outputs
 A) Per-pair corrections maps (3DEP) as a 2×3 grid:
       [ Raw                 |  Tropospheric               ]
       [ Ionospheric         |  Tropospheric + Ionospheric ]
-      [ Vegetation (TYPE)   |  SAR (band 1, 0–20000)      ]
+      [ Vegetation (TYPE)   |  SAR (band 1, backscatter in dB) ]
    • Two equal-width columns, all panels aligned (same AOI & aspect, equal sizes).
    • Single colorbar outside, to the right of the first two rows.
    • Vegetation (GeoJSON) and SAR baselayer are clipped to the **area-specific** water polygon from
@@ -605,18 +605,61 @@ def plot_corrections_sixpack(
         alpha=VEG_ALPHA,
     )
 
-    # --- Bottom-right: SAR baselayer  ---
+    # --- Bottom-right: SAR baselayer (shown in dB, with vertical colorbar) ---
     ax_sar = axes[5]
     sar = _read_sar_band1(Path(sar_tif) if sar_tif else None)
     if sar is not None:
         sar_arr, sar_extent = sar
-        ax_sar.imshow(sar_arr, extent=sar_extent, origin="upper",
-                      cmap="gray", vmin=0, vmax=20000)
-        _prep_ax(ax_sar, "SAR HH Backscatter")
+
+        # ALOS PALSAR ASF: DN is amplitude → use 20*log10(DN) for backscatter in dB
+        sar_arr = sar_arr.astype(float)
+        valid = np.isfinite(sar_arr) & (sar_arr > 0)
+        sar_db = np.full_like(sar_arr, np.nan, dtype="float32")
+        sar_db[valid] = 20.0 * np.log10(sar_arr[valid])
+
+        # Robust stretch in dB space
+        finite_db = sar_db[np.isfinite(sar_db)]
+        if finite_db.size > 0:
+            vmin_db, vmax_db = np.nanpercentile(finite_db, [2, 98])
+        else:
+            vmin_db, vmax_db = -20.0, 5.0  # fallback if everything is NaN
+
+        # Plot SAR backscatter in dB
+        im_sar = ax_sar.imshow(
+            sar_db,
+            extent=sar_extent,
+            origin="upper",
+            cmap="gray",
+            vmin=vmin_db,
+            vmax=vmax_db,
+        )
+
+        _prep_ax(ax_sar, "SAR HH backscatter (dB)")
         _clip_ax_images_to_geom(ax_sar, area_geom)
+
+        # --- Vertical colorbar for SAR ---
+        # Reuse the displacement colorbar's x-padding & width:
+        #   x0 = right edge of top-right panel + _CBAR_GAP_IN
+        #   w  = _CBAR_WIDTH_IN
+        # But vertically, only span the SAR panel (bottom-right axes).
+        pos_sar = ax_sar.get_position()
+        pos_tr  = axes[1].get_position()  # top-right correction panel
+
+        cbar_x0 = pos_tr.x1 + (_CBAR_GAP_IN / fig_w_in)      # same gap as main cbar
+        cbar_w  = _CBAR_WIDTH_IN / fig_w_in                  # same width as main cbar
+        cbar_y0 = pos_sar.y0                                 # align with SAR panel bottom
+        cbar_h  = pos_sar.y1 - pos_sar.y0                    # same height as SAR panel
+
+        cax_sar = fig.add_axes([cbar_x0, cbar_y0, cbar_w, cbar_h])
+        cb_sar = fig.colorbar(im_sar, cax=cax_sar, orientation="vertical")
+        cb_sar.set_label("SAR backscatter (dB)", fontsize=9)
+        cb_sar.ax.tick_params(labelsize=7)
+
     else:
         ax_sar.text(0.5, 0.5, "SAR baselayer missing", ha="center", va="center")
         ax_sar.set_axis_off()
+
+
 
     # Title
     top_axes_y = max(axes[0].get_position().y1, axes[1].get_position().y1)
@@ -741,7 +784,7 @@ def export_dem_difference(dem_3dep: Path, dem_srtm: Path, out_path: Path) -> Non
             resampling=Resampling.bilinear,
         )
 
-        diff = data_3dep - srtm_on_3dep  # 3DEP minus SRTM
+        diff =  srtm_on_3dep - data_3dep  # 3DEP minus SRTM
 
         nodata_val = -9999.0
         diff_out = np.where(np.isfinite(diff), diff, nodata_val).astype("float32")

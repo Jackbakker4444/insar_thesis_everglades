@@ -33,8 +33,9 @@ What it draws
 - **Per-pair curves**: RMSE vs **density** and Bias vs **density**  
   (median line with **5-95%** band; **no clipping on Bias**).  
   X-axis is log-scaled **km² per gauge**.
-- **Bottom row maps (per pair)**:  
-  **LS calibrated** map, **SAR baselayer** (band 1, 0–20000), and **IDW baseline**, each with:
+- **Bottom row maps (per pair)** (left → right):  
+  **IDW baseline**, **LS calibrated displacement**, and **SAR baselayer** (ALOS PALSAR HH, in dB),  
+  with a shared displacement colourbar on the left and a SAR dB colourbar on the right, also with:
   shared color limits, scalebar, north arrow, and **gauge overlay**  
   (calibration=black, validation=red).
 - **All-areas figures (no dots)**:  
@@ -662,18 +663,28 @@ def plot_density_pair(
     _legend_note(ax2)
 
     # ---------- Bottom row maps ----------
-    ax_ls  = fig.add_subplot(gs[3, 0])
-    ax_mid = fig.add_subplot(gs[3, 1])  # SAR (clipped to area)
-    ax_idw = fig.add_subplot(gs[3, 2])
+    # Left → right: IDW map, LS displacement, SAR image
+    ax_idw = fig.add_subplot(gs[3, 0])
+    ax_ls  = fig.add_subplot(gs[3, 1])
+    ax_sar = fig.add_subplot(gs[3, 2])
 
-    p_ls, p_mid, p_idw = ax_ls.get_position(), ax_mid.get_position(), ax_idw.get_position()
+    # Reposition bottom maps as a row just below the bias panel
+    p_idw, p_ls, p_sar = (
+        ax_idw.get_position(),
+        ax_ls.get_position(),
+        ax_sar.get_position(),
+    )
     p_bias = ax2.get_position()
     y_top_maps = max(p_bias.y0 - maps_gap_frac, bottom_margin + 0.01)
     maps_height = min(maps_height_frac, y_top_maps - bottom_margin)
     y0 = y_top_maps - maps_height
-    ax_ls.set_position([p_ls.x0,  y0, p_ls.width,  maps_height])
-    ax_mid.set_position([p_mid.x0, y0, p_mid.width, maps_height])
+
     ax_idw.set_position([p_idw.x0, y0, p_idw.width, maps_height])
+    ax_ls.set_position([p_ls.x0,   y0, p_ls.width,  maps_height])
+    ax_sar.set_position([p_sar.x0, y0, p_sar.width, maps_height])
+
+    # Handles for colourbars
+    im_idw = im_ls = im_sar = None
 
     # Read rasters
     m_ls  = _find_corr_map(area_dir, dem, corr, pair_tag)
@@ -698,15 +709,25 @@ def plot_density_pair(
     except Exception:
         gdf_gauges = None
 
-    # LS map
+    # LS displacement map (MIDDLE)
     if a1:
-        im = ax_ls.imshow(a1[0], extent=a1[1], origin="upper", cmap=CMAP_INV, vmin=vmin, vmax=vmax)
-        ax_ls.set_title(f"{corr} Corrected Displacement", fontsize=12, pad=4)
-        _draw_scalebar(ax_ls, a1[1]); _draw_north_arrow(ax_ls, a1[1])
+        im_ls = ax_ls.imshow(
+            a1[0], extent=a1[1], origin="upper",
+            cmap=CMAP_INV, vmin=vmin, vmax=vmax
+        )
+        ax_ls.set_title(f"{corr} corrected displacement", fontsize=12, pad=4)
+        _draw_scalebar(ax_ls, a1[1])
+        _draw_north_arrow(ax_ls, a1[1])
         ax_ls.set_xticks([]); ax_ls.set_yticks([])
-        if gdf_gauges is not None: _overlay_gauges(ax_ls, gdf_gauges)
+        if gdf_gauges is not None:
+            _overlay_gauges(ax_ls, gdf_gauges)
     else:
-        ax_ls.text(0.5, 0.5, f"Missing {corr} corrected map", ha="center", va="center"); ax_ls.set_axis_off()
+        ax_ls.text(
+            0.5, 0.5, f"Missing {corr} corrected map",
+            ha="center", va="center"
+        )
+        ax_ls.set_axis_off()
+
 
     # Union extent for the middle (SAR) panel
     union = None
@@ -718,46 +739,95 @@ def plot_density_pair(
     elif a2:
         union = a2[1]
 
-    # --- Middle panel: SAR baselayer (band 1; 0–20000; grayscale), clipped to area ---
+    # --- Right panel: SAR baselayer (ALOS PALSAR) in dB, clipped to area ---
     sar = _read_tif_array(Path(sar_tif) if sar_tif else None)
     if sar is not None:
         sar_arr, sar_extent = sar
-        ax_mid.imshow(sar_arr, extent=sar_extent, origin="upper",
-                      cmap="gray", vmin=0, vmax=20000)
+
+        # Convert amplitude DN → backscatter in dB
+        sar_arr = sar_arr.astype(float)
+        valid = np.isfinite(sar_arr) & (sar_arr > 0)
+        sar_db = np.full_like(sar_arr, np.nan, dtype="float32")
+        sar_db[valid] = 20.0 * np.log10(sar_arr[valid])
+
+        finite_db = sar_db[np.isfinite(sar_db)]
+        if finite_db.size > 0:
+            vmin_db, vmax_db = np.nanpercentile(finite_db, [2, 98])
+        else:
+            vmin_db, vmax_db = -20.0, 5.0  # fallback range
+
+        im_sar = ax_sar.imshow(
+            sar_db,
+            extent=sar_extent,
+            origin="upper",
+            cmap="gray",
+            vmin=vmin_db,
+            vmax=vmax_db,
+        )
+
         ex = union if union is not None else sar_extent
-        ax_mid.set_xlim(ex[0], ex[1]); ax_mid.set_ylim(ex[2], ex[3])
-        ax_mid.set_xticks([]); ax_mid.set_yticks([])
-        _draw_scalebar(ax_mid, ex); _draw_north_arrow(ax_mid, ex)
+        ax_sar.set_xlim(ex[0], ex[1])
+        ax_sar.set_ylim(ex[2], ex[3])
+        ax_sar.set_xticks([])
+        ax_sar.set_yticks([])
+        _draw_scalebar(ax_sar, ex)
+        _draw_north_arrow(ax_sar, ex)
         if area_geom is not None:
-            _clip_ax_images_to_geom(ax_mid, area_geom)
-        if gdf_gauges is not None: _overlay_gauges(ax_mid, gdf_gauges)
-        ax_mid.set_title("SAR HH Backscatter", fontsize=12, pad=4)
+            _clip_ax_images_to_geom(ax_sar, area_geom)
+        if gdf_gauges is not None:
+            _overlay_gauges(ax_sar, gdf_gauges)
+        ax_sar.set_title("SAR HH backscatter (dB)", fontsize=12, pad=4)
     else:
-        ax_mid.text(0.5, 0.5, "SAR baselayer missing", ha="center", va="center")
-        ax_mid.set_axis_off()
+        ax_sar.text(0.5, 0.5, "SAR baselayer missing", ha="center", va="center")
+        ax_sar.set_axis_off()
 
-    # IDW map
+    # IDW map (LEFT)
     if a2:
-        im2 = ax_idw.imshow(a2[0], extent=a2[1], origin="upper", cmap=CMAP_INV, vmin=vmin, vmax=vmax)
-        ax_idw.set_title("IDW", fontsize=12, pad=4)
-        _draw_scalebar(ax_idw, a2[1]); _draw_north_arrow(ax_idw, a2[1])
+        im_idw = ax_idw.imshow(
+            a2[0], extent=a2[1], origin="upper",
+            cmap=CMAP_INV, vmin=vmin, vmax=vmax
+        )
+        ax_idw.set_title("IDW baseline", fontsize=12, pad=4)
+        _draw_scalebar(ax_idw, a2[1])
+        _draw_north_arrow(ax_idw, a2[1])
         ax_idw.set_xticks([]); ax_idw.set_yticks([])
-        if gdf_gauges is not None: _overlay_gauges(ax_idw, gdf_gauges)
+        if gdf_gauges is not None:
+            _overlay_gauges(ax_idw, gdf_gauges)
     else:
-        ax_idw.text(0.5, 0.5, f"Missing {corr} IDW map", ha="center", va="center"); ax_idw.set_axis_off()
+        ax_idw.text(
+            0.5, 0.5, f"Missing {corr} IDW map",
+            ha="center", va="center"
+        )
+        ax_idw.set_axis_off()
 
-    # External colorbars
-    cbar_w = 0.015; gap = 0.006
-    if a1:
-        bb_ls = ax_ls.get_position()
-        cax_ls = fig.add_axes([bb_ls.x0 - gap - cbar_w, bb_ls.y0, cbar_w, bb_ls.height])
-        cb1 = plt.colorbar(im, cax=cax_ls, orientation="vertical", location="left")
-        cb1.set_label("cm", fontsize=9); cb1.ax.tick_params(labelsize=8)
-    if a2:
-        bb_idw = ax_idw.get_position()
-        cax_idw = fig.add_axes([bb_idw.x1 + gap, bb_idw.y0, cbar_w, bb_idw.height])
-        cb2 = plt.colorbar(im2, cax=cax_idw, orientation="vertical", location="right")
-        cb2.set_label("cm", fontsize=9); cb2.ax.tick_params(labelsize=8)
+    # External colourbars
+    cbar_w = 0.015
+    gap = 0.006
+
+    # LEFT: shared displacement colourbar for IDW + LS
+    if im_ls is not None or im_idw is not None:
+        bb_left = ax_idw.get_position()  # leftmost displacement map
+        cax_disp = fig.add_axes(
+            [bb_left.x0 - gap - cbar_w, bb_left.y0, cbar_w, bb_left.height]
+        )
+        cb_disp = plt.colorbar(
+            im_ls if im_ls is not None else im_idw,
+            cax=cax_disp,
+            orientation="vertical",
+        )
+        cb_disp.set_label("cm", fontsize=9)
+        cb_disp.ax.tick_params(labelsize=8)
+
+    # RIGHT: SAR backscatter (dB) colourbar
+    if im_sar is not None:
+        bb_sar = ax_sar.get_position()
+        cax_sar = fig.add_axes(
+            [bb_sar.x1 + gap, bb_sar.y0, cbar_w, bb_sar.height]
+        )
+        cb_sar = plt.colorbar(im_sar, cax=cax_sar, orientation="vertical")
+        cb_sar.set_label("SAR backscatter (dB)", fontsize=9)
+        cb_sar.ax.tick_params(labelsize=8)
+
 
     out = area_dir / "results" / f"density_{corr.lower()}_idw_pair_{pair_tag}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
